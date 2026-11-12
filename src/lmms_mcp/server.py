@@ -1140,6 +1140,8 @@ def render_project(
     file_format: str = "wav",
     samplerate: int = 44100,
     bitrate: int = 160,
+    oversampling: int = 1,
+    interpolation: str = "sincfastest",
 ) -> str:
     """Export the current project to an audio file using the installed LMMS.
 
@@ -1152,6 +1154,16 @@ def render_project(
         file_format: "wav", "flac", "ogg" or "mp3"
         samplerate: Sample rate in Hz (44100, 48000, ...)
         bitrate: Bitrate in kbit/s for lossy formats (ogg/mp3)
+        oversampling: 1, 2, 4 or 8 (default 1). The default 1x matches what
+            LMMS plays in its GUI and the defaults of its Export dialog, so
+            the render sounds like what the user hears in LMMS. (The LMMS
+            command line alone would default to 2x.) Higher oversampling is
+            NOT simply "higher quality": it changes the sound of some
+            instruments, e.g. ZynAddSubFX presets get a different timbre
+            because they depend on the internal sample rate. Only raise it
+            if the result should differ from the GUI.
+        interpolation: "linear", "sincfastest", "sincmedium" or "sincbest"
+            (default "sincfastest", the LMMS default)
     """
     proj = get_project()
     if not proj.path:
@@ -1170,6 +1182,16 @@ def render_project(
         return json.dumps({
             "error": f"Invalid format '{file_format}'. Use wav/flac/ogg/mp3."
         })
+    if isinstance(oversampling, bool) or oversampling not in (1, 2, 4, 8):
+        return json.dumps({
+            "error": f"Invalid oversampling '{oversampling}'. Use 1, 2, 4 or 8."
+        })
+    interp = interpolation.lower() if isinstance(interpolation, str) else ""
+    if interp not in ("linear", "sincfastest", "sincmedium", "sincbest"):
+        return json.dumps({
+            "error": f"Invalid interpolation '{interpolation}'. Use "
+                     "linear/sincfastest/sincmedium/sincbest."
+        })
 
     proj_path = Path(proj.path)
     if output_path is None:
@@ -1185,6 +1207,7 @@ def render_project(
         str(exe), "render", str(proj_path),
         "-o", output_path, "-f", fmt,
         "-s", str(samplerate), "-b", str(bitrate),
+        "-x", str(oversampling), "-i", interp,
     ]
     try:
         proc = subprocess.run(
@@ -1202,6 +1225,8 @@ def render_project(
         "command": " ".join(cmd),
         "returncode": proc.returncode,
         "output_file": str(out_file),
+        "oversampling": oversampling,
+        "interpolation": interp,
         "success": success,
     }
     if success:

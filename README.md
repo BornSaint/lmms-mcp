@@ -174,7 +174,7 @@ python -m lmms_mcp
 | Tool | Description |
 |------|-------------|
 | `get_lmms_info` | Detect installed LMMS version + available plugins |
-| `render_project` | Export to WAV/FLAC/OGG/MP3 via headless LMMS render |
+| `render_project` | Export to WAV/FLAC/OGG/MP3 via headless LMMS render. `oversampling` (1/2/4/8, default 1 = what LMMS plays in its GUI; higher changes the sound of some instruments such as ZynAddSubFX) and `interpolation` (linear/sincfastest/sincmedium/sincbest, default sincfastest) |
 
 The server reads and writes project files directly - it never launches
 the LMMS GUI. The installed LMMS is only used for: preset discovery,

@@ -1561,6 +1561,99 @@ class TestAudioFileProcessorSample:
         assert result is None or result.is_dir()
 
 
+class TestRenderProjectQuality:
+    """render_project passes -x/-i to LMMS (default 1x, like the GUI)."""
+
+    @staticmethod
+    def _setup(monkeypatch, tmp_path):
+        import subprocess
+        from lmms_mcp import lmms_app
+        from lmms_mcp import server as srv
+
+        proj = LMMSProject()
+        proj.new()
+        srv.set_project(proj)
+        proj.save(str(tmp_path / "song.mmp"))
+        monkeypatch.setattr(
+            lmms_app, "find_lmms_exe", lambda: Path("/fake/lmms"))
+        calls = []
+
+        def fake_run(cmd, **kwargs):
+            calls.append(cmd)
+            out = Path(cmd[cmd.index("-o") + 1])
+            out.write_bytes(b"RIFF")
+            return subprocess.CompletedProcess(cmd, 0, "", "")
+
+        monkeypatch.setattr("subprocess.run", fake_run)
+        return srv, calls
+
+    def test_defaults_are_1x_sincfastest(self, monkeypatch, tmp_path):
+        srv, calls = self._setup(monkeypatch, tmp_path)
+        out = tmp_path / "out.wav"
+        result = json.loads(srv.render_project(output_path=str(out)))
+        assert result["success"] is True
+        assert len(calls) == 1
+        cmd = calls[0]
+        assert cmd[cmd.index("-x") + 1] == "1"
+        assert cmd[cmd.index("-i") + 1] == "sincfastest"
+        assert "-x 1 -i sincfastest" in result["command"]
+        assert result["oversampling"] == 1
+        assert result["interpolation"] == "sincfastest"
+        # Existing arguments are unchanged.
+        assert cmd[1] == "render"
+        assert cmd[cmd.index("-o") + 1] == str(out)
+        assert cmd[cmd.index("-f") + 1] == "wav"
+        assert cmd[cmd.index("-s") + 1] == "44100"
+        assert cmd[cmd.index("-b") + 1] == "160"
+
+    def test_custom_values_are_passed_through(self, monkeypatch, tmp_path):
+        srv, calls = self._setup(monkeypatch, tmp_path)
+        result = json.loads(srv.render_project(
+            output_path=str(tmp_path / "out.wav"),
+            oversampling=4, interpolation="sincbest"))
+        assert result["success"] is True
+        cmd = calls[0]
+        assert cmd[cmd.index("-x") + 1] == "4"
+        assert cmd[cmd.index("-i") + 1] == "sincbest"
+        assert result["oversampling"] == 4
+        assert result["interpolation"] == "sincbest"
+
+    @pytest.mark.parametrize("value", [1, 2, 4, 8])
+    def test_all_oversampling_values_allowed(self, monkeypatch, tmp_path, value):
+        srv, calls = self._setup(monkeypatch, tmp_path)
+        result = json.loads(srv.render_project(
+            output_path=str(tmp_path / "out.wav"), oversampling=value))
+        assert "error" not in result
+        assert calls[0][calls[0].index("-x") + 1] == str(value)
+
+    @pytest.mark.parametrize("value", ["linear", "sincfastest",
+                                        "sincmedium", "sincbest"])
+    def test_all_interpolations_allowed(self, monkeypatch, tmp_path, value):
+        srv, calls = self._setup(monkeypatch, tmp_path)
+        result = json.loads(srv.render_project(
+            output_path=str(tmp_path / "out.wav"), interpolation=value))
+        assert "error" not in result
+        assert calls[0][calls[0].index("-i") + 1] == value
+
+    @pytest.mark.parametrize("value", [0, 3, 16, -1, True])
+    def test_invalid_oversampling_rejected(self, monkeypatch, tmp_path, value):
+        srv, calls = self._setup(monkeypatch, tmp_path)
+        result = json.loads(srv.render_project(
+            output_path=str(tmp_path / "out.wav"), oversampling=value))
+        assert "error" in result
+        assert "oversampling" in result["error"]
+        assert calls == []
+
+    @pytest.mark.parametrize("value", ["", "cubic", "sinc"])
+    def test_invalid_interpolation_rejected(self, monkeypatch, tmp_path, value):
+        srv, calls = self._setup(monkeypatch, tmp_path)
+        result = json.loads(srv.render_project(
+            output_path=str(tmp_path / "out.wav"), interpolation=value))
+        assert "error" in result
+        assert "interpolation" in result["error"]
+        assert calls == []
+
+
 if __name__ == "__main__":
     import sys
     print("Run with: pytest tests/")
