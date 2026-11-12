@@ -599,6 +599,94 @@ def add_sample_clip(
     return clip
 
 
+def _fmt_number(value: float) -> str:
+    """Format a number compactly for XML: 1.0 -> "1", 0.25 -> "0.25"."""
+    value = float(value)
+    return str(int(value)) if value == int(value) else repr(value)
+
+
+def set_audiofile_sample(
+    root: ET.Element,
+    track_index: int,
+    src: str,
+    amp: float = 100,
+    reversed: bool = False,
+    looped: int = 0,
+    stutter: bool = False,
+    start: float = 0.0,
+    end: float = 1.0,
+) -> ET.Element:
+    """Set the sample of an audiofileprocessor instrument track.
+
+    Args:
+        root: Project root element.
+        track_index: Index of an instrument track whose instrument is
+            audiofileprocessor.
+        src: Sample path, relative to the LMMS factory samples directory
+            (e.g. "drums/kick01.ogg") or absolute.
+        amp: Amplification in percent (0-500, default 100).
+        reversed: Play the sample backwards.
+        looped: 0 = off, 1 = loop, 2 = ping-pong loop.
+        stutter: Restart the sample when a new note starts.
+        start: Sample start point as a fraction (0 <= start < end).
+        end: Sample end point as a fraction (start < end <= 1).
+
+    Creates the <audiofileprocessor> element if missing; repeated calls
+    overwrite the previous settings. Returns the element.
+    """
+    tracks = find_tracks(root)
+    if not 0 <= track_index < len(tracks):
+        raise IndexError(
+            f"Track index {track_index} out of range "
+            f"(have {len(tracks)} tracks)"
+        )
+    track = tracks[track_index]
+    hint = (
+        'Create one with add_instrument_track(..., '
+        'instrument="audiofileprocessor") first.'
+    )
+    if get_track_type(track) != 0:
+        raise ValueError(
+            f"Track {track_index} is a "
+            f"{track_type_name(get_track_type(track))} track, not an "
+            f"audiofileprocessor instrument track. {hint}"
+        )
+    inst = track.find("instrumenttrack/instrument")
+    if inst is None or inst.get("name") != "audiofileprocessor":
+        found = inst.get("name") if inst is not None else None
+        raise ValueError(
+            f"Track {track_index} uses instrument '{found}', not "
+            f"audiofileprocessor. {hint}"
+        )
+
+    if not src or not str(src).strip():
+        raise ValueError("Sample path must not be empty")
+    if not 0 <= amp <= 500:
+        raise ValueError(f"amp must be 0-500 (percent), got {amp}")
+    if looped not in (0, 1, 2):
+        raise ValueError(
+            f"looped must be 0 (off), 1 (loop) or 2 (ping-pong), got {looped}"
+        )
+    if not (0 <= start < end <= 1):
+        raise ValueError(
+            f"Need 0 <= start < end <= 1, got start={start}, end={end}"
+        )
+
+    afp = inst.find("audiofileprocessor")
+    if afp is None:
+        afp = ET.SubElement(inst, "audiofileprocessor")
+    afp.set("src", str(src))
+    afp.set("amp", _fmt_number(amp))
+    afp.set("reversed", "1" if reversed else "0")
+    afp.set("looped", str(int(looped)))
+    afp.set("stutter", "1" if stutter else "0")
+    afp.set("interp", "1")
+    afp.set("sframe", _fmt_number(start))
+    afp.set("eframe", _fmt_number(end))
+    afp.set("lframe", "0")
+    return afp
+
+
 def place_instrument_pattern(
     root: ET.Element,
     track_index: int,

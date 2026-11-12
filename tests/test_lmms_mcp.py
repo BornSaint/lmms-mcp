@@ -646,6 +646,26 @@ class TestLmmsAppDetection:
             "tripleoscillator", "opl2", "reverbsc",
         }
 
+    def test_samples_dir_linux_layout(self, tmp_path, clean_env):
+        from lmms_mcp import lmms_app
+        exe = tmp_path / "prefix" / "bin" / "lmms"
+        exe.parent.mkdir(parents=True)
+        exe.write_bytes(b"x")
+        samples = tmp_path / "prefix" / "share" / "lmms" / "samples"
+        samples.mkdir(parents=True)
+        clean_env.setenv("LMMS_EXECUTABLE", str(exe))
+        assert lmms_app.get_samples_dir() == samples
+
+    def test_samples_dir_windows_layout(self, tmp_path, clean_env):
+        from lmms_mcp import lmms_app
+        exe = tmp_path / "LMMS" / "lmms.exe"
+        exe.parent.mkdir(parents=True)
+        exe.write_bytes(b"x")
+        samples = tmp_path / "LMMS" / "data" / "samples"
+        samples.mkdir(parents=True)
+        clean_env.setenv("LMMS_EXECUTABLE", str(exe))
+        assert lmms_app.get_samples_dir() == samples
+
     def test_linux_plugin_availability_and_alias(self, tmp_path, clean_env):
         from lmms_mcp import lmms_app
         clean_env.setenv(
@@ -1015,6 +1035,215 @@ class TestSilenceRegressions:
             proj.save(mmpz)
             assert Path(mmp).read_bytes().startswith(b"<?xml")
             assert not Path(mmpz).read_bytes().startswith(b"<?xml")
+
+
+class TestAudioFileProcessorSample:
+    """set_audiofile_sample: give an audiofileprocessor track its sample."""
+
+    @staticmethod
+    def _afp(root, index=0):
+        track = find_tracks(root)[index]
+        return track.find("instrumenttrack/instrument/audiofileprocessor")
+
+    def test_sets_attributes(self):
+        from lmms_mcp.xml_parser import set_audiofile_sample
+        root = create_empty_project()
+        add_instrument_track(root, "Kick", instrument="audiofileprocessor")
+        set_audiofile_sample(
+            root, 0, "drums/kick_hiphop01.ogg", amp=150, reversed=True,
+            looped=2, stutter=True, start=0.25, end=0.75,
+        )
+        afp = self._afp(root)
+        assert afp.get("src") == "drums/kick_hiphop01.ogg"
+        assert afp.get("amp") == "150"
+        assert afp.get("reversed") == "1"
+        assert afp.get("looped") == "2"
+        assert afp.get("stutter") == "1"
+        assert afp.get("interp") == "1"
+        assert afp.get("sframe") == "0.25"
+        assert afp.get("eframe") == "0.75"
+        assert afp.get("lframe") == "0"
+
+    def test_defaults(self):
+        from lmms_mcp.xml_parser import set_audiofile_sample
+        root = create_empty_project()
+        add_instrument_track(root, "Kick", instrument="audiofileprocessor")
+        set_audiofile_sample(root, 0, "drums/kick01.ogg")
+        afp = self._afp(root)
+        assert afp.get("amp") == "100"
+        assert afp.get("reversed") == "0"
+        assert afp.get("looped") == "0"
+        assert afp.get("stutter") == "0"
+        assert afp.get("sframe") == "0"
+        assert afp.get("eframe") == "1"
+
+    def test_creates_missing_element(self):
+        from lmms_mcp.xml_parser import set_audiofile_sample
+        root = create_empty_project()
+        add_instrument_track(root, "Kick", instrument="audiofileprocessor")
+        inst = find_tracks(root)[0].find("instrumenttrack/instrument")
+        inst.remove(inst.find("audiofileprocessor"))
+        set_audiofile_sample(root, 0, "drums/kick01.ogg")
+        assert self._afp(root).get("src") == "drums/kick01.ogg"
+
+    def test_overwrites_on_second_call(self):
+        from lmms_mcp.xml_parser import set_audiofile_sample
+        root = create_empty_project()
+        add_instrument_track(root, "Kick", instrument="audiofileprocessor")
+        set_audiofile_sample(root, 0, "drums/kick01.ogg", amp=200,
+                             reversed=True, looped=1)
+        set_audiofile_sample(root, 0, "drums/snare01.ogg")
+        inst = find_tracks(root)[0].find("instrumenttrack/instrument")
+        assert len(inst.findall("audiofileprocessor")) == 1
+        afp = self._afp(root)
+        assert afp.get("src") == "drums/snare01.ogg"
+        assert afp.get("amp") == "100"
+        assert afp.get("reversed") == "0"
+        assert afp.get("looped") == "0"
+
+    def test_error_on_other_instrument(self):
+        from lmms_mcp.xml_parser import set_audiofile_sample
+        root = create_empty_project()
+        add_instrument_track(root, "Lead", instrument="tripleoscillator")
+        with pytest.raises(ValueError, match="audiofileprocessor"):
+            set_audiofile_sample(root, 0, "drums/kick01.ogg")
+
+    def test_error_on_sample_track(self):
+        from lmms_mcp.xml_parser import set_audiofile_sample
+        root = create_empty_project()
+        add_sample_track(root, "Samples")
+        with pytest.raises(ValueError, match="add_instrument_track"):
+            set_audiofile_sample(root, 0, "drums/kick01.ogg")
+
+    def test_error_on_bad_track_index(self):
+        from lmms_mcp.xml_parser import set_audiofile_sample
+        root = create_empty_project()
+        add_instrument_track(root, "Kick", instrument="audiofileprocessor")
+        with pytest.raises(IndexError):
+            set_audiofile_sample(root, 5, "drums/kick01.ogg")
+        with pytest.raises(IndexError):
+            set_audiofile_sample(root, -1, "drums/kick01.ogg")
+
+    @pytest.mark.parametrize("kwargs", [
+        {"amp": -1},
+        {"amp": 501},
+        {"looped": 3},
+        {"looped": -1},
+        {"start": 0.5, "end": 0.5},
+        {"start": 0.8, "end": 0.2},
+        {"start": -0.1},
+        {"end": 1.5},
+    ])
+    def test_error_on_invalid_values(self, kwargs):
+        from lmms_mcp.xml_parser import set_audiofile_sample
+        root = create_empty_project()
+        add_instrument_track(root, "Kick", instrument="audiofileprocessor")
+        with pytest.raises(ValueError):
+            set_audiofile_sample(root, 0, "drums/kick01.ogg", **kwargs)
+        # a rejected call must not leave a half-written sample behind
+        assert self._afp(root).get("src") is None
+
+    def test_save_load_roundtrip(self):
+        from lmms_mcp.xml_parser import set_audiofile_sample
+        root = create_empty_project()
+        add_instrument_track(root, "Kick", instrument="audiofileprocessor")
+        set_audiofile_sample(root, 0, "drums/kick_hiphop01.ogg", amp=120,
+                             reversed=True, looped=1, start=0.1, end=0.9)
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "afp.mmpz"
+            save_project(path, root)
+            loaded = load_project(path)
+        afp = self._afp(loaded)
+        assert afp.get("src") == "drums/kick_hiphop01.ogg"
+        assert afp.get("amp") == "120"
+        assert afp.get("reversed") == "1"
+        assert afp.get("looped") == "1"
+        assert afp.get("sframe") == "0.1"
+        assert afp.get("eframe") == "0.9"
+
+    # ── tool level ───────────────────────────────────────────────
+
+    @staticmethod
+    def _new_project():
+        from lmms_mcp import server as srv
+        proj = LMMSProject()
+        proj.new()
+        srv.set_project(proj)
+        return srv, proj
+
+    def test_tool_sets_sample(self, monkeypatch, tmp_path):
+        from lmms_mcp import lmms_app
+        (tmp_path / "drums").mkdir()
+        (tmp_path / "drums" / "kick01.ogg").write_bytes(b"x")
+        monkeypatch.setattr(lmms_app, "get_samples_dir", lambda: tmp_path)
+        srv, proj = self._new_project()
+        srv.add_instrument_track("Kick", instrument="audiofileprocessor")
+        response = json.loads(srv.set_audiofile_sample(
+            0, "drums/kick01.ogg", amp=130, looped=1))
+        assert "error" not in response
+        assert response["track_index"] == 0
+        assert response["file"] == "drums/kick01.ogg"
+        assert "message" in response
+        assert "warning" not in response
+        afp = self._afp(proj.root)
+        assert afp.get("src") == "drums/kick01.ogg"
+        assert afp.get("amp") == "130"
+        assert afp.get("looped") == "1"
+        assert proj.modified is True
+
+    def test_tool_warns_for_missing_relative_sample(self, monkeypatch,
+                                                    tmp_path):
+        from lmms_mcp import lmms_app
+        monkeypatch.setattr(lmms_app, "get_samples_dir", lambda: tmp_path)
+        srv, proj = self._new_project()
+        srv.add_instrument_track("Kick", instrument="audiofileprocessor")
+        response = json.loads(
+            srv.set_audiofile_sample(0, "drums/nope.ogg"))
+        assert "error" not in response
+        assert "warning" in response
+        assert "drums/nope.ogg" in response["warning"]
+        # the sample is still written
+        assert self._afp(proj.root).get("src") == "drums/nope.ogg"
+
+    def test_tool_skips_check_without_samples_dir(self, monkeypatch):
+        from lmms_mcp import lmms_app
+        monkeypatch.setattr(lmms_app, "get_samples_dir", lambda: None)
+        srv, _ = self._new_project()
+        srv.add_instrument_track("Kick", instrument="audiofileprocessor")
+        response = json.loads(
+            srv.set_audiofile_sample(0, "drums/whatever.ogg"))
+        assert "error" not in response
+        assert "warning" not in response
+
+    def test_tool_absolute_path_warning(self, tmp_path):
+        srv, _ = self._new_project()
+        srv.add_instrument_track("Kick", instrument="audiofileprocessor")
+        missing = tmp_path / "missing.wav"
+        response = json.loads(srv.set_audiofile_sample(0, str(missing)))
+        assert "warning" in response
+        existing = tmp_path / "exists.wav"
+        existing.write_bytes(b"x")
+        response = json.loads(srv.set_audiofile_sample(0, str(existing)))
+        assert "error" not in response
+        assert "warning" not in response
+
+    def test_tool_errors_are_json(self):
+        srv, _ = self._new_project()
+        srv.add_instrument_track("Lead", instrument="tripleoscillator")
+        srv.add_sample_track("Samples")
+        for index in (0, 1, 9):
+            response = json.loads(
+                srv.set_audiofile_sample(index, "drums/kick01.ogg"))
+            assert "error" in response
+        srv.add_instrument_track("Kick", instrument="audiofileprocessor")
+        response = json.loads(
+            srv.set_audiofile_sample(2, "drums/kick01.ogg", amp=900))
+        assert "error" in response
+
+    def test_get_samples_dir_returns_existing_dir_or_none(self):
+        from lmms_mcp import lmms_app
+        result = lmms_app.get_samples_dir()
+        assert result is None or result.is_dir()
 
 
 if __name__ == "__main__":

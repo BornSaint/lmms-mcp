@@ -6,7 +6,7 @@ manipulating LMMS projects programmatically via the Model Context Protocol.
 
 import json
 import os
-from pathlib import Path
+from pathlib import Path, PurePosixPath, PureWindowsPath
 from xml.etree import ElementTree as ET
 
 from mcp.server import MCPServer
@@ -100,6 +100,14 @@ VSTs. Check list_available_plugins for dynamically detected custom
 plugins - they can be used directly by name in add_instrument_track /
 add_effect. For VST .dll files anywhere on disk, use scan_vst_directory
 and add_vst_track.
+
+Drums with real samples: add one instrument track per drum sound with
+instrument "audiofileprocessor", then call set_audiofile_sample on each
+(e.g. "drums/kick_hiphop01.ogg", "drums/snare01.ogg",
+"drums/hihat_closed02.ogg" from LMMS's factory samples) and play it with
+add_note / add_notes_batch at key 57 (the track's base note = original
+pitch). An audiofileprocessor track without a sample is silent. For
+synthesized drums use kicker instead.
 
 ZynAddSubFX: For rich sounds, add a track with instrument "zynaddsubfx",
 then load one of ~950 factory presets via load_zyn_preset (browse with
@@ -345,6 +353,106 @@ def add_instrument_track(
         volume=volume,
         panning=panning,
     )
+    if warning:
+        result["warning"] = warning
+    return json.dumps(result)
+
+
+def _sample_path_warning(file_path: str) -> str | None:
+    """Soft-check that a sample path exists; return a warning or None.
+
+    Relative paths are looked up in the factory samples directory of the
+    installed LMMS (skipped silently if none is found); absolute paths
+    must exist on disk.
+    """
+    if PurePosixPath(file_path).is_absolute() or \
+            PureWindowsPath(file_path).is_absolute():
+        if not Path(file_path).is_file():
+            return f"Sample file not found: {file_path}"
+        return None
+    samples_dir = lmms_app.get_samples_dir()
+    if samples_dir is None:
+        return None
+    if not (samples_dir / file_path).is_file():
+        return (
+            f"Sample '{file_path}' was not found in the LMMS factory "
+            f"samples directory ({samples_dir}). LMMS will load nothing "
+            f"and the track will be silent. Browse that directory for "
+            f"valid names (e.g. drums/kick_hiphop01.ogg) or pass an "
+            f"absolute path."
+        )
+    return None
+
+
+@mcp.tool()
+def set_audiofile_sample(
+    track_index: int,
+    file_path: str,
+    amp: int = 100,
+    reversed: bool = False,
+    looped: int = 0,
+    stutter: bool = False,
+    start: float = 0.0,
+    end: float = 1.0,
+) -> str:
+    """Set the sample played by an audiofileprocessor instrument track.
+
+    Without a sample an audiofileprocessor track is silent. Create the
+    track first with add_instrument_track(name, instrument=
+    "audiofileprocessor"), assign the sample here, then play it with
+    add_note / add_notes_batch on that track (it is a normal instrument
+    track with a pattern, not a sample track). Calling this again on the
+    same track replaces the previous sample and settings.
+
+    Drum-kit workflow: create ONE audiofileprocessor track per drum
+    sound (Kick, Snare, Hat, ...), set a sample on each, then write each
+    drum's rhythm as notes on its own track. This is much easier to edit
+    than placing one sample clip per hit on sample tracks.
+
+    Paths: a relative path is resolved by LMMS against its factory
+    samples folder, e.g. "drums/kick_hiphop01.ogg", "drums/snare01.ogg",
+    "drums/hihat_closed02.ogg", "basses/bass01.ogg". Use an absolute path
+    for your own files (WAV/OGG/FLAC/MP3). If the file cannot be found
+    the response contains a "warning" (the sample is still set).
+
+    Pitch: the sample sounds at its original pitch when the note equals
+    the track's base note, which this server creates as key 57 (A3 in this
+    server's naming where 60=C4; LMMS's own UI calls it A4). So trigger
+    drum one-shots with key=57. Other keys transpose the sample (higher
+    key = higher pitch and shorter), which can be used on purpose for
+    tuned samples or toms.
+
+    Note length: the sample is cut off when the note ends, so use a
+    length at least as long as the sample (24 ticks is enough for most
+    short hits; use 48+ for open hats, crashes and other long samples).
+
+    Args:
+        track_index: Zero-based index of the audiofileprocessor track
+        file_path: Sample path, relative to LMMS factory samples or absolute
+        amp: Amplification in percent (0-500, 100=unchanged)
+        reversed: Play the sample backwards
+        looped: 0=off (one-shot), 1=loop, 2=ping-pong loop
+        stutter: Restart the sample from the start for every new note
+        start: Sample start point as a fraction 0..1 (e.g. 0.1 skips the
+            first 10%); must be smaller than end
+        end: Sample end point as a fraction 0..1 (1.0 = whole sample)
+    """
+    proj = get_project()
+    try:
+        xml_parser.set_audiofile_sample(
+            proj.root, track_index, file_path, amp=amp, reversed=reversed,
+            looped=looped, stutter=stutter, start=start, end=end,
+        )
+    except (ValueError, IndexError) as exc:
+        return json.dumps({"error": str(exc)})
+    proj._modified = True
+    result = {
+        "track_index": track_index,
+        "file": file_path,
+        "message": f"Set sample '{file_path}' on audiofileprocessor "
+                   f"track {track_index}",
+    }
+    warning = _sample_path_warning(file_path)
     if warning:
         result["warning"] = warning
     return json.dumps(result)
@@ -1788,7 +1896,9 @@ def create_basic_song(
 
 Steps:
 1. Create a new project with {bpm} BPM
-2. Add an instrument track "Drums" with kicker or audiofileprocessor
+2. Add drum tracks: an instrument track "Drums" with kicker, or one
+   audiofileprocessor track per drum sound (Kick, Snare, Hat) with a
+   sample set via set_audiofile_sample (e.g. "drums/kick_hiphop01.ogg")
 3. Add an instrument track "Bass" with tripleoscillator or LB302
 4. Add an instrument track "Melody" with tripleoscillator or watsyn
 5. Add an automation track for volume/parameter automation
@@ -1827,12 +1937,18 @@ def add_drum_pattern(
 Description: {description}
 
 Steps:
-1. Find or create an instrument track for drums
+1. Find or create an instrument track for drums. For real drum samples
+   create one audiofileprocessor track per drum sound (Kick, Snare, Hat),
+   assign a sample to each with set_audiofile_sample (e.g.
+   "drums/kick_hiphop01.ogg", "drums/snare01.ogg",
+   "drums/hihat_closed02.ogg") and put that drum's notes at key 57 (the
+   track's base note = original sample pitch) on its own track.
 2. Add notes at the correct positions:
    - Use position values: step * 12 ticks (12 ticks per 1/16 step)
    - Each step is 12 ticks apart
    - Total pattern length: {steps} steps = {steps * 12} ticks
-3. Typical MIDI keys for drums:
+3. Typical MIDI keys for drums on a single multi-drum track
+   (not needed for per-drum audiofileprocessor tracks, which use key 57):
    - Key 36 = Kick Drum
    - Key 38 = Snare
    - Key 42 = Closed Hi-Hat

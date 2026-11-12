@@ -97,6 +97,7 @@ python -m lmms_mcp
 |------|-------------|
 | `add_instrument_track` | Add a synthesizer/sampler track |
 | `add_sample_track` | Add an audio sample track |
+| `set_audiofile_sample` | Set the sample (and amp, reverse, loop, start/end) of an `audiofileprocessor` track |
 | `add_automation_track` | Add a parameter automation track |
 | `add_pattern_track` | Add a beat/bassline pattern track |
 | `remove_track` | Remove a track by index |
@@ -248,7 +249,7 @@ plugin download mechanism - only these can be used:
 |-----------|------|
 | `tripleoscillator` | Three-oscillator subtractive synth (default) |
 | `kicker` | Kick drum synth |
-| `audiofileprocessor` | Audio file player/sampler |
+| `audiofileprocessor` | Audio file player/sampler (set its sample with `set_audiofile_sample`) |
 | `organic` | Additive organ synth |
 | `malletsstk` | Physical modeling mallets (STK) |
 | `lb302` | TB-303 style acid bass |

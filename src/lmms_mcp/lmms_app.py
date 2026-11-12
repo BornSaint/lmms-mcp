@@ -97,6 +97,32 @@ def get_plugins_dir() -> Path | None:
     return None
 
 
+def get_samples_dir() -> Path | None:
+    """Return the factory samples directory of the installed LMMS.
+
+    Relative sample paths in projects (e.g. "drums/kick01.ogg") are
+    resolved against this directory by LMMS. Order: Windows layout
+    (<exe dir>/data/samples), Linux layout relative to the resolved
+    executable (<exe dir>/../share/lmms/samples), then
+    /usr/share/lmms/samples and /usr/local/share/lmms/samples. Returns
+    None if no such directory exists.
+    """
+    candidates: list[Path] = []
+    exe = find_lmms_exe()
+    if exe is not None:
+        real_dir = exe.resolve().parent
+        candidates.append(real_dir / "data" / "samples")
+        candidates.append(real_dir.parent / "share" / "lmms" / "samples")
+    candidates.extend([
+        Path("/usr/share/lmms/samples"),
+        Path("/usr/local/share/lmms/samples"),
+    ])
+    for candidate in candidates:
+        if candidate.is_dir():
+            return candidate
+    return None
+
+
 def get_installed_plugins() -> set[str]:
     """Set of plugin library names shipped with the installed LMMS.
 
