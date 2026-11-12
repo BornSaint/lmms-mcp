@@ -6,7 +6,7 @@ from collections.abc import Collection
 from pathlib import Path
 from xml.etree import ElementTree as ET
 
-from . import lmms_app
+from . import lmms_app, pitch
 from .models import DEFAULT_KEY
 
 
@@ -275,7 +275,8 @@ def _make_instrument_track(
         "usemasterpitch": "1",
         "pitchrange": "1",
         "pitch": "0",
-        "basenote": "57",
+        # 57 (A4) unless the plugin sounds off pitch, see pitch.py
+        "basenote": str(pitch.effective_basenote(instrument)),
         "vol": str(volume),
     })
 
@@ -1449,13 +1450,17 @@ def embed_zyn_preset(
     Returns:
         Dict with result info: track_index, preset (the preset's internal
         name, falling back to preset_name), internal_name (the name stored
-        inside the preset, or None) and message.
+        inside the preset, or None), preset_octave (the octave the preset
+        transposes by, see pitch.zyn_preset_octave; the track's basenote
+        compensates it) and message.
 
     Raises:
         ValueError: If track is not a zynaddsubfx instrument or the
             preset XML is invalid.
     """
     inst = _get_zyn_instrument(root, track_index)
+    inst_track = find_track_element(root, track_index).find("instrumenttrack")
+    offset_before = pitch.track_pitch_offset(inst_track)
 
     # Validate and normalize the preset XML: strip leading whitespace and
     # the DOCTYPE (ElementTree cannot parse it and LMMS does not need it).
@@ -1497,11 +1502,17 @@ def embed_zyn_preset(
     for old in settings.findall("ZynAddSubFX-data"):
         settings.remove(old)
     settings.append(data)
+    # The preset's own octave transposition changes the track's pitch
+    # offset: re-write the base note so key 57 stays A4 = 440 Hz.
+    pitch.keep_base_note(inst_track, offset_before)
 
     return {
         "track_index": track_index,
         "preset": patch_name or preset_name or "unknown",
         "internal_name": internal_name,
+        "preset_octave": pitch.zyn_preset_octave(
+            preset_root.find("INSTRUMENT")
+        ),
         "message": f"Loaded ZynAddSubFX preset '{patch_name}' into track "
                    f"{track_index}",
     }

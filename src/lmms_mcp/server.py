@@ -15,6 +15,7 @@ from mcp.server import MCPServer
 
 from . import effects as effects_mod
 from . import lmms_app
+from . import pitch
 from . import presets as zyn_presets
 from . import xml_parser
 from .models import (
@@ -181,6 +182,52 @@ def _file_instrument_details(av) -> list[str]:
     return details
 
 
+def _pitch_note(av) -> str:
+    """Instructions paragraph: key 57 = 440 Hz on every offered instrument."""
+    pool = av.instruments
+    offered = _ordered(KNOWN_INSTRUMENTS, pool)
+    text = "Pitch: every offered instrument is tuned so that key 57 = A4 = 440 Hz."
+    compensated = [
+        n for n in offered if pitch.plugin_pitch_offset(av.plugin_name(n))
+    ]
+    if compensated:
+        text += (
+            f" The track's base note makes up for plugins that sound an "
+            f"octave low in LMMS ({', '.join(compensated)}), so never "
+            f"transpose notes by hand to correct a pitch."
+        )
+    exceptions = []
+    if "kicker" in pool:
+        exceptions.append("kicker is a drum and ignores the key")
+    if "sfxr" in pool:
+        exceptions.append(
+            "sfxr is a sound-effect synth: it follows the key but plays "
+            "about 5.5 semitones flat and is silent from key 80"
+        )
+    if "audiofileprocessor" in pool:
+        exceptions.append(
+            "audiofileprocessor plays its sample at its original pitch at "
+            "key 57"
+        )
+    if exceptions:
+        text += " Exceptions: " + "; ".join(exceptions) + "."
+    limited = [
+        (n, pitch.default_playable_keys(av.plugin_name(n)))
+        for n in sorted(offered, key=lambda n: n != "zynaddsubfx")
+        if n != "sfxr"
+    ]
+    limited = [(n, keys) for n, keys in limited if keys]
+    if limited:
+        name, keys = limited[0]
+        text += (
+            f" A few instruments do not play the whole key range (e.g. "
+            f"{name} plays keys {keys[0]}-{keys[1]} only): "
+            "add_instrument_track reports their \"playable_keys\" and "
+            "add_note / add_notes_batch warn about notes outside them."
+        )
+    return text
+
+
 def _doc_bullets(lines: list[str], indent: str = " " * 4) -> str:
     """Bulleted lines wrapped for a docstring (first line unindented)."""
     return "\n".join(
@@ -310,6 +357,8 @@ def build_instructions(av, projects_dir: str) -> str:
             f"LMMS 1.3+ and are silently ignored by older versions."
         )
 
+    pitch_note = _pitch_note(av)
+
     safe = []
     for names, role in (
         (("tripleoscillator",), "universal synth"),
@@ -337,6 +386,7 @@ Key concepts:
 - {KEY_NUMBERING_TEXT} Valid keys are {KEY_RANGE_TEXT}.
   Tools take either the key number or a note name ("C4", "Bb2").
 - Volume: 0-200 (100=normal), Panning: -100 to +100""",
+        pitch_note,
         status,
         f"""IMPORTANT - Instruments: Only use built-in LMMS instrument names (see the
 add_instrument_track tool description or lmms://reference/instruments).
@@ -396,7 +446,9 @@ pitch). An audiofileprocessor track without a sample is silent."""
         blocks.append(
             """ZynAddSubFX: For rich sounds, add a track with instrument "zynaddsubfx",
 then load one of ~950 factory presets via load_zyn_preset (browse with
-list_zyn_presets). Fine-tune with set_zyn_params."""
+list_zyn_presets). Fine-tune with set_zyn_params. Every preset plays key 57
+as A4 = 440 Hz: an octave shift built into a preset (many basses have one)
+is compensated for you."""
         )
 
     chains = lmms_app.adapt_recommendations(
@@ -598,6 +650,9 @@ def _add_instrument(
     result["instrument"] = instrument
     if plugin != instrument:
         result["lmms_plugin"] = plugin
+    keys = proj.playable_keys(result["track_index"])
+    if keys:
+        result["playable_keys"] = list(keys)
     if custom:
         result["custom_plugin"] = True
     else:
@@ -679,6 +734,11 @@ def add_instrument_track(
     installed LMMS knows that plugin under another name, it also reports
     "lmms_plugin", the name written into the project; keep using the
     "instrument" name yourself.
+
+    Key 57 = A4 = 440 Hz on the new track (unpitched drum and effect
+    instruments excepted). When the instrument does not play all keys
+    0-108 at the right pitch, the response has "playable_keys": [lowest,
+    highest]; add_note warns about notes outside.
 
     $FILE_NOTE
     """
@@ -1203,7 +1263,9 @@ def add_note(
 
     On invalid input (key outside 0-108, negative pos, length <= 0, bad
     track or pattern index) nothing is added and the response is
-    {"error": "..."} explaining what to fix.
+    {"error": "..."} explaining what to fix. A key the track's instrument
+    cannot play at the right pitch (see "playable_keys" of
+    add_instrument_track) is still added but the response has a "warning".
 
     Args:
         track_index: Zero-based track index (must be an instrument or pattern track)
@@ -1306,6 +1368,8 @@ def add_notes_batch(
     [{"index": i, "note": <the input>, "error": "..."}], "notes": [...]}.
     When any note failed there is also a top-level "warning"; when every
     note failed (or the track index is bad) there is a top-level "error".
+    Notes outside the keys the track's instrument plays at the right pitch
+    are added too, with a "warning" on the note and in the top-level one.
 
     Args:
         track_index: Zero-based track index
@@ -1359,6 +1423,18 @@ def add_notes_batch(
         response["warning"] = (
             f"{len(errors)} of {len(notes)} notes were NOT added; "
             f"see errors."
+        )
+    out_of_range = [n for n in added if n.get("warning")]
+    if out_of_range:
+        keys = proj.playable_keys(track_index)
+        extra = (
+            f"{len(out_of_range)} of {len(added)} added notes are outside "
+            f"the keys this track's instrument plays correctly "
+            f"({keys[0]}-{keys[1]}); see notes[].warning."
+        )
+        response["warning"] = (
+            f"{response['warning']} {extra}" if "warning" in response
+            else extra
         )
     return json.dumps(response)
 
@@ -1620,6 +1696,11 @@ def load_zyn_preset(track_index: int, preset: str) -> str:
     nothing matches, the error suggests close names; list_zyn_presets
     shows everything available.
 
+    Pitch: key 57 plays A4 = 440 Hz with every preset. Some presets carry
+    their own octave shift (basses are often an octave lower); it is
+    compensated through the track's base note and reported as
+    "preset_octave" when it is not 0.
+
     Args:
         track_index: Index of the target track
         preset: "Category/Name", plain name, "0034-Name" or absolute path
@@ -1651,6 +1732,17 @@ def load_zyn_preset(track_index: int, preset: str) -> str:
         ),
     }
     notes = []
+    keys = proj.playable_keys(track_index)
+    if keys:
+        response["playable_keys"] = list(keys)
+    octave = result.get("preset_octave", 0)
+    if octave:
+        response["preset_octave"] = octave
+        notes.append(
+            f"This preset transposes by {octave:+d} octave(s) itself; the "
+            f"track's base note compensates it so key 57 still plays "
+            f"A4 = 440 Hz."
+        )
     if internal_name and internal_name.lower() != (
         match.name.rsplit("/", 1)[-1].lower()
     ):

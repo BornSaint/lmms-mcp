@@ -277,7 +277,7 @@ hi-hat (46) and 37 the crash (49).
 | Ticks per bar | 192 (in 4/4 time) |
 | Default tempo | 140 BPM |
 | Key 48 | C4 (middle C, 261.63 Hz) |
-| Key 57 | A4 (440 Hz; the default base note of an instrument track) |
+| Key 57 | A4 (440 Hz on every offered instrument; the default base note of an instrument track) |
 | Key range | 0-108 (C0 to C9); LMMS clamps higher keys to 108 |
 | Volume range | 0-200 (100 = normal) |
 | Panning range | -100 (left) to +100 (right) |
@@ -285,6 +285,57 @@ hi-hat (46) and 37 the crash (49).
 | Track type 1 | Pattern (Beat/Bassline) |
 | Track type 2 | Sample |
 | Track type 5 | Automation |
+
+### Pitch: key 57 = A4 = 440 Hz on every instrument
+
+All offered instruments are tuned so that key 57 = A4 = 440 Hz. Some LMMS
+plugins sound off the key they are played at, so the server compensates
+through the instrument track's base note (LMMS transposes a track by
+`57 - basenote` semitones): it writes `basenote = base note - offset`, e.g.
+45 instead of 57 for a `zynaddsubfx` track. From the agent's side the base
+note stays 57 and it never has to transpose notes by hand. The offsets (measured with
+LMMS 1.2.2, rendering A3, A4 and A5 and estimating the fundamental) live in
+`PITCH_OFFSET_SEMITONES` in `src/lmms_mcp/pitch.py`:
+
+| Instrument | Without compensation | Fix |
+|------------|----------------------|-----|
+| `zynaddsubfx` | 12 semitones low (LMMS hands its key to ZynAddSubFX as the MIDI note, A4 = 69) | base note 45 |
+| `opulenz` (`OPL2` in LMMS 1.2.x) | fundamental 12 semitones low (the default patch's modulator runs at half the carrier frequency) | base note 45 |
+| every other pitched instrument | within 1 % of the key | none |
+
+ZynAddSubFX presets also carry an octave transposition of their own (about
+15 % of the factory presets: basses are often one octave down, a few pads
+one up). `load_zyn_preset` compensates it as well, so key 57 is A4 with
+the preset's main sound (the response reports `preset_octave` when it is
+not 0). A few presets still read an octave above the key because their
+strongest partial is the second harmonic (measured on e.g. `Guitar/Dist
+Guitar 3` and `Collection/Full Strings`); that is part of their timbre and
+is not corrected.
+
+Exceptions: `kicker` is a drum and ignores the key; `sfxr` is a
+sound-effect synth that follows the key but plays about 5.5 semitones flat
+and is silent from key 80; `audiofileprocessor` plays its sample at its
+original pitch at key 57. The default patches of `tripleoscillator` (its
+second and third oscillator are one and two octaves down) and `organic` (a
+partial one octave down) layer sub-octave partials on purpose: their main
+oscillator is on the key. `bitinvader` and `watsyn` start with a random
+waveform (two renders of the same project differ), so their timbre changes
+from render to render and their pitch cannot be measured reliably.
+
+Some instruments do not play all of keys 0-108 at the right pitch.
+`add_instrument_track` reports `playable_keys` for them and `add_note` /
+`add_notes_batch` add the note anyway with a `warning`:
+
+| Instrument | Playable keys | Outside |
+|------------|---------------|---------|
+| `zynaddsubfx` | 0-95 (up to 107 for a preset with +1 octave, down to 83 for -1) | silent (ZynAddSubFX drops MIDI notes from 108 up) |
+| `opulenz` | 0-90 | silent |
+| `freeboy` | 24-95 | silent |
+| `sid` | 2-94 | wrong pitch (16-bit frequency register wraps) |
+| `nes` | 0-72 | sharp by up to 1.75 semitones (waveform period is a whole number of samples) |
+| `vibedstrings` | 0-78 | too quiet to hear |
+| `sfxr` | 0-78 | silent from 80 |
+| `sf2player` | depends on the soundfont (the default GM soundfont's piano is silent from about key 100) | silent |
 
 ## Available Instruments
 

@@ -30,6 +30,10 @@ KEY_MIN = 0
 KEY_MAX = 108
 MIDI_NOTE_OFFSET = 12
 DEFAULT_KEY = 48  # C4, middle C
+# The key an instrument track plays at its natural pitch (A4, 440 Hz; the
+# original pitch of a sample). New tracks are calibrated so this holds on
+# every offered instrument, see pitch.py.
+DEFAULT_BASE_NOTE = 57
 
 
 @dataclass

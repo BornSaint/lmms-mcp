@@ -4001,3 +4001,385 @@ class TestSetInstrumentFile:
         props = tool.input_schema["properties"]
         assert set(props) == {"track_index", "file_path", "bank", "patch"}
         assert tool.input_schema["required"] == ["track_index", "file_path"]
+
+
+class TestPitchCalibration:
+    """Key 57 = A4 = 440 Hz on every offered instrument (src/lmms_mcp/pitch.py).
+
+    The offsets are measured with LMMS 1.2.2: ZynAddSubFX and OPL2 sound
+    12 semitones below the key. LMMS transposes a track by 57 - basenote,
+    so their tracks are created with basenote 45.
+    """
+
+    @staticmethod
+    def _written(root, index=0):
+        track = find_tracks(root)[index]
+        return track.find("instrumenttrack").get("basenote")
+
+    @staticmethod
+    def _inst_track(root, index=0):
+        return find_tracks(root)[index].find("instrumenttrack")
+
+    @staticmethod
+    def _preset_xml(octave=0, engine="add", name="P", extra_items=""):
+        """A minimal .xiz whose kit item 0 has the given global octave."""
+        coarse = (octave * 1024) % 16384
+        branch = {"add": "ADD_SYNTH_PARAMETERS", "pad": "PAD_SYNTH_PARAMETERS",
+                  "sub": "SUB_SYNTH_PARAMETERS"}[engine]
+        return (
+            '<?xml version="1.0" encoding="UTF-8"?>\n'
+            '<ZynAddSubFX-data version-major="1" version-minor="0">'
+            '<INFORMATION/><BASE_PARAMETERS/>'
+            f'<INSTRUMENT><INFO><string name="name">{name}</string></INFO>'
+            '<INSTRUMENT_KIT><INSTRUMENT_KIT_ITEM id="0">'
+            '<par_bool name="enabled" value="yes"/>'
+            f'<par_bool name="{engine}_enabled" value="yes"/>'
+            f'<{branch}><FREQUENCY_PARAMETERS>'
+            f'<par name="coarse_detune" value="{coarse}"/>'
+            f'</FREQUENCY_PARAMETERS></{branch}>'
+            '</INSTRUMENT_KIT_ITEM>'
+            f'{extra_items}'
+            '</INSTRUMENT_KIT></INSTRUMENT></ZynAddSubFX-data>'
+        )
+
+    # --- the table and the helper ------------------------------------------
+
+    def test_table_lists_the_measured_offsets(self):
+        from lmms_mcp import pitch
+        assert pitch.PITCH_OFFSET_SEMITONES == {
+            "zynaddsubfx": 12, "opl2": 12}
+        # a sampler keeps key 57 = original pitch
+        assert pitch.plugin_pitch_offset("audiofileprocessor") == 0
+        assert pitch.plugin_pitch_offset("tripleoscillator") == 0
+
+    def test_offset_lookup_ignores_case(self):
+        from lmms_mcp import pitch
+        assert pitch.plugin_pitch_offset("OPL2") == 12
+        assert pitch.plugin_pitch_offset("ZynAddSubFX") == 12
+
+    def test_effective_basenote(self):
+        from lmms_mcp import pitch
+        assert pitch.effective_basenote("zynaddsubfx") == 45
+        assert pitch.effective_basenote("OPL2") == 45
+        assert pitch.effective_basenote("tripleoscillator") == 57
+        assert pitch.effective_basenote("audiofileprocessor") == 57
+        # a user base note maps to written = user - offset
+        assert pitch.effective_basenote("zynaddsubfx", 60) == 48
+        assert pitch.effective_basenote("tripleoscillator", 60) == 60
+        # preset compensation comes on top of the table
+        assert pitch.effective_basenote("zynaddsubfx", 57, 12) == 33
+        assert pitch.effective_basenote("zynaddsubfx", 57, -12) == 57
+
+    def test_effective_basenote_refuses_what_lmms_cannot_store(self):
+        from lmms_mcp import pitch
+        with pytest.raises(ValueError, match="only accepts 0-127"):
+            pitch.effective_basenote("zynaddsubfx", 5)
+        with pytest.raises(ValueError):
+            pitch.effective_basenote("tripleoscillator", 128)
+
+    # --- new tracks --------------------------------------------------------
+
+    def test_new_zynaddsubfx_track_gets_basenote_45(self):
+        root = create_empty_project()
+        add_instrument_track(root, "Z", instrument="zynaddsubfx")
+        assert self._written(root) == "45"
+
+    def test_opl2_track_gets_basenote_45_under_either_name_case(self):
+        root = create_empty_project()
+        add_instrument_track(root, "O", instrument="OPL2")
+        assert self._written(root) == "45"
+
+    def test_other_tracks_keep_basenote_57(self):
+        from lmms_mcp import server as srv
+        root = create_empty_project()
+        names = [n for n in srv.KNOWN_INSTRUMENTS
+                 if n not in ("zynaddsubfx", "opulenz")]
+        for n in names:
+            add_instrument_track(root, n, instrument=n)
+        # papu is what freeboy is called in LMMS 1.2 on Linux
+        add_instrument_track(root, "papu", instrument="papu")
+        assert {self._written(root, i) for i in range(len(names) + 1)} == {"57"}
+
+    def test_pattern_track_kicker_keeps_basenote_57(self):
+        root = create_empty_project()
+        add_pattern_track(root, "Beat")
+        kicker = root.find(".//bbtrack//instrumenttrack")
+        assert kicker.get("basenote") == "57"
+
+    def test_server_tool_writes_the_compensated_basenote(self):
+        from lmms_mcp import server as srv
+        proj = LMMSProject()
+        proj.new()
+        srv.set_project(proj)
+        srv.add_instrument_track("Z", instrument="zynaddsubfx")
+        srv.add_instrument_track("T", instrument="tripleoscillator")
+        srv.add_instrument_track("S", instrument="audiofileprocessor")
+        assert [self._written(proj.root, i) for i in range(3)] == [
+            "45", "57", "57"]
+
+    # --- a track's base note ------------------------------------------------
+
+    def test_user_base_note_round_trip(self):
+        from lmms_mcp import pitch
+        root = create_empty_project()
+        add_instrument_track(root, "Z", instrument="zynaddsubfx")
+        add_instrument_track(root, "T", instrument="tripleoscillator")
+        zyn, tri = self._inst_track(root, 0), self._inst_track(root, 1)
+        assert pitch.get_base_note(zyn) == 57
+        assert pitch.get_base_note(tri) == 57
+        assert pitch.set_base_note(zyn, 60) == 48
+        assert zyn.get("basenote") == "48"
+        assert pitch.get_base_note(zyn) == 60
+        assert pitch.set_base_note(tri, 60) == 60
+        with pytest.raises(ValueError):
+            pitch.set_base_note(zyn, 3)  # would need basenote -9
+        assert zyn.get("basenote") == "48"  # unchanged
+
+    # --- ZynAddSubFX presets carry their own octave -------------------------
+
+    @pytest.mark.parametrize("coarse, octave", [
+        (0, 0), (1024, 1), (2048, 2), (7 * 1024, 7), (8 * 1024, -8),
+        (15 * 1024, -1), (14 * 1024, -2),
+        (1024 + 5, 1), (15 * 1024 + 1023, -1),  # semitone bits are not octaves
+    ])
+    def test_zyn_octave_from_coarse_detune(self, coarse, octave):
+        from lmms_mcp import pitch
+        assert pitch.zyn_octave_from_coarse_detune(coarse) == octave
+
+    def test_preset_octave_reads_the_first_enabled_engine(self):
+        from lmms_mcp import pitch
+        for octave in (-2, -1, 0, 1, 2):
+            for engine in ("add", "pad", "sub"):
+                root = ET.fromstring(self._preset_xml(octave, engine))
+                assert pitch.zyn_preset_octave(root.find("INSTRUMENT")) == octave
+        assert pitch.zyn_preset_octave(None) == 0
+        assert pitch.zyn_preset_octave(ET.fromstring("<INSTRUMENT/>")) == 0
+
+    def test_preset_octave_prefers_additive_over_pad_and_skips_disabled(self):
+        from lmms_mcp import pitch
+        both = self._preset_xml(1, "add").replace(
+            '<par_bool name="add_enabled" value="yes"/>',
+            '<par_bool name="add_enabled" value="yes"/>'
+            '<par_bool name="pad_enabled" value="yes"/>'
+            '<PAD_SYNTH_PARAMETERS><FREQUENCY_PARAMETERS>'
+            '<par name="coarse_detune" value="15360"/>'
+            '</FREQUENCY_PARAMETERS></PAD_SYNTH_PARAMETERS>')
+        assert pitch.zyn_preset_octave(
+            ET.fromstring(both).find("INSTRUMENT")) == 1
+        # a disabled first item is skipped
+        skipped = self._preset_xml(2, "add").replace(
+            '<par_bool name="enabled" value="yes"/>',
+            '<par_bool name="enabled" value="no"/>', 1)
+        assert pitch.zyn_preset_octave(
+            ET.fromstring(skipped).find("INSTRUMENT")) == 0
+
+    @pytest.mark.parametrize("octave, written", [
+        (0, "45"), (1, "57"), (-1, "33"), (2, "69"), (-2, "21"),
+    ])
+    def test_loading_a_preset_compensates_its_octave(self, octave, written):
+        from lmms_mcp.xml_parser import embed_zyn_preset
+        root = create_empty_project()
+        add_instrument_track(root, "Z", instrument="zynaddsubfx")
+        result = embed_zyn_preset(root, 0, self._preset_xml(octave))
+        assert result["preset_octave"] == octave
+        assert self._written(root) == written
+        # the user-facing base note stays A4
+        from lmms_mcp import pitch
+        assert pitch.get_base_note(self._inst_track(root)) == 57
+
+    def test_switching_presets_follows_the_octave_each_time(self):
+        from lmms_mcp.xml_parser import embed_zyn_preset
+        root = create_empty_project()
+        add_instrument_track(root, "Z", instrument="zynaddsubfx")
+        seen = []
+        for octave in (1, 0, -1, 1, 0):
+            embed_zyn_preset(root, 0, self._preset_xml(octave))
+            seen.append(self._written(root))
+        assert seen == ["57", "45", "33", "57", "45"]
+
+    def test_custom_base_note_survives_a_preset_change(self):
+        from lmms_mcp import pitch
+        from lmms_mcp.xml_parser import embed_zyn_preset
+        root = create_empty_project()
+        add_instrument_track(root, "Z", instrument="zynaddsubfx")
+        pitch.set_base_note(self._inst_track(root), 60)
+        embed_zyn_preset(root, 0, self._preset_xml(1))
+        assert pitch.get_base_note(self._inst_track(root)) == 60
+        embed_zyn_preset(root, 0, self._preset_xml(0))
+        assert pitch.get_base_note(self._inst_track(root)) == 60
+
+    def test_uncalibrated_zyn_track_is_not_shifted_by_a_flat_preset(self):
+        """A track made elsewhere (basenote 57) only moves by the octave
+        difference its preset brings, not by the table offset."""
+        from lmms_mcp.xml_parser import embed_zyn_preset
+        root = create_empty_project()
+        add_instrument_track(root, "Z", instrument="zynaddsubfx")
+        self._inst_track(root).set("basenote", "57")
+        embed_zyn_preset(root, 0, self._preset_xml(0))
+        assert self._written(root) == "57"
+
+    def test_failed_preset_load_leaves_the_basenote(self):
+        from lmms_mcp.xml_parser import embed_zyn_preset
+        root = create_empty_project()
+        add_instrument_track(root, "Z", instrument="zynaddsubfx")
+        with pytest.raises(ValueError):
+            embed_zyn_preset(root, 0, "<not-a-preset/>")
+        assert self._written(root) == "45"
+
+    def test_load_zyn_preset_tool_reports_the_octave(self, tmp_path, monkeypatch):
+        import gzip
+        from lmms_mcp import lmms_app, presets
+        from lmms_mcp import server as srv
+        zyn_dir = tmp_path / "ZynAddSubFX"
+        (zyn_dir / "Bass").mkdir(parents=True)
+        for rel, octave, name in (("Bass/0001-Deep.xiz", -1, "Deep"),
+                                  ("Bass/0002-Plain.xiz", 0, "Plain"),
+                                  ("Bass/0003-Bell.xiz", 1, "Bell")):
+            with gzip.open(zyn_dir / rel, "wb") as f:
+                f.write(self._preset_xml(octave, name=name).encode())
+        monkeypatch.setenv("LMMS_PRESETS_DIR", str(zyn_dir))
+        monkeypatch.setattr(presets, "_static_preset_candidates", lambda: [])
+        monkeypatch.setattr(lmms_app, "find_lmms_exe", lambda: None)
+        proj = LMMSProject()
+        proj.new()
+        srv.set_project(proj)
+        srv.add_instrument_track("Z", instrument="zynaddsubfx")
+
+        deep = json.loads(srv.load_zyn_preset(0, "Bass/Deep"))
+        assert deep["preset_octave"] == -1
+        assert "-1 octave" in deep["note"] and "A4 = 440 Hz" in deep["note"]
+        assert deep["playable_keys"] == [0, 83]
+        assert self._written(proj.root) == "33"
+
+        plain = json.loads(srv.load_zyn_preset(0, "Bass/Plain"))
+        assert "preset_octave" not in plain and "note" not in plain
+        assert plain["playable_keys"] == [0, 95]
+        assert self._written(proj.root) == "45"
+
+        bell = json.loads(srv.load_zyn_preset(0, "Bass/Bell"))
+        assert bell["preset_octave"] == 1
+        assert bell["playable_keys"] == [0, 107]
+        assert self._written(proj.root) == "57"
+
+    # --- keys a plugin cannot play ----------------------------------------
+
+    def test_playable_key_ranges(self):
+        from lmms_mcp import pitch
+        root = create_empty_project()
+        for n in ("zynaddsubfx", "tripleoscillator", "papu", "sid", "OPL2"):
+            add_instrument_track(root, n, instrument=n)
+        ranges = [pitch.playable_key_range(self._inst_track(root, i))
+                  for i in range(5)]
+        assert ranges == [(0, 95), None, (24, 95), (2, 94), (0, 90)]
+
+    def test_playable_keys_follow_the_written_basenote(self):
+        from lmms_mcp import pitch
+        root = create_empty_project()
+        add_instrument_track(root, "Z", instrument="zynaddsubfx")
+        track = self._inst_track(root)
+        assert pitch.playable_key_range(track) == (0, 95)
+        track.set("basenote", "57")  # nothing added to the key any more
+        assert pitch.playable_key_range(track) == (0, 107)
+        track.set("basenote", "33")  # 24 semitones added
+        assert pitch.playable_key_range(track) == (0, 83)
+
+    def test_key_range_warning(self):
+        from lmms_mcp import pitch
+        root = create_empty_project()
+        add_instrument_track(root, "Z", instrument="zynaddsubfx")
+        add_instrument_track(root, "T", instrument="tripleoscillator")
+        zyn, tri = self._inst_track(root, 0), self._inst_track(root, 1)
+        assert pitch.key_range_warning(zyn, 95) is None
+        warning = pitch.key_range_warning(zyn, 96)
+        assert "Key 96 (C8)" in warning and "0-95" in warning
+        assert pitch.key_range_warning(tri, 108) is None
+
+    def test_add_instrument_track_reports_playable_keys(self):
+        from lmms_mcp import server as srv
+        proj = LMMSProject()
+        proj.new()
+        srv.set_project(proj)
+        zyn = json.loads(srv.add_instrument_track("Z", instrument="zynaddsubfx"))
+        tri = json.loads(srv.add_instrument_track("T", instrument="tripleoscillator"))
+        assert zyn["playable_keys"] == [0, 95]
+        assert "playable_keys" not in tri
+
+    def test_add_note_warns_outside_the_playable_keys_but_adds_it(self):
+        from lmms_mcp import server as srv
+        proj = LMMSProject()
+        proj.new()
+        srv.set_project(proj)
+        srv.add_instrument_track("Z", instrument="zynaddsubfx")
+        srv.add_instrument_track("T", instrument="tripleoscillator")
+        ok = json.loads(srv.add_note(0, key=95))
+        assert "warning" not in ok
+        high = json.loads(srv.add_note(0, key=100))
+        assert "Key 100" in high["warning"] and "Added note" in high["message"]
+        assert "warning" not in json.loads(srv.add_note(1, key=100))
+        by_name = json.loads(srv.add_note_by_name(0, "C8"))
+        assert "Key 96" in by_name["warning"]
+        keys = [n.get("key") for n in proj.root.iter("note")]
+        assert keys == ["95", "100", "96", "100"]
+
+    def test_add_notes_batch_warns_per_note_and_overall(self):
+        from lmms_mcp import server as srv
+        proj = LMMSProject()
+        proj.new()
+        srv.set_project(proj)
+        srv.add_instrument_track("Z", instrument="zynaddsubfx")
+        res = json.loads(srv.add_notes_batch(0, [
+            {"key": 57, "pos": 0}, {"key": 96, "pos": 48},
+            {"key": 108, "pos": 96}, {"key": 200, "pos": 144},
+        ]))
+        assert res["added"] == 3 and res["failed"] == 1
+        assert [("warning" in n) for n in res["notes"]] == [False, True, True]
+        assert "2 of 3 added notes are outside" in res["warning"]
+        assert "1 of 4 notes were NOT added" in res["warning"]
+        clean = json.loads(srv.add_notes_batch(0, [{"key": 60, "pos": 0}]))
+        assert "warning" not in clean
+
+    # --- what the agent is told -------------------------------------------
+
+    def test_instructions_state_the_pitch_and_its_exceptions(self):
+        from lmms_mcp import server as srv
+        text = " ".join(srv.build_instructions(
+            srv._availability, "/tmp/p").split())
+        assert "every offered instrument is tuned so that key 57 = A4 = 440 Hz" in text
+        # compensated: zynaddsubfx everywhere; opulenz only where LMMS
+        # loads it as OPL2 (the fake install here has a plugin "opulenz")
+        assert "octave low in LMMS (zynaddsubfx)" in text
+        assert "kicker is a drum and ignores the key" in text
+        assert "sfxr is a sound-effect synth" in text
+        assert "audiofileprocessor plays its sample at its original pitch" in text
+        assert "e.g. zynaddsubfx plays keys 0-95 only" in text
+        assert "an octave shift built into a preset" in text
+
+    def test_instructions_only_name_offered_instruments(self):
+        from lmms_mcp import lmms_app
+        from lmms_mcp import server as srv
+        av = lmms_app.build_availability(
+            srv.KNOWN_INSTRUMENTS, srv.effects_mod.KNOWN_EFFECTS,
+            {"tripleoscillator", "lb302"}, "1.2.2", windows=False)
+        text = " ".join(srv.build_instructions(av, "/tmp/p").split())
+        assert "key 57 = A4 = 440 Hz" in text
+        for word in ("kicker", "sfxr", "zynaddsubfx", "opulenz",
+                     "audiofileprocessor", "playable_keys"):
+            assert word not in text, word
+
+    def test_instructions_name_opulenz_when_lmms_loads_it_as_opl2(self):
+        from lmms_mcp import lmms_app
+        from lmms_mcp import server as srv
+        av = lmms_app.build_availability(
+            srv.KNOWN_INSTRUMENTS, srv.effects_mod.KNOWN_EFFECTS,
+            {"tripleoscillator", "opl2", "zynaddsubfx"}, "1.2.2",
+            stems={"opl2": "OPL2"}, windows=False)
+        assert av.plugin_name("opulenz") == "OPL2"
+        text = " ".join(srv.build_instructions(av, "/tmp/p").split())
+        assert "octave low in LMMS (opulenz, zynaddsubfx)" in text
+
+    def test_default_playable_keys_of_a_new_track(self):
+        from lmms_mcp import pitch
+        assert pitch.default_playable_keys("zynaddsubfx") == (0, 95)
+        assert pitch.default_playable_keys("OPL2") == (0, 90)
+        assert pitch.default_playable_keys("papu") == (24, 95)
+        assert pitch.default_playable_keys("monstro") is None

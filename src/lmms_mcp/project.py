@@ -15,8 +15,10 @@ from .models import (
     SongInfo,
     key_to_note_name,
 )
+from . import pitch
 from .xml_parser import (
     create_empty_project,
+    find_track_element,
     element_to_dict,
     find_mixer_channels,
     find_tracks,
@@ -379,7 +381,34 @@ class LMMSProject:
                 f"{res['old_len']} -> {res['new_len']}: notes beyond a "
                 f"pattern clip's end are silent in LMMS]"
             )
-        return {"message": message}
+        result = {"message": message}
+        warning = self.key_range_warning(track_index, key)
+        if warning:
+            result["warning"] = warning
+        return result
+
+    def playable_keys(self, track_index: int) -> tuple[int, int] | None:
+        """Keys the track's instrument plays at the right pitch, if limited.
+
+        None for the whole range 0-108 and for tracks that are not plain
+        instrument tracks (pattern tracks, sample tracks ...).
+        """
+        inst_track = self._instrument_track_element(track_index)
+        return None if inst_track is None else pitch.playable_key_range(
+            inst_track)
+
+    def key_range_warning(self, track_index: int, key: int) -> str | None:
+        """Warning when `key` is outside what the track's instrument plays."""
+        inst_track = self._instrument_track_element(track_index)
+        return None if inst_track is None else pitch.key_range_warning(
+            inst_track, key)
+
+    def _instrument_track_element(self, track_index: int) -> ET.Element | None:
+        try:
+            track = find_track_element(self.root, track_index)
+        except ValueError:
+            return None
+        return track.find("instrumenttrack")
 
     def add_mixer_channel(self, name: str, volume: float = 1.0) -> dict:
         """Add a mixer channel."""
