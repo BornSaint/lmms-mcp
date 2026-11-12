@@ -7,53 +7,89 @@ from xml.etree import ElementTree as ET
 
 import pytest
 
-from lmms_mcp.models import Note, midi_to_note_name, note_name_to_midi, bars_to_ticks, ticks_to_bars
+from lmms_mcp.models import (
+    KEY_MAX,
+    KEY_MIN,
+    MIDI_NOTE_OFFSET,
+    Note,
+    bars_to_ticks,
+    key_to_note_name,
+    note_name_to_key,
+    ticks_to_bars,
+)
 from lmms_mcp.xml_parser import create_empty_project, load_project, save_project, find_tracks, add_instrument_track, add_note_to_track, add_pattern_track, add_sample_track
 from lmms_mcp.project import LMMSProject
 
 
 class TestModels:
-    def test_midi_to_note_name(self):
-        assert midi_to_note_name(60) == "C4"
-        assert midi_to_note_name(69) == "A4"
-        assert midi_to_note_name(0) == "C-1"
-        assert midi_to_note_name(127) == "G9"
+    def test_key_to_note_name(self):
+        assert key_to_note_name(48) == "C4"
+        assert key_to_note_name(57) == "A4"
+        assert key_to_note_name(0) == "C0"
+        assert key_to_note_name(108) == "C9"
+        assert key_to_note_name(34) == "A#2"
 
-    def test_note_name_to_midi(self):
-        assert note_name_to_midi("C4") == 60
-        assert note_name_to_midi("A4") == 69
-        assert note_name_to_midi("A#3") == 58
+    def test_note_name_to_key(self):
+        assert note_name_to_key("C4") == 48
+        assert note_name_to_key("A4") == 57
+        assert note_name_to_key("A#3") == 46
+        assert note_name_to_key("C0") == 0
+        assert note_name_to_key("C9") == 108
+
+    def test_numbering_matches_measured_pitch(self):
+        # Measured with LMMS 1.2.2 renders: key 45 -> 220 Hz, key 57 ->
+        # 440 Hz, key 69 -> 880 Hz, key 48 -> 261.63 Hz (middle C).
+        def hz(name):
+            return 440 * 2 ** ((note_name_to_key(name) - 57) / 12)
+
+        assert hz("A3") == pytest.approx(220)
+        assert hz("A4") == pytest.approx(440)
+        assert hz("A5") == pytest.approx(880)
+        assert hz("C4") == pytest.approx(261.63, abs=0.01)
+
+    def test_midi_note_is_key_plus_12(self):
+        assert MIDI_NOTE_OFFSET == 12
+        assert note_name_to_key("C4") + MIDI_NOTE_OFFSET == 60  # MIDI middle C
+        assert note_name_to_key("A4") + MIDI_NOTE_OFFSET == 69  # MIDI A440
+
+    def test_key_range_is_c0_to_c9(self):
+        assert (KEY_MIN, KEY_MAX) == (0, 108)
+        assert key_to_note_name(KEY_MIN) == "C0"
+        assert key_to_note_name(KEY_MAX) == "C9"
 
     def test_roundtrip_note_names(self):
-        for key in [0, 24, 48, 60, 69, 72, 96, 127]:
-            name = midi_to_note_name(key)
-            assert note_name_to_midi(name) == key
+        for key in range(KEY_MIN, KEY_MAX + 1):
+            name = key_to_note_name(key)
+            assert note_name_to_key(name) == key
 
     @pytest.mark.parametrize("name,key", [
-        ("Bb2", 46), ("A#2", 46), ("Eb4", 63), ("Db3", 49),
-        ("Cb4", 59), ("B#3", 60), ("E#4", 65), ("Fb4", 64),
-        ("bb2", 46), ("b3", 59), ("B3", 59), ("c4", 60), ("c#4", 61),
-        ("C-1", 0), ("G9", 127), ("Cb0", 11), ("B\u266d2", 46),
-        ("F\u266f3", 54), ("Bbb3", 57), ("F##3", 55), (" Bb2 ", 46),
+        ("Bb2", 34), ("A#2", 34), ("Eb4", 51), ("Db3", 37),
+        ("Cb4", 47), ("B#3", 48), ("E#4", 53), ("Fb4", 52),
+        ("bb2", 34), ("b3", 47), ("B3", 47), ("c4", 48), ("c#4", 49),
+        ("C0", 0), ("C9", 108), ("Cb1", 11), ("B\u266d2", 34),
+        ("F\u266f3", 42), ("Bbb3", 45), ("F##3", 43), (" Bb2 ", 34),
+        ("B#0", 12), ("B#8", 108),
     ])
-    def test_note_name_to_midi_flats_and_enharmonics(self, name, key):
-        assert note_name_to_midi(name) == key
+    def test_note_name_to_key_flats_and_enharmonics(self, name, key):
+        assert note_name_to_key(name) == key
 
     def test_flat_and_sharp_enharmonics_agree(self):
         # Every sharp name (C#, D#, F#, G#, A#) has a flat twin one letter
         # up in the same octave (Db, Eb, Gb, Ab, Bb).
-        for key in range(128):
-            sharp = midi_to_note_name(key)
+        for key in range(KEY_MIN, KEY_MAX + 1):
+            sharp = key_to_note_name(key)
             if "#" not in sharp:
                 continue
             flat_letter = "ABCDEFG"[("ABCDEFG".index(sharp[0]) + 1) % 7]
             octave = sharp[2:]
-            assert note_name_to_midi(f"{flat_letter}b{octave}") == key
+            assert note_name_to_key(f"{flat_letter}b{octave}") == key
 
-    @pytest.mark.parametrize("name", ["G#9", "Ab9", "C10", "Cb-1", "C-2"])
-    def test_note_name_out_of_midi_range(self, name):
-        with pytest.raises(ValueError, match="out of range.*0-127"):
-            note_name_to_midi(name)
+    @pytest.mark.parametrize("name", [
+        "C#9", "Db9", "C10", "Cb0", "C-1", "B-1", "Bb-1", "A9",
+    ])
+    def test_note_name_out_of_range(self, name):
+        with pytest.raises(ValueError, match=r"out of range.*0-108.*C0 to C9"):
+            note_name_to_key(name)
 
     @pytest.mark.parametrize("name", [
         "H2", "", "  ", "C", "4", "60", "BB2", "C#b4", "Cbbb4", "bbbb3",
@@ -61,14 +97,20 @@ class TestModels:
     ])
     def test_note_name_invalid_states_format(self, name):
         with pytest.raises(ValueError) as exc:
-            note_name_to_midi(name)
+            note_name_to_key(name)
         msg = str(exc.value)
         assert f"Invalid note name {name!r}" in msg
-        assert "Bb2" in msg and "F#3" in msg and "C4 = 60" in msg
+        assert "Bb2" in msg and "F#3" in msg and "C4 = 48" in msg
 
     def test_note_name_non_string_rejected(self):
         with pytest.raises(ValueError, match="Invalid note name"):
-            note_name_to_midi(60)
+            note_name_to_key(48)
+
+    def test_old_midi_helper_names_are_gone(self):
+        from lmms_mcp import models
+
+        assert not hasattr(models, "note_name_to_midi")
+        assert not hasattr(models, "midi_to_note_name")
 
     def test_bars_to_ticks(self):
         assert bars_to_ticks(1) == 192
@@ -79,14 +121,19 @@ class TestModels:
         assert ticks_to_bars(768) == 4.0
 
     def test_note_to_dict(self):
-        note = Note(key=60, pos=0, length=48, volume=100)
+        note = Note(key=48, pos=0, length=48, volume=100)
         d = note.to_dict()
-        assert d["key"] == 60
+        assert d["key"] == 48
         assert d["note_name"] == "C4"
 
+    def test_note_default_key_is_middle_c(self):
+        assert Note().key == 48
+        assert Note().to_dict()["note_name"] == "C4"
+        assert Note.from_dict({}).key == 48
+
     def test_note_from_dict(self):
-        note = Note.from_dict({"key": 69, "pos": 48, "length": 96})
-        assert note.key == 69
+        note = Note.from_dict({"key": 57, "pos": 48, "length": 96})
+        assert note.key == 57
         assert note.pos == 48
 
 
@@ -2001,7 +2048,7 @@ class TestNoteValidation:
         res = json.loads(srv.add_note_by_name(0, "Bb2", pos=0, length=48))
         assert "error" not in res
         notes = self._note_elems(proj)
-        assert [n.get("key") for n in notes] == ["46"]
+        assert [n.get("key") for n in notes] == ["34"]
 
     def test_add_note_by_name_invalid_reports_error(self):
         srv, proj = self._srv()
@@ -2013,14 +2060,17 @@ class TestNoteValidation:
 
     def test_add_note_by_name_out_of_range(self):
         srv, proj = self._srv()
-        res = json.loads(srv.add_note_by_name(0, "G#9"))
-        assert "error" in res and "out of range" in res["error"]
+        for name in ("C#9", "G#9", "C-1"):
+            res = json.loads(srv.add_note_by_name(0, name))
+            assert "error" in res and "out of range" in res["error"], name
+            assert "C0 to C9" in res["error"], name
         assert self._note_elems(proj) == []
 
     def test_add_note_validation(self):
         srv, proj = self._srv()
         for kwargs, fragment in [
             ({"key": 128}, "key 128 is out of range"),
+            ({"key": 109}, "key 109 is out of range"),
             ({"key": -1}, "key -1 is out of range"),
             ({"pos": -48}, "pos must be >= 0"),
             ({"length": 0}, "length must be > 0"),
@@ -2042,23 +2092,23 @@ class TestNoteValidation:
 
     def test_add_note_valid_still_works(self):
         srv, proj = self._srv()
-        res = json.loads(srv.add_note(0, key=127, pos=0, length=12))
+        res = json.loads(srv.add_note(0, key=108, pos=0, length=12))
         assert "error" not in res and "message" in res
-        assert [n.get("key") for n in self._note_elems(proj)] == ["127"]
+        assert [n.get("key") for n in self._note_elems(proj)] == ["108"]
 
     def test_batch_all_valid(self):
         srv, proj = self._srv()
         res = json.loads(srv.add_notes_batch(0, [
             {"key": "Bb2", "pos": 0, "length": 24},
             {"key": "C#3", "pos": 24, "length": 24},
-            {"key": 60, "pos": 48},
+            {"key": 48, "pos": 48},
         ]))
         assert res["added"] == 3
         assert res["failed"] == 0
         assert res["errors"] == []
         assert len(res["notes"]) == 3
         assert "warning" not in res and "error" not in res
-        assert [n.get("key") for n in self._note_elems(proj)] == ["46", "49", "60"]
+        assert [n.get("key") for n in self._note_elems(proj)] == ["34", "37", "48"]
 
     def test_batch_mixed_valid_and_invalid(self):
         srv, proj = self._srv()
@@ -2075,7 +2125,7 @@ class TestNoteValidation:
         assert err["index"] == 0
         assert err["note"] == bad
         assert "Invalid note name 'H2'" in err["error"]
-        assert [n.get("key") for n in self._note_elems(proj)] == ["46"]
+        assert [n.get("key") for n in self._note_elems(proj)] == ["34"]
 
     def test_batch_numeric_and_range_validation(self):
         srv, proj = self._srv()
@@ -2138,10 +2188,216 @@ class TestNoteValidation:
 
     def test_note_name_to_key_tool_flats(self):
         from lmms_mcp import server as srv
-        assert json.loads(srv.note_name_to_key("Bb2"))["midi_key"] == 46
+        res = json.loads(srv.note_name_to_key("Bb2"))
+        assert res["key"] == 34 and res["midi_note"] == 46
         assert "error" in json.loads(srv.note_name_to_key("H2"))
         scale = json.loads(srv.generate_scale("Bb2", "major"))
-        assert scale["notes"][0]["key"] == 46
+        assert scale["notes"][0]["key"] == 34
+
+    # --- LMMS key numbering (C4 = 48, A4 = 57 = 440 Hz) -------------------
+
+    def test_note_names_become_lmms_keys(self):
+        srv, proj = self._srv()
+        res = json.loads(srv.add_notes_batch(0, [
+            {"key": "A3", "pos": 0}, {"key": "A4", "pos": 192},
+            {"key": "C4", "pos": 384}, {"key": "A5", "pos": 576},
+            {"key": "Cb4", "pos": 768}, {"key": "B#3", "pos": 960},
+            {"key": "C0", "pos": 1152}, {"key": "C9", "pos": 1344},
+        ]))
+        assert res["failed"] == 0
+        assert [n.get("key") for n in self._note_elems(proj)] == [
+            "45", "57", "48", "69", "47", "48", "0", "108"]
+        # each result says which key (and name) the note was written as
+        assert "key=45 (A3)" in res["notes"][0]["message"]
+        assert "key=57 (A4)" in res["notes"][1]["message"]
+        assert "key=48 (C4)" in res["notes"][2]["message"]
+        assert "key=69 (A5)" in res["notes"][3]["message"]
+
+    def test_add_note_by_name_a4_is_key_57(self):
+        srv, proj = self._srv()
+        res = json.loads(srv.add_note_by_name(0, "A4"))
+        assert "error" not in res
+        assert [n.get("key") for n in self._note_elems(proj)] == ["57"]
+
+    def test_add_note_default_key_is_middle_c(self):
+        srv, proj = self._srv()
+        assert "error" not in json.loads(srv.add_note(0))
+        assert [n.get("key") for n in self._note_elems(proj)] == ["48"]
+        assert json.loads(srv.add_note_by_name(0))  # default name C4
+        assert [n.get("key") for n in self._note_elems(proj)] == ["48", "48"]
+        # a batch note without a key is middle C too
+        assert json.loads(srv.add_notes_batch(0, [{"pos": 48}]))["added"] == 1
+        assert [n.get("key") for n in self._note_elems(proj)][-1] == "48"
+
+    def test_key_range_errors_name_the_range_and_the_midi_offset(self):
+        srv, proj = self._srv()
+        res = json.loads(srv.add_note(0, key=120))
+        msg = res["error"]
+        assert "Note NOT added" in msg
+        assert "0-108" in msg and "C0 to C9" in msg
+        assert "middle C (C4) = 48" in msg and "A4 = 57 = 440 Hz" in msg
+        assert "MIDI note number is key + 12" in msg
+        assert "use 108" in msg  # 120 as a MIDI note is key 108
+        res = json.loads(srv.add_notes_batch(0, [{"key": 60}, {"key": 109}]))
+        assert res["added"] == 1 and res["failed"] == 1
+        assert "key 109 is out of range" in res["errors"][0]["error"]
+        assert [n.get("key") for n in self._note_elems(proj)] == ["60"]
+
+    def test_lowest_and_highest_keys_are_accepted(self):
+        srv, proj = self._srv()
+        for key in (0, 108):
+            assert "error" not in json.loads(srv.add_note(0, key=key))
+        assert [n.get("key") for n in self._note_elems(proj)] == ["0", "108"]
+
+    def test_key_to_note_name_tool(self):
+        from lmms_mcp import server as srv
+        res = json.loads(srv.key_to_note_name(48))
+        assert res == {"key": 48, "note": "C4", "midi_note": 60}
+        res = json.loads(srv.key_to_note_name(57))
+        assert res["note"] == "A4" and res["midi_note"] == 69
+        assert json.loads(srv.key_to_note_name(0))["note"] == "C0"
+        assert json.loads(srv.key_to_note_name(108))["note"] == "C9"
+        for bad in (-1, 109, 127):
+            res = json.loads(srv.key_to_note_name(bad))
+            assert "0-108" in res["error"] and "C0 to C9" in res["error"]
+
+    def test_key_and_name_tools_round_trip_the_whole_range(self):
+        from lmms_mcp import server as srv
+        for key in range(0, 109):
+            name = json.loads(srv.key_to_note_name(key))["note"]
+            back = json.loads(srv.note_name_to_key(name))
+            assert back["key"] == key
+            assert back["midi_note"] == key + 12
+
+    def test_note_name_to_key_tool_range_errors(self):
+        from lmms_mcp import server as srv
+        for name in ("C#9", "C-1", "C10"):
+            res = json.loads(srv.note_name_to_key(name))
+            assert "out of range" in res["error"], name
+
+    def test_generate_scale_uses_lmms_keys_and_stops_at_c9(self):
+        from lmms_mcp import server as srv
+        scale = json.loads(srv.generate_scale("C4", "major"))
+        assert [n["key"] for n in scale["notes"]] == [48, 50, 52, 53, 55, 57, 59]
+        assert [n["note"] for n in scale["notes"]] == [
+            "C4", "D4", "E4", "F4", "G4", "A4", "B4"]
+        top = json.loads(srv.generate_scale("A8", "major", num_octaves=2))
+        assert max(n["key"] for n in top["notes"]) <= 108
+        assert top["notes"][0]["key"] == 105
+        assert top["count"] == len(top["notes"]) < 14
+        assert "error" in json.loads(srv.generate_scale("C10"))
+
+    def test_note_names_resource_is_the_lmms_mapping(self):
+        from lmms_mcp import server as srv
+        data = json.loads(srv.resource_note_names())
+        assert data["total"] == 109 == len(data["mapping"])
+        by_key = {m["key"]: m for m in data["mapping"]}
+        assert by_key[0]["note"] == "C0" and by_key[108]["note"] == "C9"
+        assert by_key[48]["note"] == "C4" and by_key[48]["midi_note"] == 60
+        assert by_key[57]["note"] == "A4" and by_key[57]["midi_note"] == 69
+        assert "MIDI note number is key + 12" in data["numbering"]
+
+    def test_notes_read_back_with_lmms_names(self):
+        srv, proj = self._srv()
+        srv.add_note(0, key=57)
+        track = json.loads(srv.get_track(0))
+        names = [n["note_name"] for p in track["patterns"] for n in p["notes"]]
+        assert names == ["A4"]
+
+
+class TestKeyNumberingDocs:
+    """Every doc, prompt and resource states the LMMS numbering and none
+    still says MIDI numbers (60 = C4, 69 = A4, kick = 36)."""
+
+    STALE = (
+        "60=C4", "60 = C4", "69=A4", "69 = A4", "C-1", "G9",
+        "outside 0-127", "int 0-127", "number (0-127)", "keys 0-127",
+        "MIDI key", "midi_key", "A3 in this server", "Key 36", "Key 38",
+        "one octave down",
+    )
+    STATEMENT = (
+        "Keys are LMMS keys: middle C (C4) = 48, A4 = 57 = 440 Hz. "
+        "A MIDI note number is key + 12."
+    )
+
+    def _texts(self, server_for):
+        import asyncio
+        srv = server_for(LMMS_122_PLUGINS)
+        tools = {t.name: t.description or ""
+                 for t in asyncio.run(srv.mcp.list_tools())}
+        prompts = {
+            "create_basic_song": srv.create_basic_song(),
+            "add_drum_pattern": srv.add_drum_pattern(),
+            "create_melody": srv.create_melody(),
+        }
+        return srv, tools, prompts
+
+    def test_instructions_state_the_numbering_once(self, server_for):
+        srv, _, _ = self._texts(server_for)
+        text = " ".join(srv.mcp.instructions.split())
+        assert self.STATEMENT in text
+        assert text.count("A MIDI note number is key + 12") == 1
+        assert "Valid keys are 0-108, i.e. C0 to C9." in text
+
+    def test_note_tools_state_the_numbering(self, server_for):
+        _, tools, _ = self._texts(server_for)
+        for name in ("add_note", "add_note_by_name", "note_name_to_key",
+                     "key_to_note_name", "generate_scale"):
+            flat = " ".join(tools[name].split())
+            assert "middle C (C4) = 48" in flat, name
+            assert "A4 = 57 = 440 Hz" in flat, name
+            assert "MIDI note number is key + 12" in flat, name
+        flat = " ".join(tools["add_notes_batch"].split())
+        assert "middle C = C4 = 48" in flat and "key + 12" in flat
+        assert "0-108" in flat and "C0..C9" in flat
+
+    def test_no_text_still_uses_midi_numbering(self, server_for):
+        srv, tools, prompts = self._texts(server_for)
+        everything = {"instructions": srv.mcp.instructions, **tools,
+                      **prompts}
+        for where, text in everything.items():
+            for stale in self.STALE:
+                assert stale not in text, (where, stale)
+
+    def test_audiofile_sample_doc_calls_key_57_a4(self, server_for):
+        _, tools, _ = self._texts(server_for)
+        flat = " ".join(tools["set_audiofile_sample"].split())
+        assert "key 57 (A4, the LMMS default)" in flat
+
+    def test_sf2_drum_keys_are_lmms_keys(self, server_for):
+        _, tools, _ = self._texts(server_for)
+        flat = " ".join(tools["set_instrument_file"].split())
+        assert "notes 35-81 are keys 23-69 here (MIDI note minus 12)" in flat
+        assert ("key 24 kick, 26 snare, 30 closed hi-hat, 34 open hi-hat, "
+                "37 crash") in flat
+
+    def test_drum_prompt_lists_lmms_keys_with_midi_numbers(self, server_for):
+        _, _, prompts = self._texts(server_for)
+        text = prompts["add_drum_pattern"]
+        for line in (
+            "Key 24 = Kick Drum (MIDI 36)", "Key 26 = Snare (MIDI 38)",
+            "Key 30 = Closed Hi-Hat (MIDI 42)",
+            "Key 34 = Open Hi-Hat (MIDI 46)",
+            "Key 37 = Crash Cymbal (MIDI 49)",
+            "Key 39 = Ride Cymbal (MIDI 51)",
+        ):
+            assert line in text
+        assert "a MIDI note number is key + 12" in " ".join(text.split())
+        assert "key 57 (A4," in " ".join(text.split())
+
+    def test_drum_prompt_names_the_kit_only_when_offered(self, server_for):
+        srv = server_for(LMMS_122_PLUGINS - {"sf2player"})
+        text = srv.add_drum_pattern()
+        assert "sf2player" not in text
+        assert "any General MIDI drum instrument" in text
+        assert "Key 24 = Kick Drum" in text
+
+    def test_readme_matches(self):
+        readme = (Path(__file__).resolve().parents[1] / "README.md").read_text()
+        flat = " ".join(readme.split())
+        assert "middle C (C4) = 48, A4 = 57 = 440 Hz. A MIDI note number is key + 12." in flat
+        assert "Note 60" not in readme and "Note 69" not in readme
+        assert "key 24 is the kick (MIDI 36)" in flat
 
 
 # A made-up LMMS 1.2.2 install: independent of the machine running the

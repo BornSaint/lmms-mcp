@@ -6,12 +6,14 @@ from pathlib import Path
 from xml.etree import ElementTree as ET
 
 from .models import (
+    DEFAULT_KEY,
     TrackType,
     Note,
     Pattern,
     Track,
     MixerChannel,
     SongInfo,
+    key_to_note_name,
 )
 from .xml_parser import (
     create_empty_project,
@@ -170,7 +172,7 @@ class LMMSProject:
             )
             for note_elem in pattern_elem.findall("note"):
                 pattern.notes.append(Note(
-                    key=int(note_elem.get("key", "60")),
+                    key=int(note_elem.get("key", str(DEFAULT_KEY))),
                     pos=int(note_elem.get("pos", "0")),
                     length=int(note_elem.get("len", "48")),
                     volume=int(note_elem.get("vol", "100")),
@@ -200,7 +202,7 @@ class LMMSProject:
                 )
                 for note_elem in pattern_elem.findall("note"):
                     pattern.notes.append(Note(
-                        key=int(note_elem.get("key", "60")),
+                        key=int(note_elem.get("key", str(DEFAULT_KEY))),
                         pos=int(note_elem.get("pos", "0")),
                         length=int(note_elem.get("len", "48")),
                         volume=int(note_elem.get("vol", "100")),
@@ -343,7 +345,7 @@ class LMMSProject:
     def add_note(
         self,
         track_index: int,
-        key: int = 60,
+        key: int = DEFAULT_KEY,
         pos: int = 0,
         length: int = 48,
         volume: int = 100,
@@ -368,7 +370,8 @@ class LMMSProject:
         )
         self._modified = True
         message = (
-            f"Added note at track {track_index}: key={key} pos={pos} len={length}"
+            f"Added note at track {track_index}: key={key} "
+            f"({key_to_note_name(key)}) pos={pos} len={length}"
         )
         if res["extended_len"]:
             message += (

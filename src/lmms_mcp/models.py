@@ -22,10 +22,19 @@ TICKS_PER_STEP = 12
 STEPS_PER_BAR = 16
 DEFAULT_BPM = 140
 
+# Note keys are LMMS keys, not MIDI note numbers: LMMS key = MIDI note - 12.
+# C0 = 0, middle C (C4) = 48, A4 = 57 = 440 Hz (the instrument track's
+# default base note). LMMS clamps keys above 108 (C9) to 108 when it loads
+# a project, so 0..108 is the range whose pitch is played exactly.
+KEY_MIN = 0
+KEY_MAX = 108
+MIDI_NOTE_OFFSET = 12
+DEFAULT_KEY = 48  # C4, middle C
+
 
 @dataclass
 class Note:
-    key: int = 60
+    key: int = DEFAULT_KEY
     pos: int = 0
     length: int = 48
     volume: int = 100
@@ -38,13 +47,13 @@ class Note:
             "length": self.length,
             "volume": self.volume,
             "panning": self.panning,
-            "note_name": midi_to_note_name(self.key),
+            "note_name": key_to_note_name(self.key),
         }
 
     @staticmethod
     def from_dict(d: dict) -> Note:
         return Note(
-            key=d.get("key", 60),
+            key=d.get("key", DEFAULT_KEY),
             pos=d.get("pos", 0),
             length=d.get("length", 48),
             volume=d.get("volume", 100),
@@ -161,20 +170,19 @@ class SongInfo:
         }
 
 
-# MIDI note name helpers
+# Note name helpers (LMMS keys, scientific pitch names: C4 = 48, A4 = 57)
 
 NOTE_NAMES = ["C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B"]
 
 
-def midi_to_note_name(midi_key: int) -> str:
-    """Convert a MIDI key number (0-127) to a note name like 'C4', 'A#3'."""
-    octave = (midi_key // 12) - 1
-    note = NOTE_NAMES[midi_key % 12]
-    return f"{note}{octave}"
+def key_to_note_name(key: int) -> str:
+    """Convert an LMMS key number to a note name like 'C4', 'A#3'.
 
+    C0 = key 0, C4 (middle C) = 48, A4 = 57. Keys outside the valid range
+    (e.g. read from an existing project) still get a name.
+    """
+    return f"{NOTE_NAMES[key % 12]}{key // 12}"
 
-MIDI_KEY_MIN = 0
-MIDI_KEY_MAX = 127
 
 # Semitone offset of each natural note within an octave.
 _NATURAL_SEMITONES = {"C": 0, "D": 2, "E": 4, "F": 5, "G": 7, "A": 9, "B": 11}
@@ -184,24 +192,34 @@ _NATURAL_SEMITONES = {"C": 0, "D": 2, "E": 4, "F": 5, "G": 7, "A": 9, "B": 11}
 # and "bb3" is Bb3 (B flat) - there is no ambiguity.
 _NOTE_NAME_RE = re.compile(r"([A-Ga-g])(##|bb|#|b|)(-?[0-9]+)")
 
+KEY_RANGE_TEXT = (
+    f"{KEY_MIN}-{KEY_MAX}, i.e. {key_to_note_name(KEY_MIN)} to "
+    f"{key_to_note_name(KEY_MAX)}"
+)
+
+KEY_NUMBERING_TEXT = (
+    "Keys are LMMS keys: middle C (C4) = 48, A4 = 57 = 440 Hz. "
+    "A MIDI note number is key + 12."
+)
+
 NOTE_NAME_FORMAT_HINT = (
     "Use a letter A-G, optional # or b, and an octave, "
-    "e.g. C4, F#3, Bb2 (C4 = 60)."
+    "e.g. C4, F#3, Bb2 (C4 = 48, A4 = 57 = 440 Hz)."
 )
 
 
-def note_name_to_midi(name: str) -> int:
-    """Convert a note name to a MIDI key number (0-127, C4 = 60).
+def note_name_to_key(name: str) -> int:
+    """Convert a note name to an LMMS key number (C4 = 48, A4 = 57).
 
     Accepts sharps and flats ('A#3', 'Bb3', also the unicode sharp and
     flat signs), a case-insensitive note letter ('bb2' = Bb2,
     'b3' = B3) and double accidentals ('F##3', 'Bbb3'). Enharmonic
     spellings wrap across the octave boundary like on a piano:
-    Cb4 = B3 = 59, B#3 = C4 = 60, E#4 = F4, Fb4 = E4.
+    Cb4 = B3 = 47, B#3 = C4 = 48, E#4 = F4, Fb4 = E4.
 
     Raises ValueError with a message explaining the accepted format when
-    the name is malformed or the result is outside MIDI 0-127
-    (C-1 .. G9).
+    the name is malformed or the result is outside the valid key range
+    (0-108, C0 .. C9).
     """
     if not isinstance(name, str):
         raise ValueError(
@@ -214,8 +232,8 @@ def note_name_to_midi(name: str) -> int:
         hint = NOTE_NAME_FORMAT_HINT
         if re.fullmatch(r"-?[0-9]+", cleaned):
             hint += (
-                " A bare number is a MIDI key, not a note name: pass it "
-                "as an integer (e.g. 60), not a string."
+                " A bare number is a key, not a note name: pass it "
+                "as an integer (e.g. 48), not a string."
             )
         raise ValueError(f"Invalid note name {name!r}. {hint}")
 
@@ -227,12 +245,11 @@ def note_name_to_midi(name: str) -> int:
     else:
         offset = 0
 
-    key = (int(octave_str) + 1) * 12 + _NATURAL_SEMITONES[letter.upper()] + offset
-    if not MIDI_KEY_MIN <= key <= MIDI_KEY_MAX:
+    key = int(octave_str) * 12 + _NATURAL_SEMITONES[letter.upper()] + offset
+    if not KEY_MIN <= key <= KEY_MAX:
         raise ValueError(
-            f"Note {name!r} is out of range (it would be MIDI key {key}; "
-            f"valid keys are {MIDI_KEY_MIN}-{MIDI_KEY_MAX}, i.e. "
-            f"{midi_to_note_name(MIDI_KEY_MIN)} to {midi_to_note_name(MIDI_KEY_MAX)})."
+            f"Note {name!r} is out of range (it would be key {key}; "
+            f"valid keys are {KEY_RANGE_TEXT})."
         )
     return key
 

@@ -7,6 +7,7 @@ from pathlib import Path
 from xml.etree import ElementTree as ET
 
 from . import lmms_app
+from .models import DEFAULT_KEY
 
 
 def _q_compress(data: bytes) -> bytes:
@@ -433,7 +434,7 @@ def _select_pattern(track: ET.Element, pattern_index: int | None) -> ET.Element 
 def add_note_to_track(
     root: ET.Element,
     track_index: int,
-    key: int = 60,
+    key: int = DEFAULT_KEY,
     pos: int = 0,
     length: int = 48,
     volume: int = 100,

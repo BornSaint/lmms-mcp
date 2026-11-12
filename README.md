@@ -6,7 +6,7 @@ An MCP (Model Context Protocol) server for [LMMS](https://lmms.io/) - the free, 
 
 - **Create & save** LMMS projects (`.mmpz` compressed, `.mmp` XML)
 - **Add tracks**: Instrument, Sample, Pattern (Beat/Bassline), Automation
-- **Add notes** with MIDI key, position, velocity, and panning
+- **Add notes** by LMMS key number or note name, with position, velocity, and panning
 - **Effects**: built-in effects on tracks and mixer channels (delay, reverb, EQ, dynamics...)
 - **Adapts to your LMMS**: only plugins your installed LMMS version really has are offered or accepted (see [Installed LMMS version](#installed-lmms-version))
 - **ZynAddSubFX presets**: Load any of ~950 factory instruments (.xiz), tune parameters
@@ -113,8 +113,8 @@ python -m lmms_mcp
 
 | Tool | Description |
 |------|-------------|
-| `add_note` | Add a note by MIDI key number |
-| `add_note_by_name` | Add a note by name (e.g. "C4", "A#3", "Bb2") |
+| `add_note` | Add a note by LMMS key number (0-108; C4 = 48, A4 = 57) |
+| `add_note_by_name` | Add a note by name (e.g. "C4", "A#3", "Bb2"; C0 to C9) |
 | `add_notes_batch` | Add multiple notes at once |
 
 ### Mixer
@@ -233,8 +233,8 @@ update needed.
 
 | Tool | Description |
 |------|-------------|
-| `note_name_to_key` | Convert note name to MIDI number |
-| `key_to_note_name` | Convert MIDI number to note name |
+| `note_name_to_key` | Convert note name to LMMS key number (also returns the MIDI note number) |
+| `key_to_note_name` | Convert LMMS key number to note name (also returns the MIDI note number) |
 | `bars_to_ticks_converter` | Convert bars to ticks |
 | `ticks_to_bars_converter` | Convert ticks to bars |
 | `generate_scale` | Generate a musical scale |
@@ -249,7 +249,7 @@ update needed.
 | `lmms://project/xml` | Raw project XML |
 | `lmms://reference/instruments` | Instruments available in the installed LMMS |
 | `lmms://reference/effects` | Effects available in the installed LMMS |
-| `lmms://reference/note_names` | MIDI note name mapping |
+| `lmms://reference/note_names` | LMMS key number to note name mapping (with MIDI note numbers) |
 | `lmms://reference/scales` | Available musical scales |
 
 ## Prompts
@@ -264,12 +264,21 @@ update needed.
 
 ## LMMS Concepts
 
+Note numbers are LMMS keys, not MIDI note numbers: middle C (C4) = 48,
+A4 = 57 = 440 Hz. A MIDI note number is key + 12. Note names ("C4",
+"Bb2") follow the same numbering, so `add_note_by_name("A4")` is key 57,
+LMMS's 440 Hz reference pitch. Valid keys are 0-108 (C0 to C9). For the
+General MIDI drum kit of `sf2player` (bank 128) this means key 24 is the
+kick (MIDI 36), 26 the snare (38), 30 the closed hi-hat (42), 34 the open
+hi-hat (46) and 37 the crash (49).
+
 | Concept | Value |
 |---------|-------|
 | Ticks per bar | 192 (in 4/4 time) |
 | Default tempo | 140 BPM |
-| Note 60 | C4 (middle C) |
-| Note 69 | A4 (440 Hz) |
+| Key 48 | C4 (middle C, 261.63 Hz) |
+| Key 57 | A4 (440 Hz; the default base note of an instrument track) |
+| Key range | 0-108 (C0 to C9); LMMS clamps higher keys to 108 |
 | Volume range | 0-200 (100 = normal) |
 | Panning range | -100 (left) to +100 (right) |
 | Track type 0 | Instrument |

@@ -18,19 +18,24 @@ from . import lmms_app
 from . import presets as zyn_presets
 from . import xml_parser
 from .models import (
-    MIDI_KEY_MAX,
-    MIDI_KEY_MIN,
+    DEFAULT_KEY,
+    KEY_MAX,
+    KEY_MIN,
+    KEY_NUMBERING_TEXT,
+    KEY_RANGE_TEXT,
+    MIDI_NOTE_OFFSET,
     NOTE_NAMES,
     TICKS_PER_BAR,
     TICKS_PER_STEP,
     STEPS_PER_BAR,
     TrackType,
     Note,
-    midi_to_note_name,
-    note_name_to_midi,
     bars_to_ticks,
     ticks_to_bars,
 )
+# The tools below are named note_name_to_key / key_to_note_name too.
+from .models import key_to_note_name as _key_to_note_name
+from .models import note_name_to_key as _note_name_to_key
 from .project import LMMSProject, get_project, set_project
 
 DEFAULT_PROJECTS_DIR = os.environ.get(
@@ -159,9 +164,9 @@ def _file_instrument_details(av) -> list[str]:
             "sf2player plays a SoundFont (.sf2) with General MIDI programs: "
             "patch 0 piano, 24 nylon guitar, 32 acoustic bass, 40 violin, "
             "48 strings, 56 trumpet, 73 flute (bank 0). Bank 128 is the "
-            "drum kit, played on keys 23-69 of this server (the GM drum map "
-            "35-81 one octave down): 24 kick, 26 snare, 30 closed hi-hat, "
-            "34 open hi-hat, 37 crash."
+            "drum kit; its General MIDI drum notes 35-81 are keys 23-69 "
+            "here (MIDI note minus 12): key 24 kick, 26 snare, 30 closed "
+            "hi-hat, 34 open hi-hat, 37 crash."
         )
     if "gigplayer" in pool:
         details.append(
@@ -318,7 +323,7 @@ def build_instructions(av, projects_dir: str) -> str:
             safe.append(f"{'/'.join(present)} ({role})")
 
     blocks = [
-        """LMMS MCP Server for AI-powered music production.
+        f"""LMMS MCP Server for AI-powered music production.
 
 This server lets you create, load, modify, and save LMMS music projects.
 LMMS is a free, open-source digital audio workstation (DAW).
@@ -329,7 +334,8 @@ Key concepts:
 - Pattern tracks (Beat/Bassline) hold drum patterns in the song editor
 - The Mixer has channels (0=Master) where tracks route their audio
 - Time is measured in ticks: 192 ticks = 1 bar (4/4 time)
-- Notes use MIDI key numbers: 60=C4 (middle C), 69=A4
+- {KEY_NUMBERING_TEXT} Valid keys are {KEY_RANGE_TEXT}.
+  Tools take either the key number or a note name ("C4", "Bb2").
 - Volume: 0-200 (100=normal), Panning: -100 to +100""",
         status,
         f"""IMPORTANT - Instruments: Only use built-in LMMS instrument names (see the
@@ -786,11 +792,10 @@ def set_audiofile_sample(
     the response contains a "warning" (the sample is still set).
 
     Pitch: the sample sounds at its original pitch when the note equals
-    the track's base note, which this server creates as key 57 (A3 in this
-    server's naming where 60=C4; LMMS's own UI calls it A4). So trigger
-    drum one-shots with key=57. Other keys transpose the sample (higher
-    key = higher pitch and shorter), which can be used on purpose for
-    tuned samples or toms.
+    the track's base note, which this server creates as key 57 (A4, the
+    LMMS default). So trigger drum one-shots with key=57. Other keys
+    transpose the sample (higher key = higher pitch and shorter), which
+    can be used on purpose for tuned samples or toms.
 
     Note length: the sample is cut off when the note ends, so use a
     length at least as long as the sample (24 ticks is enough for most
@@ -1104,22 +1109,23 @@ def _validate_note_fields(
 ) -> dict:
     """Validate one note's fields; return them normalised as ints.
 
-    key may be a MIDI number (0-127) or a note name ("C4", "Bb2").
+    key may be an LMMS key number (0-108) or a note name ("C4", "Bb2").
     Raises ValueError with an actionable message on the first problem.
     """
     if isinstance(key, str):
-        key = note_name_to_midi(key)
+        key = _note_name_to_key(key)
     elif isinstance(key, bool) or not isinstance(key, (int, float)):
         raise ValueError(
-            f"key must be a MIDI number 0-127 or a note name like 'Bb2', "
-            f"got {key!r}."
+            f"key must be an LMMS key number {KEY_MIN}-{KEY_MAX} or a note "
+            f"name like 'Bb2', got {key!r}."
         )
     else:
         key = _as_int(key, "key")
-    if not MIDI_KEY_MIN <= key <= MIDI_KEY_MAX:
+    if not KEY_MIN <= key <= KEY_MAX:
         raise ValueError(
-            f"key {key} is out of range: MIDI keys are "
-            f"{MIDI_KEY_MIN}-{MIDI_KEY_MAX} (C-1 to G9, 60 = C4)."
+            f"key {key} is out of range: valid LMMS keys are "
+            f"{KEY_RANGE_TEXT} ({KEY_NUMBERING_TEXT} "
+            f"If {key} is a MIDI note number, use {key - MIDI_NOTE_OFFSET}.)"
         )
 
     pos = _as_int(pos, "pos")
@@ -1170,7 +1176,7 @@ def _track_index_error(proj: LMMSProject, track_index) -> str | None:
 def _add_checked_note(proj: LMMSProject, track_index: int, note: dict) -> dict:
     """Validate one note dict and add it. Raises ValueError / IndexError."""
     fields = _validate_note_fields(
-        note.get("key", 60),
+        note.get("key", DEFAULT_KEY),
         note.get("pos", 0),
         note.get("length", 48),
         note.get("volume", 100),
@@ -1183,7 +1189,7 @@ def _add_checked_note(proj: LMMSProject, track_index: int, note: dict) -> dict:
 @mcp.tool()
 def add_note(
     track_index: int,
-    key: int = 60,
+    key: int = DEFAULT_KEY,
     pos: int = 0,
     length: int = 48,
     volume: int = 100,
@@ -1192,14 +1198,18 @@ def add_note(
 ) -> str:
     """Add a note to a track's pattern.
 
-    On invalid input (key outside 0-127, negative pos, length <= 0, bad
+    Keys are LMMS keys: middle C (C4) = 48, A4 = 57 = 440 Hz. A MIDI note
+    number is key + 12.
+
+    On invalid input (key outside 0-108, negative pos, length <= 0, bad
     track or pattern index) nothing is added and the response is
     {"error": "..."} explaining what to fix.
 
     Args:
         track_index: Zero-based track index (must be an instrument or pattern track)
-        key: MIDI note number (0-127). 60=C4 (middle C), 69=A4, 127=G9.
-            To use a note name instead (e.g. 'Bb2') call add_note_by_name.
+        key: LMMS key number (0-108, C0 to C9). 48=C4 (middle C), 57=A4
+            (440 Hz), 108=C9. To use a note name instead (e.g. 'Bb2') call
+            add_note_by_name.
         pos: Position in ticks RELATIVE TO THE PATTERN START
             (192 ticks = 1 bar, 48 = 1/4 note). Notes are placed inside the
             target pattern; if a note ends beyond the pattern clip length,
@@ -1242,10 +1252,11 @@ def add_note_by_name(
     """Add a note using a note name (e.g. 'C4', 'A#3', 'F#5', 'Bb2').
 
     Sharps (#) and flats (b) are both accepted and enharmonic spellings
-    map to the same key: 'Bb2' = 'A#2' = MIDI 46, 'Db3' = 'C#3' = 49,
-    'Cb4' = 'B3' = 59, 'B#3' = 'C4' = 60. The note letter is
-    case-insensitive ('bb2' = Bb2, 'b3' = B3). Valid range is C-1 (key 0)
-    to G9 (key 127); C4 = 60.
+    map to the same key: 'Bb2' = 'A#2' = key 34, 'Db3' = 'C#3' = 37,
+    'Cb4' = 'B3' = 47, 'B#3' = 'C4' = 48. The note letter is
+    case-insensitive ('bb2' = Bb2, 'b3' = B3). Valid range is C0 (key 0)
+    to C9 (key 108). Keys are LMMS keys: middle C (C4) = 48, A4 = 57 =
+    440 Hz. A MIDI note number is key + 12.
 
     On invalid input (unknown note name, out-of-range note, negative pos,
     length <= 0, bad track index) nothing is added and the response is
@@ -1254,7 +1265,7 @@ def add_note_by_name(
     Args:
         track_index: Zero-based track index
         note_name: Note name like 'C4', 'A#3', 'F5', 'Bb2' (letter A-G,
-            optional # or b, octave -1..9)
+            optional # or b, octave 0..9; C0 to C9)
         pos: Position in ticks RELATIVE TO THE PATTERN START
             (192 ticks = 1 bar, 48 = 1/4 note)
         length: Note length in ticks (12 = 1/16 note, 24 = 1/8, 48 = 1/4 (one beat),
@@ -1262,7 +1273,7 @@ def add_note_by_name(
         volume: Note velocity (0-200)
     """
     try:
-        key = note_name_to_midi(note_name)
+        key = _note_name_to_key(note_name)
     except ValueError as e:
         return json.dumps({"error": f"Note NOT added: {e}"})
 
@@ -1298,9 +1309,10 @@ def add_notes_batch(
 
     Args:
         track_index: Zero-based track index
-        notes: List of note objects, each with: key (int 0-127, or a note
-            name str like "C4", "A#3", "Bb2" - sharps and flats both work,
-            e.g. "Bb2" = "A#2" = 46; range C-1..G9, 60 = C4),
+        notes: List of note objects, each with: key (LMMS key int 0-108, or
+            a note name str like "C4", "A#3", "Bb2" - sharps and flats both
+            work, e.g. "Bb2" = "A#2" = 34; range C0..C9; middle C = C4 = 48,
+            A4 = 57 = 440 Hz; a MIDI note number is key + 12),
             pos (ticks >= 0, relative to the pattern start; 192 = 1 bar,
             48 = 1/4 note), length (ticks > 0, default 48 = 1/4 note;
             24 = 1/8, 12 = 1/16, 192 = 1 bar), volume (0-200, default 100),
@@ -2362,32 +2374,48 @@ def set_master_pitch(pitch: int) -> str:
 
 @mcp.tool()
 def note_name_to_key(name: str) -> str:
-    """Convert a note name (e.g. 'C4') to its MIDI key number.
+    """Convert a note name (e.g. 'C4') to its LMMS key number.
 
-    Sharps and flats both work and enharmonics agree ('Bb2' = 'A#2' = 46,
-    'Cb4' = 'B3' = 59). Range C-1 (0) to G9 (127); C4 = 60. Invalid names
-    return {"error": "..."} stating the accepted format.
+    Keys are LMMS keys: middle C (C4) = 48, A4 = 57 = 440 Hz. A MIDI note
+    number is key + 12 (also returned as "midi_note").
+
+    Sharps and flats both work and enharmonics agree ('Bb2' = 'A#2' = 34,
+    'Cb4' = 'B3' = 47). Range C0 (0) to C9 (108). Invalid names return
+    {"error": "..."} stating the accepted format.
 
     Args:
         name: Note name like 'C4', 'A#3', 'F#5', 'Bb2'
     """
     try:
-        key = note_name_to_midi(name)
-        return json.dumps({"note": name, "midi_key": key})
+        key = _note_name_to_key(name)
+        return json.dumps({
+            "note": name, "key": key, "midi_note": key + MIDI_NOTE_OFFSET,
+        })
     except ValueError as e:
         return json.dumps({"error": str(e)})
 
 
 @mcp.tool()
 def key_to_note_name(key: int) -> str:
-    """Convert a MIDI key number to its note name.
+    """Convert an LMMS key number to its note name.
+
+    Keys are LMMS keys: middle C (C4) = 48, A4 = 57 = 440 Hz. A MIDI note
+    number is key + 12 (also returned as "midi_note").
 
     Args:
-        key: MIDI key number (0-127)
+        key: LMMS key number (0-108, C0 to C9)
     """
-    if not 0 <= key <= 127:
-        return json.dumps({"error": "MIDI key must be 0-127"})
-    return json.dumps({"midi_key": key, "note": midi_to_note_name(key)})
+    if isinstance(key, bool) or not isinstance(key, int) or not (
+        KEY_MIN <= key <= KEY_MAX
+    ):
+        return json.dumps({
+            "error": f"key must be an integer {KEY_RANGE_TEXT}. "
+                     f"{KEY_NUMBERING_TEXT}"
+        })
+    return json.dumps({
+        "key": key, "note": _key_to_note_name(key),
+        "midi_note": key + MIDI_NOTE_OFFSET,
+    })
 
 
 @mcp.tool()
@@ -2418,7 +2446,10 @@ def generate_scale(
     scale_type: str = "major",
     num_octaves: int = 1,
 ) -> str:
-    """Generate a musical scale as MIDI key numbers and note names.
+    """Generate a musical scale as LMMS key numbers and note names.
+
+    Keys are LMMS keys: middle C (C4) = 48, A4 = 57 = 440 Hz. A MIDI note
+    number is key + 12. Notes above C9 (key 108) are left out.
 
     Args:
         root_note: Root note name (e.g. 'C4', 'A3', 'Bb2'; sharps and flats both work)
@@ -2443,7 +2474,7 @@ def generate_scale(
         return json.dumps({"error": f"Unknown scale type: {scale_type}. Use: {list(scales.keys())}"})
 
     try:
-        root_key = note_name_to_midi(root_note)
+        root_key = _note_name_to_key(root_note)
     except ValueError as e:
         return json.dumps({"error": str(e)})
 
@@ -2452,10 +2483,10 @@ def generate_scale(
     for octave in range(num_octaves):
         for interval in intervals:
             key = root_key + octave * 12 + interval
-            if key <= 127:
+            if key <= KEY_MAX:
                 notes.append({
                     "key": key,
-                    "note": midi_to_note_name(key),
+                    "note": _key_to_note_name(key),
                     "position": len(notes),
                 })
 
@@ -2561,14 +2592,19 @@ def resource_effects() -> str:
 
 @mcp.resource("lmms://reference/note_names")
 def resource_note_names() -> str:
-    """MIDI note number to note name mapping reference."""
+    """LMMS key number to note name mapping reference."""
     mapping = []
-    for key in range(128):
+    for key in range(KEY_MIN, KEY_MAX + 1):
         mapping.append({
             "key": key,
-            "note": midi_to_note_name(key),
+            "note": _key_to_note_name(key),
+            "midi_note": key + MIDI_NOTE_OFFSET,
         })
-    return json.dumps({"mapping": mapping, "total": 128}, indent=2)
+    return json.dumps({
+        "numbering": KEY_NUMBERING_TEXT,
+        "mapping": mapping,
+        "total": len(mapping),
+    }, indent=2)
 
 
 @mcp.resource("lmms://reference/scales")
@@ -2613,7 +2649,8 @@ def create_basic_song(
     Args:
         genre: Musical genre (electronic, rock, hip-hop, jazz, pop, ambient)
         bpm: Tempo in beats per minute
-        key: Root note for the melody (e.g. 'C4', 'A3')
+        key: Root note for the melody as a note name (e.g. 'C4' = middle C =
+            key 48, 'A3' = 220 Hz)
     """
     pool = _availability.instruments
     drum_options = []
@@ -2676,8 +2713,8 @@ def add_drum_pattern(
    create one audiofileprocessor track per drum sound (Kick, Snare, Hat),
    assign a sample to each with set_audiofile_sample (e.g.
    "drums/kick_hiphop01.ogg", "drums/snare01.ogg",
-   "drums/hihat_closed02.ogg") and put that drum's notes at key 57 (the
-   track's base note = original sample pitch) on its own track."""
+   "drums/hihat_closed02.ogg") and put that drum's notes at key 57 (A4,
+   the track's base note = original sample pitch) on its own track."""
         key_note = (
             "\n   (not needed for per-drum audiofileprocessor tracks, "
             "which use key 57):"
@@ -2689,6 +2726,11 @@ def add_drum_pattern(
             + ")."
         )
         key_note = ":"
+    gm_kit = (
+        "the sf2player drum kit, bank 128"
+        if "sf2player" in _availability.instruments
+        else "any General MIDI drum instrument"
+    )
     return f"""Create a drum pattern with style: {pattern_style}.
 
 Description: {description}
@@ -2699,13 +2741,16 @@ Steps:
    - Use position values: step * 12 ticks (12 ticks per 1/16 step)
    - Each step is 12 ticks apart
    - Total pattern length: {steps} steps = {steps * 12} ticks
-3. Typical MIDI keys for drums on a single multi-drum track{key_note}
-   - Key 36 = Kick Drum
-   - Key 38 = Snare
-   - Key 42 = Closed Hi-Hat
-   - Key 46 = Open Hi-Hat
-   - Key 49 = Crash Cymbal
-   - Key 51 = Ride Cymbal
+3. Keys for a General MIDI drum kit on a single multi-drum track
+   ({gm_kit}){key_note}
+   Keys are LMMS keys: a MIDI note number is key + 12, so the GM drum
+   notes sit 12 lower than in MIDI charts:
+   - Key 24 = Kick Drum (MIDI 36)
+   - Key 26 = Snare (MIDI 38)
+   - Key 30 = Closed Hi-Hat (MIDI 42)
+   - Key 34 = Open Hi-Hat (MIDI 46)
+   - Key 37 = Crash Cymbal (MIDI 49)
+   - Key 39 = Ride Cymbal (MIDI 51)
 4. Use the add_notes_batch tool for efficient note creation"""
 
 
