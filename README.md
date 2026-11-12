@@ -7,7 +7,8 @@ An MCP (Model Context Protocol) server for [LMMS](https://lmms.io/) - the free, 
 - **Create & save** LMMS projects (`.mmpz` compressed, `.mmp` XML)
 - **Add tracks**: Instrument, Sample, Pattern (Beat/Bassline), Automation
 - **Add notes** with MIDI key, position, velocity, and panning
-- **Effects**: 18 built-in effects on tracks and mixer channels (delay, reverb, EQ, compressor...)
+- **Effects**: built-in effects on tracks and mixer channels (delay, reverb, EQ, dynamics...)
+- **Adapts to your LMMS**: only plugins your installed LMMS version really has are offered or accepted (see [Installed LMMS version](#installed-lmms-version))
 - **ZynAddSubFX presets**: Load any of ~950 factory instruments (.xiz), tune parameters
 - **Arrangement**: Place patterns, BB clips and audio clips on the song timeline
 - **Automation**: Tempo ramps, volume swells, panning curves - linked to real LMMS models
@@ -145,6 +146,8 @@ python -m lmms_mcp
 
 ### ZynAddSubFX Presets & Parameters
 
+Only offered when the installed LMMS has the `zynaddsubfx` plugin.
+
 | Tool | Description |
 |------|-------------|
 | `list_zyn_presets` | Browse ~950 factory presets (.xiz) by category |
@@ -178,19 +181,53 @@ python -m lmms_mcp
 
 The server reads and writes project files directly - it never launches
 the LMMS GUI. The installed LMMS is only used for: preset discovery,
-plugin availability checks (warns about plugins your version lacks,
-e.g. SlicerT/Xpressive require LMMS 1.3+) and audio rendering.
+plugin availability checks (see [Installed LMMS version](#installed-lmms-version))
+and audio rendering.
+
+### Installed LMMS version
+
+LMMS 1.2.x and 1.3+ ship different plugins, and LMMS silently ignores a
+plugin it does not have when loading a project (no error, just no sound).
+To keep agents out of that dead end, the server inspects the installed LMMS
+once at startup and adapts to it:
+
+- **Not offered**: the server instructions, the `add_instrument_track` /
+  `add_effect` tool descriptions, the `lmms://reference/*` resources,
+  `list_available_plugins`, the prompts and the recommended instrument/effect
+  chains list only plugins your LMMS has. A recommended plugin that is missing
+  is replaced by its closest available one (e.g. `compressor` becomes
+  `dynamicsprocessor` on LMMS 1.2.x) or dropped.
+- **Refused**: asking for a known plugin your LMMS lacks (e.g. `compressor`
+  or `slicert` on LMMS 1.2.2) returns an error that names the installed
+  version, the reason (e.g. "requires LMMS 1.3+"), an `alternative` and the
+  list of available plugins. The project is left unchanged.
+- **Tools hidden**: tools that are useless without a plugin are not
+  registered when it is missing - the ZynAddSubFX tools without
+  `zynaddsubfx`, `set_audiofile_sample` without `audiofileprocessor`, and
+  `add_vst_track` / `scan_vst_directory` without the `vestige` VST host.
+- **Custom plugins**: instrument plugins that are installed but not in the
+  built-in list can still be used by name with `add_instrument_track`
+  (importers, exporters and analyzers are not instruments and are refused).
+- **No LMMS found**: availability cannot be verified, so every known plugin
+  is offered and allowed. The server instructions say so, and plugins that
+  need LMMS 1.3+ carry a warning when added. Set `LMMS_EXECUTABLE` to enable
+  the checks.
+
+`list_available_plugins` also shows what is missing and why
+(`unavailable_in_installed_lmms`). Restart the server after installing or
+removing plugins or upgrading LMMS: the check runs once at startup.
 
 ### Custom Plugins & VST
 
 | Tool | Description |
 |------|-------------|
-| `list_available_plugins` | Dynamically list ALL installed plugins (incl. custom ones) |
-| `scan_vst_directory` | Find VST .dll files in a folder |
-| `add_vst_track` | Add a track hosting a VST plugin (Vestige) |
+| `list_available_plugins` | List the plugins usable with the installed LMMS (incl. custom ones) and what is missing |
+| `scan_vst_directory` | Find VST .dll files in a folder (only offered if LMMS has the `vestige` VST host) |
+| `add_vst_track` | Add a track hosting a VST plugin (Vestige; only offered if LMMS has the `vestige` VST host) |
 
-Custom LMMS plugins dropped into the plugins folder are detected
-automatically and can be used directly by name - no server update needed.
+Custom LMMS instrument plugins dropped into the plugins folder are
+detected automatically and can be used directly by name - no server
+update needed.
 
 ### Utilities
 
@@ -210,8 +247,8 @@ automatically and can be used directly by name - no server update needed.
 | `lmms://project/tracks` | All tracks in the project |
 | `lmms://project/mixer` | All mixer channels |
 | `lmms://project/xml` | Raw project XML |
-| `lmms://reference/instruments` | Available LMMS instruments |
-| `lmms://reference/effects` | Available LMMS effects |
+| `lmms://reference/instruments` | Instruments available in the installed LMMS |
+| `lmms://reference/effects` | Effects available in the installed LMMS |
 | `lmms://reference/note_names` | MIDI note name mapping |
 | `lmms://reference/scales` | Available musical scales |
 
@@ -243,7 +280,9 @@ automatically and can be used directly by name - no server update needed.
 ## Available Instruments
 
 All built-in LMMS instruments (verified against LMMS source). LMMS has no
-plugin download mechanism - only these can be used:
+plugin download mechanism - only these can be used. The server offers only
+the ones your installed LMMS has; plugins marked **LMMS 1.3+** do not exist
+in LMMS 1.2.x and are refused there:
 
 | Plugin ID | Name |
 |-----------|------|
@@ -260,23 +299,26 @@ plugin download mechanism - only these can be used:
 | `sfxr` | Retro sound effect generator |
 | `opulenz` | OPL3 FM synthesizer |
 | `watsyn` | 4-oscillator wavetable-style synth |
-| `xpressive` | Expressive mono lead synth |
+| `xpressive` | Expressive mono lead synth (**LMMS 1.3+**) |
 | `zynaddsubfx` | ZynAddSubFX powerful feature-rich synth |
 | `sf2player` | SoundFont (.sf2) sample player |
 | `vibedstrings` | Vibrating string physical model |
 | `bitinvader` | Bit-crushed wavetable synth |
 | `patman` | GUS patch sampler |
 | `gigplayer` | GIG sample library player |
-| `slicert` | Beat slicer for audio loops |
-| `vestige` | VST plugin host (Windows only) |
+| `slicert` | Beat slicer for audio loops (**LMMS 1.3+**) |
+| `vestige` | VST plugin host (only if your LMMS was built with VST support; use `add_vst_track`) |
 
 ## Available Effects
 
 Built-in LMMS effects for `add_effect`: `amplifier`, `bassbooster`,
-`bitcrush`, `compressor`, `crossovereq`, `delay`, `dispersion`,
-`dualfilter`, `dynamicsprocessor`, `eq`, `flanger`, `frequencyshifter`,
-`multitapecho`, `reverbsc`, `slewdistortion`, `stereoenhancer`,
-`stereomatrix`, `waveshaper`.
+`bitcrush`, `compressor` (**LMMS 1.3+**), `crossovereq`, `delay`,
+`dispersion` (**LMMS 1.3+**), `dualfilter`, `dynamicsprocessor`, `eq`,
+`flanger`, `frequencyshifter` (**LMMS 1.3+**), `multitapecho`, `reverbsc`,
+`slewdistortion` (**LMMS 1.3+**), `stereoenhancer`, `stereomatrix`,
+`waveshaper`. As with instruments, only the ones your installed LMMS has
+are offered; on LMMS 1.2.x use `dynamicsprocessor` where `compressor` is
+listed below.
 
 Typical chains:
 - Lead synth: `delay` -> `reverbsc`

@@ -6,6 +6,8 @@ manipulating LMMS projects programmatically via the Model Context Protocol.
 
 import json
 import os
+import string
+import textwrap
 from pathlib import Path, PurePosixPath, PureWindowsPath
 from xml.etree import ElementTree as ET
 
@@ -74,9 +76,158 @@ INSTRUMENT_RECOMMENDATIONS = {
     "strings": ["vibedstrings", "zynaddsubfx"],
 }
 
-mcp = MCPServer(
-    "LMMS MCP Server",
-    instructions=f"""LMMS MCP Server for AI-powered music production.
+# Alternative spellings accepted by add_instrument_track
+INSTRUMENT_ALIASES = {
+    "mallets": "malletsstk",
+    "stk": "malletsstk",
+    "sf2": "sf2player",
+    "fluidsynth": "sf2player",
+    "zyn": "zynaddsubfx",
+    "zynadd": "zynaddsubfx",
+    "audiofile": "audiofileprocessor",
+    "afp": "audiofileprocessor",
+    "lb-302": "lb302",
+    "303": "lb302",
+    "opl3": "opulenz",
+}
+
+# Tools that are useless without a plugin; they are removed from the
+# server when the installed LMMS lacks it, so agents are never offered them.
+TOOL_REQUIRES = {
+    "list_zyn_presets": "zynaddsubfx",
+    "load_zyn_preset": "zynaddsubfx",
+    "set_zyn_params": "zynaddsubfx",
+    "set_audiofile_sample": "audiofileprocessor",
+    "scan_vst_directory": "vestige",
+    "add_vst_track": "vestige",
+}
+
+# ──────────────────────────────────────────────────────────────────
+# PLUGIN AVAILABILITY (single source of truth, adapts to installed LMMS)
+# ──────────────────────────────────────────────────────────────────
+
+# What the installed LMMS offers, computed once at import. Everything the
+# agent is shown (instructions, tool descriptions, resources, prompts) and
+# every refusal is derived from this. Tests replace it with a fake.
+_availability = lmms_app.detect_availability(
+    KNOWN_INSTRUMENTS, effects_mod.KNOWN_EFFECTS
+)
+
+
+def _ordered(known, names) -> list[str]:
+    """The known plugin names that are in `names`, in catalogue order."""
+    return [n for n in known if n in names]
+
+
+def _instrument_choices(av) -> list[str]:
+    """Available instruments for add_instrument_track (VST has its own tool)."""
+    return [n for n in _ordered(KNOWN_INSTRUMENTS, av.instruments)
+            if n != "vestige"]
+
+
+def _effect_choices(av) -> list[str]:
+    return sorted(av.effects)
+
+
+def _lmms_label(av) -> str:
+    return f"LMMS {av.version}" if av.version else "the installed LMMS"
+
+
+def _wrap_names(names, indent: str = " " * 12, width: int = 78) -> str:
+    """Comma-separated names wrapped for a docstring (first line unindented)."""
+    lines = textwrap.wrap(
+        ", ".join(names), width=width - len(indent), break_long_words=False
+    )
+    return ("\n" + indent).join(lines)
+
+
+def render_plugin_doc(template: str, av) -> str:
+    """Fill $INSTRUMENTS / $EFFECTS in a tool docstring template."""
+    return string.Template(template).safe_substitute(
+        INSTRUMENTS=_wrap_names(_instrument_choices(av)),
+        EFFECTS=_wrap_names(_effect_choices(av)),
+    )
+
+
+def _verification_warning(av, name: str) -> str | None:
+    """Warning for a version-dependent plugin when nothing could be verified."""
+    if av.verified or name not in lmms_app.PLUGIN_REQUIRES:
+        return None
+    msg = (
+        f"No LMMS installation was found, so '{name}' (requires "
+        f"{lmms_app.PLUGIN_REQUIRES[name]}) could not be verified; older "
+        f"LMMS versions silently ignore it."
+    )
+    alternative = lmms_app.PLUGIN_SUBSTITUTES.get(name)
+    if alternative:
+        msg += f" '{alternative}' works in every version."
+    return msg
+
+
+def _refusal(kind: str, name: str, av) -> str:
+    """JSON error for a known plugin that the installed LMMS lacks.
+
+    kind is "instrument" or "effect". The project is never modified.
+    """
+    pool = av.instruments if kind == "instrument" else av.effects
+    message = lmms_app.unavailable_reason(name, av.version)
+    alternative = lmms_app.PLUGIN_SUBSTITUTES.get(name)
+    if alternative not in pool:
+        alternative = None
+    payload: dict = {}
+    if alternative:
+        message += f" Use '{alternative}' instead."
+    else:
+        message += f" Choose one of the available_{kind}s."
+    payload["error"] = message
+    if alternative:
+        payload["alternative"] = alternative
+    payload[f"available_{kind}s"] = (
+        _instrument_choices(av) if kind == "instrument"
+        else _effect_choices(av)
+    )
+    return json.dumps(payload)
+
+
+def _chain_text(chain) -> str:
+    return " -> ".join(chain)
+
+
+def build_instructions(av, projects_dir: str) -> str:
+    """Server instructions listing only what the installed LMMS offers."""
+    pool = av.instruments
+
+    if av.verified:
+        status = (
+            f"Installed LMMS: {av.version or 'version unknown'}. This server "
+            f"only offers plugins that exist in it: plugin lists in tool "
+            f"descriptions and lmms://reference/* are already filtered, and "
+            f"add_instrument_track / add_effect refuse anything else without "
+            f"changing the project."
+        )
+    else:
+        later = ", ".join(sorted(lmms_app.PLUGIN_REQUIRES))
+        status = (
+            f"No LMMS installation was detected, so plugin availability could "
+            f"not be verified (set LMMS_EXECUTABLE to enable checks). The "
+            f"plugin lists show LMMS's standard plugins; some ({later}) need "
+            f"LMMS 1.3+ and are silently ignored by older versions."
+        )
+
+    safe = []
+    for names, role in (
+        (("tripleoscillator",), "universal synth"),
+        (("kicker",), "drums"),
+        (("lb302",), "bass"),
+        (("freeboy", "nes", "sid"), "chiptune"),
+        (("organic",), "pads/organ"),
+    ):
+        present = [n for n in names if n in pool]
+        if present:
+            safe.append(f"{'/'.join(present)} ({role})")
+
+    blocks = [
+        """LMMS MCP Server for AI-powered music production.
 
 This server lets you create, load, modify, and save LMMS music projects.
 LMMS is a free, open-source digital audio workstation (DAW).
@@ -88,47 +239,90 @@ Key concepts:
 - The Mixer has channels (0=Master) where tracks route their audio
 - Time is measured in ticks: 192 ticks = 1 bar (4/4 time)
 - Notes use MIDI key numbers: 60=C4 (middle C), 69=A4
-- Volume: 0-200 (100=normal), Panning: -100 to +100
-
-IMPORTANT - Instruments: Only use built-in LMMS instrument names (see the
+- Volume: 0-200 (100=normal), Panning: -100 to +100""",
+        status,
+        f"""IMPORTANT - Instruments: Only use built-in LMMS instrument names (see the
 add_instrument_track tool description or lmms://reference/instruments).
 LMMS has NO plugin download mechanism. If asked for a sound you cannot
 produce, use tripleoscillator (universal synth) and explain the limitation.
-Safe choices: tripleoscillator, kicker (drums), lb302 (bass),
-freeboy/nes/sid (chiptune), organic (pads/organ).
+Safe choices: {', '.join(safe)}.""",
+    ]
 
-Custom plugins: The user may have installed additional LMMS plugins or
-VSTs. Check list_available_plugins for dynamically detected custom
-plugins - they can be used directly by name in add_instrument_track /
-add_effect. For VST .dll files anywhere on disk, use scan_vst_directory
-and add_vst_track.
+    custom = (
+        "Custom plugins: The user may have installed additional LMMS "
+        "instrument plugins. list_available_plugins shows them; they can be "
+        "used by name in add_instrument_track."
+    )
+    if "vestige" in pool:
+        custom += (
+            " For VST .dll files anywhere on disk, use scan_vst_directory "
+            "and add_vst_track."
+        )
+    blocks.append(custom)
 
-Drums with real samples: add one instrument track per drum sound with
+    if "audiofileprocessor" in pool:
+        blocks.append(
+            """Drums with real samples: add one instrument track per drum sound with
 instrument "audiofileprocessor", then call set_audiofile_sample on each
 (e.g. "drums/kick_hiphop01.ogg", "drums/snare01.ogg",
 "drums/hihat_closed02.ogg" from LMMS's factory samples) and play it with
 add_note / add_notes_batch at key 57 (the track's base note = original
-pitch). An audiofileprocessor track without a sample is silent. For
-synthesized drums use kicker instead.
+pitch). An audiofileprocessor track without a sample is silent."""
+            + (" For synthesized drums use kicker instead."
+               if "kicker" in pool else "")
+        )
 
-ZynAddSubFX: For rich sounds, add a track with instrument "zynaddsubfx",
+    if "zynaddsubfx" in pool:
+        blocks.append(
+            """ZynAddSubFX: For rich sounds, add a track with instrument "zynaddsubfx",
 then load one of ~950 factory presets via load_zyn_preset (browse with
-list_zyn_presets). Fine-tune with set_zyn_params.
+list_zyn_presets). Fine-tune with set_zyn_params."""
+        )
 
-Effects: Add built-in effects to tracks or mixer channels with add_effect
-(see lmms://reference/effects for the full list). Typical chains:
-- Lead: delay -> reverbsc
-- Vocals: eq -> compressor -> reverbsc
-- Master bus: eq -> compressor -> stereoenhancer
+    chains = lmms_app.adapt_recommendations(
+        {
+            "Lead": ["delay", "reverbsc"],
+            "Vocals": ["eq", "compressor", "reverbsc"],
+            "Master bus": ["eq", "compressor", "stereoenhancer"],
+        },
+        av.effects,
+    )
+    blocks.append(
+        "Effects: Add built-in effects to tracks or mixer channels with "
+        "add_effect (see lmms://reference/effects for the full list). "
+        "Typical chains:\n"
+        + "\n".join(f"- {use}: {_chain_text(c)}" for use, c in chains.items())
+    )
 
-Default projects directory: {DEFAULT_PROJECTS_DIR}
+    blocks.append(
+        f"""Default projects directory: {projects_dir}
 When saving a project, use this directory if no specific path is given.
-Example: save to {DEFAULT_PROJECTS_DIR}/my_song.mmpz
+Example: save to {projects_dir}/my_song.mmpz
 
 Workflow: Create a project -> Add tracks -> Load instruments/presets ->
-Add notes -> Add effects -> Configure mixer -> Save
-""",
+Add notes -> Add effects -> Configure mixer -> Save"""
+    )
+    return "\n\n".join(blocks) + "\n"
+
+
+mcp = MCPServer(
+    "LMMS MCP Server",
+    instructions=build_instructions(_availability, DEFAULT_PROJECTS_DIR),
 )
+
+
+def _plugin_tool(fn):
+    """Register a tool whose docstring lists the available plugins.
+
+    The docstring may contain $INSTRUMENTS / $EFFECTS; it is rendered
+    from the installed LMMS before registration, so the tool description
+    the agent sees names only plugins that exist. The raw template is
+    kept in fn.__plugin_doc_template__.
+    """
+    fn.__plugin_doc_template__ = fn.__doc__ or ""
+    fn.__doc__ = render_plugin_doc(fn.__plugin_doc_template__, _availability)
+    return mcp.tool()(fn)
+
 
 # ──────────────────────────────────────────────────────────────────
 # PROJECT TOOLS
@@ -261,7 +455,7 @@ def get_project_xml() -> str:
 # ──────────────────────────────────────────────────────────────────
 
 
-@mcp.tool()
+@_plugin_tool
 def add_instrument_track(
     name: str,
     instrument: str = "tripleoscillator",
@@ -273,50 +467,30 @@ def add_instrument_track(
 
     Args:
         name: Track name (e.g. "Lead Synth", "Bass")
-        instrument: Plugin name (lowercase). Valid options:
-            tripleoscillator, kicker, audiofileprocessor, organic,
-            malletsstk, freeboy, lb302, monstro, nes, opulenz,
-            patman, sf2player, sfxr, sid, slicert, vibedstrings,
-            watsyn, xpressive, zynaddsubfx, gigplayer, bitinvader
+        instrument: Plugin name (lowercase). Valid options in the installed
+            LMMS:
+            $INSTRUMENTS
         mixer_channel: Mixer channel number (0=Master, 1+=custom channels)
         volume: Track volume (0-200, 100=normal)
         panning: Track panning (-100 to +100, 0=center)
     """
     proj = get_project()
+    av = _availability
 
     # Validate instrument name (case-insensitive fuzzy match)
     normalized = instrument.strip().lower()
     if normalized not in KNOWN_INSTRUMENTS:
-        # Try common aliases / case variants
-        alias_map = {
-            "mallets": "malletsstk",
-            "stk": "malletsstk",
-            "sf2": "sf2player",
-            "fluidsynth": "sf2player",
-            "zynaddsubfx": "zynaddsubfx",
-            "zyn": "zynaddsubfx",
-            "zynadd": "zynaddsubfx",
-            "audiofileprocessor": "audiofileprocessor",
-            "audiofile": "audiofileprocessor",
-            "afp": "audiofileprocessor",
-            "lb-302": "lb302",
-            "303": "lb302",
-            "opl3": "opulenz",
-            "opulenz": "opulenz",
-        }
-        resolved = alias_map.get(normalized)
+        resolved = INSTRUMENT_ALIASES.get(normalized)
         if resolved is None:
             # Not a known name - but maybe a custom/newly installed plugin?
-            installed = lmms_app.get_installed_plugins()
-            if normalized in installed:
-                result_msg = {
-                    "message": f"Added instrument track '{name}' with "
-                               f"custom plugin '{normalized}'",
-                    "track_index": None,
-                    "custom_plugin": True,
-                    "note": f"'{normalized}' is not in the built-in list "
-                            f"but is installed in your LMMS plugins folder.",
-                }
+            if normalized in av.installed:
+                if normalized in lmms_app.NON_TRACK_PLUGINS:
+                    return json.dumps({
+                        "error": f"'{normalized}' is an LMMS helper plugin "
+                                 f"(importer/exporter/analyzer), not an "
+                                 f"instrument.",
+                        "available_instruments": _instrument_choices(av),
+                    })
                 proj_result = proj.add_track(
                     "instrument", name,
                     instrument=normalized,
@@ -326,27 +500,29 @@ def add_instrument_track(
                 )
                 proj_result["custom_plugin"] = True
                 return json.dumps(proj_result)
-            suggestions = ", ".join(sorted(KNOWN_INSTRUMENTS.keys()))
+            hint = (
+                "Use one of valid_instruments. Use list_available_plugins "
+                "to see what is installed."
+            )
+            if "vestige" in av.instruments:
+                hint = (
+                    "Use one of valid_instruments. For VST plugins use "
+                    "add_vst_track with the DLL path. Use "
+                    "list_available_plugins to see what is installed."
+                )
             return json.dumps({
                 "error": f"Unknown instrument '{instrument}'. "
                 f"LMMS has no plugin download mechanism - only built-in "
                 f"instruments can be used.",
-                "valid_instruments": sorted(KNOWN_INSTRUMENTS.keys()),
-                "hint": f"Use one of: {suggestions}. "
-                f"For VST plugins use add_vst_track with the DLL path. "
-                f"Use list_available_plugins to see what is installed.",
+                "valid_instruments": _instrument_choices(av),
+                "hint": hint,
             })
         normalized = resolved
 
-    # Check the installed LMMS actually ships this plugin
-    available, reason = lmms_app.check_plugin_available(normalized)
-    warning = None
-    if not available:
-        warning = reason
-        alt_map = {"slicert": "audiofileprocessor", "xpressive": "watsyn"}
-        alternative = alt_map.get(normalized)
-        if alternative:
-            warning += f" Consider '{alternative}' instead."
+    # Refuse plugins the installed LMMS lacks: it would silently load
+    # nothing and the track would be silent.
+    if normalized not in av.instruments:
+        return _refusal("instrument", normalized, av)
 
     result = proj.add_track(
         "instrument", name,
@@ -355,6 +531,7 @@ def add_instrument_track(
         volume=volume,
         panning=panning,
     )
+    warning = _verification_warning(av, normalized)
     if warning:
         result["warning"] = warning
     return json.dumps(result)
@@ -1028,7 +1205,7 @@ def _resolve_fxchain_target(target_type: str, target_index: int) -> ET.Element:
     raise ValueError("target_type must be 'track' or 'mixer'")
 
 
-@mcp.tool()
+@_plugin_tool
 def add_effect(
     target_type: str,
     target_index: int,
@@ -1042,44 +1219,35 @@ def add_effect(
     Args:
         target_type: "track" or "mixer"
         target_index: Track index or mixer channel number (0=Master)
-        effect: Built-in LMMS effect name. Valid: amplifier, bassbooster,
-            bitcrush, compressor, crossovereq, delay, dispersion,
-            dualfilter, dynamicsprocessor, eq, flanger, frequencyshifter,
-            multitapecho, reverbsc, slewdistortion, stereoenhancer,
-            stereomatrix, waveshaper
+        effect: Built-in LMMS effect name. Valid in the installed LMMS:
+            $EFFECTS
         wet: Wet/dry mix 0.0-1.0 (1.0=full effect)
         enabled: Whether the effect is active
         position: Chain position to insert at (None=end of chain)
     """
+    av = _availability
+    normalized = effect.strip().lower()
+    # Refuse effects the installed LMMS lacks: it would silently ignore
+    # them when loading the project. Nothing is modified.
+    if normalized in effects_mod.KNOWN_EFFECTS and normalized not in av.effects:
+        return _refusal("effect", normalized, av)
     try:
         parent = _resolve_fxchain_target(target_type, target_index)
-        result = effects_mod.add_effect(parent, effect, wet, enabled, position)
-        available, reason = lmms_app.check_plugin_available(effect)
-        if not available:
-            # Custom effect plugin? (DLL exists but not in known list)
-            installed = lmms_app.get_installed_plugins()
-            if effect.strip().lower() in installed:
-                result["note"] = (
-                    f"'{effect}' is a custom plugin - parameters use "
-                    f"defaults."
-                )
-            else:
-                alt_map = {
-                    "compressor": "dynamicsprocessor",
-                    "dispersion": "flanger",
-                    "frequencyshifter": "eq",
-                    "slewdistortion": "waveshaper",
-                }
-                alternative = alt_map.get(effect.lower())
-                if alternative:
-                    reason += f" Consider '{alternative}' instead."
-                result["warning"] = reason
+        result = effects_mod.add_effect(
+            parent, effect, wet, enabled, position,
+            available=_effect_choices(av),
+        )
+        warning = _verification_warning(av, normalized)
+        if warning:
+            result["warning"] = warning
         return json.dumps(result)
     except ValueError as exc:
         return json.dumps({
             "error": str(exc),
-            "valid_effects": sorted(effects_mod.KNOWN_EFFECTS.keys()),
-            "recommendations": effects_mod.EFFECT_RECOMMENDATIONS,
+            "valid_effects": _effect_choices(av),
+            "recommendations": lmms_app.adapt_recommendations(
+                effects_mod.EFFECT_RECOMMENDATIONS, av.effects
+            ),
         })
 
 
@@ -1320,23 +1488,18 @@ def get_lmms_info() -> str:
                        "Set LMMS_EXECUTABLE env var to the LMMS executable "
                        "(lmms.exe / lmms).",
         })
-    installed = sorted(lmms_app.get_installed_plugins())
-    # Intersect with our known instruments/effects for quick reference
-    inst_available = [
-        i for i in KNOWN_INSTRUMENTS
-        if lmms_app.check_plugin_available(i)[0]
-    ]
-    eff_available = [
-        e for e in effects_mod.KNOWN_EFFECTS
-        if lmms_app.check_plugin_available(e)[0]
-    ]
+    av = _availability
+    installed = sorted(av.installed)
     return json.dumps({
         "found": True,
-        "version": lmms_app.get_lmms_version(),
+        "version": av.version,
         "path": str(exe),
+        "plugins_verified": av.verified,
         "plugin_count": len(installed),
-        "instruments_verified_available": inst_available,
-        "effects_verified_available": eff_available,
+        "instruments_verified_available": _ordered(
+            KNOWN_INSTRUMENTS, av.instruments),
+        "effects_verified_available": _ordered(
+            effects_mod.KNOWN_EFFECTS, av.effects),
         "all_installed_plugins": installed,
     }, indent=2)
 
@@ -1446,27 +1609,45 @@ def render_project(
 
 @mcp.tool()
 def list_available_plugins() -> str:
-    """List ALL plugins installed in your LMMS, dynamically detected.
+    """List the plugins usable with the installed LMMS.
 
-    Includes built-in instruments/effects plus any custom plugins the
-    user added to LMMS's plugins folder. Custom plugins can be used
-    directly by name in add_instrument_track / add_effect.
+    Shows the built-in instruments/effects this LMMS provides, any custom
+    instrument plugins the user added to its plugins folder (usable by
+    name in add_instrument_track), and which known plugins are missing.
     """
-    known_inst = set(KNOWN_INSTRUMENTS.keys())
-    known_eff = set(effects_mod.KNOWN_EFFECTS.keys())
-    classified = lmms_app.classify_installed_plugins(known_inst, known_eff)
-    exe = lmms_app.find_lmms_exe()
-    return json.dumps({
-        "lmms_found": exe is not None,
-        "version": lmms_app.get_lmms_version(),
-        "built_in_instruments": sorted(known_inst),
-        "built_in_effects": sorted(known_eff),
-        "custom_plugins_unknown_type": classified["unknown"],
-        "note": "Custom plugins can be used by their library name "
-                "(without extension, and without the 'lib' prefix on "
-                "Linux) in add_instrument_track or add_effect. For VST "
-                ".dll files on disk use add_vst_track instead.",
-    }, indent=2)
+    av = _availability
+    classified = lmms_app.classify_installed_plugins(
+        set(KNOWN_INSTRUMENTS), set(effects_mod.KNOWN_EFFECTS), av.installed
+    )
+    result = {
+        "lmms_found": lmms_app.find_lmms_exe() is not None,
+        "version": av.version,
+        "built_in_instruments": _ordered(KNOWN_INSTRUMENTS, av.instruments),
+        "built_in_effects": _effect_choices(av),
+        "custom_plugins_unknown_type": [
+            n for n in classified["unknown"]
+            if n not in lmms_app.NON_TRACK_PLUGINS
+        ],
+    }
+    if av.verified:
+        missing = {}
+        for name in (*KNOWN_INSTRUMENTS, *effects_mod.KNOWN_EFFECTS):
+            if name in av.instruments or name in av.effects:
+                continue
+            required = lmms_app.PLUGIN_REQUIRES.get(name)
+            reason = f"requires {required}" if required else "not installed"
+            alternative = lmms_app.PLUGIN_SUBSTITUTES.get(name)
+            if alternative in av.instruments or alternative in av.effects:
+                reason += f"; use {alternative}"
+            missing[name] = reason
+        result["unavailable_in_installed_lmms"] = missing
+    result["note"] = (
+        "Custom plugins can be tried as instruments by their library name "
+        "(without extension, and without the 'lib' prefix on Linux) in "
+        "add_instrument_track. add_effect only accepts the built-in effects "
+        "listed above."
+    )
+    return json.dumps(result, indent=2)
 
 
 @mcp.tool()
@@ -1512,6 +1693,14 @@ def add_vst_track(
         panning: Track panning (-100 to +100)
     """
     proj = get_project()
+    av = _availability
+    if "vestige" not in av.instruments:
+        return json.dumps({
+            "error": lmms_app.unavailable_reason("vestige", av.version)
+                     + " VST plugins cannot be hosted. Use "
+                       "add_instrument_track with an available instrument.",
+            "available_instruments": _instrument_choices(av),
+        })
     path = Path(dll_path)
     if not path.is_file():
         return json.dumps({
@@ -2046,32 +2235,55 @@ def resource_project_xml() -> str:
     return proj.get_xml_string()
 
 
+def _reference_note(av, kind: str) -> str:
+    if av.verified:
+        return (
+            f"These are the {kind} available in {_lmms_label(av)}. LMMS "
+            f"cannot download additional plugins - do not use any other "
+            f"names."
+        )
+    return (
+        f"No LMMS installation was detected, so availability could not be "
+        f"verified: these are LMMS's standard {kind}. Plugins that need "
+        f"LMMS 1.3+ are silently ignored by older versions."
+    )
+
+
 @mcp.resource("lmms://reference/instruments")
 def resource_instruments() -> str:
-    """List of available LMMS instruments/plugins (built-in, verified)."""
+    """Instruments available in the installed LMMS (verified)."""
+    av = _availability
     return json.dumps({
-        "note": "These are ALL built-in LMMS instruments. LMMS cannot "
-                "download additional plugins - do not use any other names.",
+        "note": _reference_note(av, "instruments"),
         "instruments": [
-            {"name": name, "description": desc}
-            for name, desc in sorted(KNOWN_INSTRUMENTS.items())
+            {"name": name, "description": KNOWN_INSTRUMENTS[name]}
+            for name in sorted(av.instruments)
         ],
-        "recommendations_by_use_case": INSTRUMENT_RECOMMENDATIONS,
+        "recommendations_by_use_case": lmms_app.adapt_recommendations(
+            INSTRUMENT_RECOMMENDATIONS, av.instruments
+        ),
     }, indent=2)
 
 
 @mcp.resource("lmms://reference/effects")
 def resource_effects() -> str:
-    """List of available LMMS effects (built-in, verified)."""
+    """Effects available in the installed LMMS (verified)."""
+    av = _availability
     return json.dumps({
-        "note": "These are ALL built-in LMMS effects. External-host "
-                "effects (ladspaeffect, lv2effect, vsteffect) depend on "
-                "system plugins and should be avoided.",
+        "note": _reference_note(av, "effects")
+                + " Effects that host external plugins (LADSPA, LV2, VST) "
+                  "cannot be added with add_effect.",
         "effects": [
-            {"name": name, "description": desc, "controls_node": node}
-            for name, (desc, node) in sorted(KNOWN_EFFECTS.items())
+            {
+                "name": name,
+                "description": effects_mod.KNOWN_EFFECTS[name][0],
+                "controls_node": effects_mod.KNOWN_EFFECTS[name][1],
+            }
+            for name in sorted(av.effects)
         ],
-        "recommendations_by_use_case": EFFECT_RECOMMENDATIONS,
+        "recommendations_by_use_case": lmms_app.adapt_recommendations(
+            effects_mod.EFFECT_RECOMMENDATIONS, av.effects
+        ),
     }, indent=2)
 
 
@@ -2111,6 +2323,13 @@ def resource_scales() -> str:
 # ──────────────────────────────────────────────────────────────────
 
 
+def _available_of(*names: str) -> list[str]:
+    """The given instrument names that the installed LMMS provides."""
+    return [n for n in names if n in _availability.instruments] or [
+        "tripleoscillator"
+    ]
+
+
 @mcp.prompt()
 def create_basic_song(
     genre: str = "electronic",
@@ -2124,15 +2343,31 @@ def create_basic_song(
         bpm: Tempo in beats per minute
         key: Root note for the melody (e.g. 'C4', 'A3')
     """
+    pool = _availability.instruments
+    drum_options = []
+    if "kicker" in pool:
+        drum_options.append('an instrument track "Drums" with kicker')
+    if "audiofileprocessor" in pool:
+        drum_options.append(
+            "one audiofileprocessor track per drum sound (Kick, Snare, "
+            "Hat) with a sample set via set_audiofile_sample (e.g. "
+            '"drums/kick_hiphop01.ogg")'
+        )
+    if not drum_options:
+        drum_options.append(
+            'an instrument track "Drums" with tripleoscillator '
+            "(short, percussive notes)"
+        )
+    drums = ", or ".join(drum_options)
+    bass = " or ".join(_available_of("tripleoscillator", "lb302"))
+    melody = " or ".join(_available_of("tripleoscillator", "watsyn"))
     return f"""Create a {genre} song at {bpm} BPM in the key of {key}.
 
 Steps:
 1. Create a new project with {bpm} BPM
-2. Add drum tracks: an instrument track "Drums" with kicker, or one
-   audiofileprocessor track per drum sound (Kick, Snare, Hat) with a
-   sample set via set_audiofile_sample (e.g. "drums/kick_hiphop01.ogg")
-3. Add an instrument track "Bass" with tripleoscillator or LB302
-4. Add an instrument track "Melody" with tripleoscillator or watsyn
+2. Add drum tracks: {drums}
+3. Add an instrument track "Bass" with {bass}
+4. Add an instrument track "Melody" with {melody}
 5. Add an automation track for volume/parameter automation
 6. Add notes to each track following {genre} conventions
 7. Configure mixer channels
@@ -2164,23 +2399,35 @@ def add_drum_pattern(
 
     description = patterns.get(pattern_style, f"Custom {pattern_style} pattern")
 
+    if "audiofileprocessor" in _availability.instruments:
+        find_track = """Find or create an instrument track for drums. For real drum samples
+   create one audiofileprocessor track per drum sound (Kick, Snare, Hat),
+   assign a sample to each with set_audiofile_sample (e.g.
+   "drums/kick_hiphop01.ogg", "drums/snare01.ogg",
+   "drums/hihat_closed02.ogg") and put that drum's notes at key 57 (the
+   track's base note = original sample pitch) on its own track."""
+        key_note = (
+            "\n   (not needed for per-drum audiofileprocessor tracks, "
+            "which use key 57):"
+        )
+    else:
+        find_track = (
+            "Find or create an instrument track for drums (for example "
+            + " or ".join(_available_of("kicker", "tripleoscillator"))
+            + ")."
+        )
+        key_note = ":"
     return f"""Create a drum pattern with style: {pattern_style}.
 
 Description: {description}
 
 Steps:
-1. Find or create an instrument track for drums. For real drum samples
-   create one audiofileprocessor track per drum sound (Kick, Snare, Hat),
-   assign a sample to each with set_audiofile_sample (e.g.
-   "drums/kick_hiphop01.ogg", "drums/snare01.ogg",
-   "drums/hihat_closed02.ogg") and put that drum's notes at key 57 (the
-   track's base note = original sample pitch) on its own track.
+1. {find_track}
 2. Add notes at the correct positions:
    - Use position values: step * 12 ticks (12 ticks per 1/16 step)
    - Each step is 12 ticks apart
    - Total pattern length: {steps} steps = {steps * 12} ticks
-3. Typical MIDI keys for drums on a single multi-drum track
-   (not needed for per-drum audiofileprocessor tracks, which use key 57):
+3. Typical MIDI keys for drums on a single multi-drum track{key_note}
    - Key 36 = Kick Drum
    - Key 38 = Snare
    - Key 42 = Closed Hi-Hat
@@ -2205,6 +2452,7 @@ def create_melody(
         bars: Number of bars for the melody
         style: Melodic style (simple, complex, arpeggiated, chordal)
     """
+    melody = ", ".join(_available_of("tripleoscillator", "watsyn"))
     return f"""Create a melody in {scale_type} scale starting on {root_note}.
 
 Parameters:
@@ -2214,7 +2462,7 @@ Parameters:
 
 Steps:
 1. Use the generate_scale tool to get the scale notes
-2. Create or find a melody instrument track (tripleoscillator, watsyn, etc.)
+2. Create or find a melody instrument track ({melody}, etc.)
 3. Add notes following the {style} style:
    - Simple: Use mostly scale tones on strong beats
    - Complex: Use chromatic passing tones and syncopation
@@ -2277,6 +2525,24 @@ but audio rendering requires the LMMS application."""
 Steps:
 1. Use save_project with path='{path}' and compressed={format == 'mmpz'}
 2. The project will be saved as {'compressed .mmpz' if format == 'mmpz' else 'uncompressed .mmp'}"""
+
+
+# ──────────────────────────────────────────────────────────────────
+# HIDE TOOLS THE INSTALLED LMMS CANNOT SUPPORT
+# ──────────────────────────────────────────────────────────────────
+
+
+def _remove_unsupported_tools(av) -> list[str]:
+    """Unregister tools whose required plugin the installed LMMS lacks."""
+    removed = []
+    for tool_name, plugin in TOOL_REQUIRES.items():
+        if plugin not in av.instruments:
+            mcp.remove_tool(tool_name)
+            removed.append(tool_name)
+    return removed
+
+
+_remove_unsupported_tools(_availability)
 
 
 # ──────────────────────────────────────────────────────────────────

@@ -2077,3 +2077,492 @@ class TestNoteValidation:
         assert "error" in json.loads(srv.note_name_to_key("H2"))
         scale = json.loads(srv.generate_scale("Bb2", "major"))
         assert scale["notes"][0]["key"] == 46
+
+
+# A made-up LMMS 1.2.2 install: independent of the machine running the
+# tests. Lacks everything that needs LMMS 1.3+ and the VST host.
+LMMS_122_PLUGINS = frozenset({
+    "tripleoscillator", "kicker", "audiofileprocessor", "organic",
+    "malletsstk", "lb302", "monstro", "nes", "papu", "opl2", "patman",
+    "sf2player", "sfxr", "sid", "vibedstrings", "watsyn", "zynaddsubfx",
+    "gigplayer", "bitinvader",
+    "amplifier", "bassbooster", "bitcrush", "crossovereq", "delay",
+    "dualfilter", "dynamicsprocessor", "eq", "flanger", "multitapecho",
+    "reverbsc", "stereoenhancer", "stereomatrix", "waveshaper",
+    "ladspaeffect", "midiexport", "spectrumanalyzer",
+    "mycustomsynth",
+})
+# Known only from LMMS 1.3 on, or hosting external plugins
+UNAVAILABLE_IN_122 = (
+    "compressor", "slicert", "xpressive", "dispersion", "frequencyshifter",
+    "slewdistortion", "vestige",
+)
+
+
+class TestPluginAvailability:
+    """The MCP only offers, and only accepts, plugins the installed LMMS has."""
+
+    @pytest.fixture
+    def lmms122(self, monkeypatch):
+        """(server, project) with a fake LMMS 1.2.2 as the installed LMMS."""
+        from lmms_mcp import lmms_app
+        from lmms_mcp import server as srv
+        monkeypatch.setattr(
+            srv, "_availability",
+            lmms_app.build_availability(
+                srv.KNOWN_INSTRUMENTS, srv.effects_mod.KNOWN_EFFECTS,
+                LMMS_122_PLUGINS, "1.2.2",
+            ),
+        )
+        proj = LMMSProject()
+        proj.new()
+        srv.set_project(proj)
+        return srv, proj
+
+    @pytest.fixture
+    def unverified(self, monkeypatch):
+        """(server, project) when no LMMS installation is found."""
+        from lmms_mcp import lmms_app
+        from lmms_mcp import server as srv
+        monkeypatch.setattr(
+            srv, "_availability",
+            lmms_app.build_availability(
+                srv.KNOWN_INSTRUMENTS, srv.effects_mod.KNOWN_EFFECTS,
+                set(), None,
+            ),
+        )
+        proj = LMMSProject()
+        proj.new()
+        srv.set_project(proj)
+        return srv, proj
+
+    @pytest.fixture
+    def server_for(self, monkeypatch):
+        """Reload the server module against a fake install (what an agent
+        sees at startup: instructions, tool list, descriptions)."""
+        import importlib
+
+        from lmms_mcp import lmms_app
+        from lmms_mcp import server as srv
+
+        def make(installed, version="1.2.2"):
+            monkeypatch.setattr(
+                lmms_app, "get_installed_plugins", lambda: set(installed))
+            monkeypatch.setattr(
+                lmms_app, "get_lmms_version", lambda: version)
+            return importlib.reload(srv)
+
+        yield make
+        monkeypatch.undo()
+        importlib.reload(srv)
+
+    # --- pure detection -------------------------------------------------
+
+    def test_compute_available_respects_aliases_and_static(self):
+        from lmms_mcp import lmms_app
+        known = ["tripleoscillator", "opulenz", "nes", "slicert", "freeboy"]
+        # opl2 satisfies opulenz, papu satisfies nes, freeboy is built in
+        available = lmms_app.compute_available(
+            known, {"tripleoscillator", "opl2", "papu"})
+        assert available == {"tripleoscillator", "opulenz", "nes", "freeboy"}
+
+    def test_compute_available_without_install_allows_everything(self):
+        from lmms_mcp import lmms_app
+        known = ["slicert", "compressor", "tripleoscillator"]
+        assert lmms_app.compute_available(known, set()) == set(known)
+
+    def test_build_availability_marks_verified(self):
+        from lmms_mcp import lmms_app
+        av = lmms_app.build_availability(
+            ["a", "b"], ["c"], {"a", "c"}, "1.2.2")
+        assert av.verified and av.version == "1.2.2"
+        assert av.instruments == {"a"} and av.effects == {"c"}
+        none = lmms_app.build_availability(["a", "b"], ["c"], set(), None)
+        assert not none.verified
+        assert none.instruments == {"a", "b"} and none.effects == {"c"}
+
+    def test_detect_availability_reads_installed_lmms(self, monkeypatch):
+        from lmms_mcp import lmms_app
+        monkeypatch.setattr(
+            lmms_app, "get_installed_plugins", lambda: {"delay", "kicker"})
+        monkeypatch.setattr(lmms_app, "get_lmms_version", lambda: "1.2.2")
+        av = lmms_app.detect_availability(
+            ["kicker", "slicert"], ["delay", "compressor"])
+        assert av.verified and av.version == "1.2.2"
+        assert av.instruments == {"kicker"}
+        assert av.effects == {"delay"}
+
+    def test_detect_availability_without_lmms(self, monkeypatch):
+        from lmms_mcp import lmms_app
+        monkeypatch.setattr(lmms_app, "get_installed_plugins", lambda: set())
+        av = lmms_app.detect_availability(["kicker", "slicert"], ["delay"])
+        assert not av.verified and av.version is None
+        assert av.instruments == {"kicker", "slicert"}
+
+    def test_adapt_recommendations_substitutes_and_drops(self):
+        from lmms_mcp import lmms_app
+        recs = {
+            "vocals": ["eq", "compressor", "reverbsc"],
+            "dup": ["compressor", "dynamicsprocessor"],
+            "lead": ["xpressive", "tripleoscillator"],
+            "gone": ["slicert"],
+        }
+        available = {"eq", "reverbsc", "dynamicsprocessor", "tripleoscillator"}
+        assert lmms_app.adapt_recommendations(recs, available) == {
+            "vocals": ["eq", "dynamicsprocessor", "reverbsc"],
+            "dup": ["dynamicsprocessor"],
+            "lead": ["tripleoscillator"],
+        }
+
+    def test_classify_given_installed_set(self):
+        from lmms_mcp import lmms_app
+        result = lmms_app.classify_installed_plugins(
+            {"kicker"}, {"delay"}, installed={"kicker", "delay", "other"})
+        assert result == {
+            "instruments": ["kicker"], "effects": ["delay"],
+            "unknown": ["other"],
+        }
+
+    # --- refusals -------------------------------------------------------
+
+    def test_add_effect_refuses_missing_effect(self, lmms122):
+        srv, proj = lmms122
+        srv.add_instrument_track("Lead")
+        before = proj.get_xml_string()
+        result = json.loads(srv.add_effect("track", 0, "compressor"))
+        assert "'compressor' is not available in the installed LMMS 1.2.2" \
+            in result["error"]
+        assert "requires LMMS 1.3+" in result["error"]
+        assert "Use 'dynamicsprocessor' instead" in result["error"]
+        assert result["alternative"] == "dynamicsprocessor"
+        assert "dynamicsprocessor" in result["available_effects"]
+        for name in UNAVAILABLE_IN_122:
+            assert name not in result["available_effects"]
+        assert proj.get_xml_string() == before
+        assert find_tracks(proj.root)[0].find(
+            "instrumenttrack/fxchain/effect") is None
+
+    def test_add_effect_refusal_ignores_case_and_spaces(self, lmms122):
+        srv, _ = lmms122
+        srv.add_instrument_track("Lead")
+        result = json.loads(srv.add_effect("track", 0, " Compressor "))
+        assert result["alternative"] == "dynamicsprocessor"
+
+    def test_add_effect_refuses_on_mixer_too(self, lmms122):
+        srv, proj = lmms122
+        before = proj.get_xml_string()
+        result = json.loads(srv.add_effect("mixer", 0, "dispersion"))
+        assert result["alternative"] == "flanger"
+        assert proj.get_xml_string() == before
+
+    def test_add_effect_available_effect_works(self, lmms122):
+        srv, _ = lmms122
+        srv.add_instrument_track("Lead")
+        result = json.loads(srv.add_effect("track", 0, "dynamicsprocessor"))
+        assert result["effect"] == "dynamicsprocessor"
+        assert "warning" not in result and "error" not in result
+
+    def test_unknown_effect_error_lists_only_available(self, lmms122):
+        srv, _ = lmms122
+        srv.add_instrument_track("Lead")
+        result = json.loads(srv.add_effect("track", 0, "greatest_reverb_9000"))
+        assert "Unknown effect" in result["error"]
+        assert result["valid_effects"] == sorted(
+            srv._availability.effects)
+        text = json.dumps(result)
+        for name in UNAVAILABLE_IN_122:
+            assert name not in text
+        assert result["recommendations"]["vocals"] == [
+            "eq", "dynamicsprocessor", "reverbsc", "delay"]
+
+    def test_add_instrument_track_refuses_missing_instrument(self, lmms122):
+        srv, proj = lmms122
+        before = proj.get_xml_string()
+        result = json.loads(
+            srv.add_instrument_track("Slices", instrument="slicert"))
+        assert "'slicert' is not available in the installed LMMS 1.2.2" \
+            in result["error"]
+        assert "requires LMMS 1.3+" in result["error"]
+        assert result["alternative"] == "audiofileprocessor"
+        assert "audiofileprocessor" in result["available_instruments"]
+        for name in UNAVAILABLE_IN_122:
+            assert name not in result["available_instruments"]
+        assert find_tracks(proj.root) == []
+        assert proj.get_xml_string() == before
+
+    def test_xpressive_refused_with_watsyn_alternative(self, lmms122):
+        srv, proj = lmms122
+        result = json.loads(
+            srv.add_instrument_track("Lead", instrument="xpressive"))
+        assert result["alternative"] == "watsyn"
+        assert find_tracks(proj.root) == []
+
+    def test_alias_to_missing_instrument_is_refused(self, monkeypatch, lmms122):
+        from lmms_mcp import lmms_app
+        srv, proj = lmms122
+        installed = LMMS_122_PLUGINS - {"sf2player"}
+        monkeypatch.setattr(
+            srv, "_availability",
+            lmms_app.build_availability(
+                srv.KNOWN_INSTRUMENTS, srv.effects_mod.KNOWN_EFFECTS,
+                installed, "1.2.2"))
+        result = json.loads(srv.add_instrument_track("SF", instrument="sf2"))
+        assert "'sf2player' is not available" in result["error"]
+        assert "alternative" not in result
+        assert find_tracks(proj.root) == []
+
+    def test_available_instruments_work(self, lmms122):
+        srv, proj = lmms122
+        for inst in ("tripleoscillator", "KICKER", "opulenz", "zyn"):
+            result = json.loads(srv.add_instrument_track("T", instrument=inst))
+            assert "error" not in result and "warning" not in result, inst
+        assert len(find_tracks(proj.root)) == 4
+
+    def test_custom_installed_plugin_still_accepted(self, lmms122):
+        srv, proj = lmms122
+        result = json.loads(
+            srv.add_instrument_track("Mine", instrument="mycustomsynth"))
+        assert result.get("custom_plugin") is True
+        assert len(find_tracks(proj.root)) == 1
+
+    def test_helper_plugin_is_not_an_instrument(self, lmms122):
+        srv, proj = lmms122
+        result = json.loads(
+            srv.add_instrument_track("X", instrument="midiexport"))
+        assert "not an instrument" in result["error"]
+        assert find_tracks(proj.root) == []
+
+    def test_unknown_instrument_error_lists_only_available(self, lmms122):
+        srv, _ = lmms122
+        result = json.loads(
+            srv.add_instrument_track("X", instrument="not_a_plugin_xyz"))
+        assert "Unknown instrument" in result["error"]
+        assert result["valid_instruments"] == srv._instrument_choices(
+            srv._availability)
+        text = json.dumps(result)
+        for name in UNAVAILABLE_IN_122:
+            assert name not in text
+
+    def test_add_vst_track_refused_without_vestige(self, lmms122, tmp_path):
+        srv, proj = lmms122
+        dll = tmp_path / "synth.dll"
+        dll.write_bytes(b"MZ")
+        before = proj.get_xml_string()
+        result = json.loads(srv.add_vst_track("VST", str(dll)))
+        assert "'vestige' is not available in the installed LMMS 1.2.2" \
+            in result["error"]
+        assert proj.get_xml_string() == before
+
+    def test_add_vst_track_works_with_vestige(self, monkeypatch, lmms122,
+                                              tmp_path):
+        from lmms_mcp import lmms_app
+        srv, proj = lmms122
+        monkeypatch.setattr(
+            srv, "_availability",
+            lmms_app.build_availability(
+                srv.KNOWN_INSTRUMENTS, srv.effects_mod.KNOWN_EFFECTS,
+                LMMS_122_PLUGINS | {"vestige"}, "1.2.2"))
+        dll = tmp_path / "synth.dll"
+        dll.write_bytes(b"MZ")
+        result = json.loads(srv.add_vst_track("VST", str(dll)))
+        assert "error" not in result
+        assert len(find_tracks(proj.root)) == 1
+
+    # --- no LMMS found: everything known is allowed ----------------------
+
+    def test_without_lmms_known_plugins_are_allowed(self, unverified):
+        srv, _ = unverified
+        added = json.loads(
+            srv.add_instrument_track("Lead", instrument="tripleoscillator"))
+        assert "error" not in added and "warning" not in added
+        fx = json.loads(srv.add_effect("track", 0, "delay"))
+        assert "error" not in fx and "warning" not in fx
+
+    def test_without_lmms_version_dependent_plugins_warn(self, unverified):
+        srv, proj = unverified
+        track = json.loads(
+            srv.add_instrument_track("Slices", instrument="slicert"))
+        assert "error" not in track
+        assert "could not be verified" in track["warning"]
+        assert "audiofileprocessor" in track["warning"]
+        fx = json.loads(srv.add_effect("track", 0, "compressor"))
+        assert "error" not in fx
+        assert "could not be verified" in fx["warning"]
+        assert "dynamicsprocessor" in fx["warning"]
+        assert len(find_tracks(proj.root)) == 1
+        assert find_tracks(proj.root)[0].find(
+            "instrumenttrack/fxchain/effect[@name='compressor']") is not None
+
+    def test_without_lmms_instructions_say_so(self, unverified):
+        srv, _ = unverified
+        text = srv.build_instructions(srv._availability, "/tmp/p")
+        assert "No LMMS installation was detected" in text
+        assert "compressor" in text  # standard chains, unverifiable
+        assert srv.mcp.instructions is not None
+
+    # --- what the agent is shown -----------------------------------------
+
+    def test_instructions_omit_unavailable_plugins(self, lmms122):
+        srv, _ = lmms122
+        text = srv.build_instructions(srv._availability, "/tmp/projects")
+        for name in UNAVAILABLE_IN_122:
+            assert name not in text, name
+        assert "Installed LMMS: 1.2.2" in text
+        assert "eq -> dynamicsprocessor -> reverbsc" in text
+        assert "Master bus: eq -> dynamicsprocessor -> stereoenhancer" in text
+        assert "scan_vst_directory" not in text
+        assert "/tmp/projects" in text
+
+    def test_instructions_follow_missing_zyn_and_sampler(self, monkeypatch,
+                                                         lmms122):
+        from lmms_mcp import lmms_app
+        srv, _ = lmms122
+        av = lmms_app.build_availability(
+            srv.KNOWN_INSTRUMENTS, srv.effects_mod.KNOWN_EFFECTS,
+            LMMS_122_PLUGINS - {"zynaddsubfx", "audiofileprocessor"},
+            "1.2.2")
+        text = srv.build_instructions(av, "/tmp/p")
+        assert "zynaddsubfx" not in text
+        assert "load_zyn_preset" not in text
+        assert "audiofileprocessor" not in text
+        assert "set_audiofile_sample" not in text
+
+    def test_instructions_offer_everything_on_a_full_install(self, monkeypatch,
+                                                             lmms122):
+        from lmms_mcp import lmms_app
+        srv, _ = lmms122
+        av = lmms_app.build_availability(
+            srv.KNOWN_INSTRUMENTS, srv.effects_mod.KNOWN_EFFECTS,
+            LMMS_122_PLUGINS | set(UNAVAILABLE_IN_122), "1.3.0")
+        text = srv.build_instructions(av, "/tmp/p")
+        assert "Vocals: eq -> compressor -> reverbsc" in text
+        assert "scan_vst_directory" in text
+
+    def test_tool_docstrings_list_only_available(self, lmms122):
+        srv, _ = lmms122
+        for fn in (srv.add_instrument_track, srv.add_effect):
+            doc = srv.render_plugin_doc(
+                fn.__plugin_doc_template__, srv._availability)
+            assert "$" not in doc
+            for name in UNAVAILABLE_IN_122:
+                assert name not in doc, (fn.__name__, name)
+        inst_doc = srv.render_plugin_doc(
+            srv.add_instrument_track.__plugin_doc_template__,
+            srv._availability)
+        assert "tripleoscillator" in inst_doc and "zynaddsubfx" in inst_doc
+        fx_doc = srv.render_plugin_doc(
+            srv.add_effect.__plugin_doc_template__, srv._availability)
+        assert "dynamicsprocessor" in fx_doc
+
+    def test_resources_list_only_available(self, lmms122):
+        srv, _ = lmms122
+        instruments = srv.resource_instruments()
+        effects = srv.resource_effects()
+        for name in UNAVAILABLE_IN_122:
+            assert f'"{name}"' not in instruments, name
+            assert f'"{name}"' not in effects, name
+        assert "1.2.2" in effects
+        assert "dynamicsprocessor" in effects
+        eff = json.loads(effects)
+        assert eff["recommendations_by_use_case"]["drums"] == [
+            "dynamicsprocessor", "eq", "waveshaper"]
+        inst = json.loads(instruments)
+        assert inst["recommendations_by_use_case"]["lead"] == [
+            "tripleoscillator", "watsyn", "opulenz"]
+
+    def test_effects_resource_works_on_a_full_install(self):
+        """Regression: the resource raised NameError (KNOWN_EFFECTS)."""
+        from lmms_mcp import server as srv
+        data = json.loads(srv.resource_effects())
+        names = {e["name"] for e in data["effects"]}
+        assert {"compressor", "delay"} <= names
+
+    def test_prompts_only_mention_available_instruments(self, lmms122):
+        srv, _ = lmms122
+        texts = [
+            srv.create_basic_song(),
+            srv.add_drum_pattern(),
+            srv.create_melody(),
+        ]
+        for text in texts:
+            for name in UNAVAILABLE_IN_122:
+                assert name not in text, name
+
+    def test_prompts_without_sampler(self, monkeypatch, lmms122):
+        from lmms_mcp import lmms_app
+        srv, _ = lmms122
+        monkeypatch.setattr(
+            srv, "_availability",
+            lmms_app.build_availability(
+                srv.KNOWN_INSTRUMENTS, srv.effects_mod.KNOWN_EFFECTS,
+                LMMS_122_PLUGINS - {"audiofileprocessor"}, "1.2.2"))
+        for text in (srv.create_basic_song(), srv.add_drum_pattern()):
+            assert "audiofileprocessor" not in text
+            assert "set_audiofile_sample" not in text
+
+    def test_list_available_plugins_reports_missing_with_reasons(self, lmms122):
+        srv, _ = lmms122
+        result = json.loads(srv.list_available_plugins())
+        assert "compressor" not in result["built_in_effects"]
+        assert "slicert" not in result["built_in_instruments"]
+        missing = result["unavailable_in_installed_lmms"]
+        assert missing["compressor"] == "requires LMMS 1.3+; use dynamicsprocessor"
+        assert missing["slicert"] == "requires LMMS 1.3+; use audiofileprocessor"
+        assert "vestige" in missing
+        assert result["version"] == "1.2.2"
+        # helper plugins are not offered, real custom ones are
+        assert result["custom_plugins_unknown_type"] == ["mycustomsynth"]
+
+    def test_get_lmms_info_uses_the_snapshot(self, monkeypatch, lmms122):
+        from lmms_mcp import lmms_app
+        srv, _ = lmms122
+        monkeypatch.setattr(
+            lmms_app, "find_lmms_exe", lambda: Path("/usr/bin/lmms"))
+        info = json.loads(srv.get_lmms_info())
+        assert info["version"] == "1.2.2"
+        assert "compressor" not in info["effects_verified_available"]
+        assert "delay" in info["effects_verified_available"]
+        assert "slicert" not in info["instruments_verified_available"]
+
+    # --- end to end through the MCP registry ------------------------------
+
+    def test_registered_server_hides_unavailable_plugins(self, server_for):
+        import asyncio
+        srv = server_for(LMMS_122_PLUGINS)
+        tools = {t.name: t for t in asyncio.run(srv.mcp.list_tools())}
+        # Tools needing the missing VST host are not offered at all
+        assert "add_vst_track" not in tools
+        assert "scan_vst_directory" not in tools
+        assert "add_effect" in tools and "load_zyn_preset" in tools
+        everything = srv.mcp.instructions + "\n".join(
+            t.description or "" for t in tools.values())
+        for name in UNAVAILABLE_IN_122:
+            assert name not in everything, name
+        assert "dynamicsprocessor" in tools["add_effect"].description
+        assert "tripleoscillator" in tools["add_instrument_track"].description
+
+    def test_registered_server_hides_tools_of_missing_plugins(self, server_for):
+        import asyncio
+        srv = server_for(LMMS_122_PLUGINS - {"zynaddsubfx"})
+        names = {t.name for t in asyncio.run(srv.mcp.list_tools())}
+        assert not {"list_zyn_presets", "load_zyn_preset",
+                    "set_zyn_params"} & names
+        assert "set_audiofile_sample" in names
+
+    def test_registered_server_offers_everything_on_a_full_install(
+            self, server_for):
+        import asyncio
+        srv = server_for(LMMS_122_PLUGINS | set(UNAVAILABLE_IN_122), "1.3.0")
+        tools = {t.name: t for t in asyncio.run(srv.mcp.list_tools())}
+        assert {"add_vst_track", "scan_vst_directory",
+                "load_zyn_preset"} <= set(tools)
+        assert "slicert" in tools["add_instrument_track"].description
+        assert "compressor" in tools["add_effect"].description
+
+    def test_registered_server_without_lmms_offers_everything(self, server_for):
+        import asyncio
+        srv = server_for(set(), None)
+        tools = {t.name: t for t in asyncio.run(srv.mcp.list_tools())}
+        assert "add_vst_track" in tools
+        assert "compressor" in tools["add_effect"].description
+        assert "No LMMS installation was detected" in srv.mcp.instructions

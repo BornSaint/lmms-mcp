@@ -5,6 +5,7 @@ manipulate fxchain elements on tracks and mixer channels.
 """
 
 import xml.etree.ElementTree as ET
+from collections.abc import Collection
 
 # Built-in LMMS effects: plugin name -> (description, controls node name).
 # Names verified against LMMS source (plugin descriptors + nodeName()).
@@ -63,6 +64,7 @@ def add_effect(
     wet: float = 1.0,
     enabled: bool = True,
     position: int | None = None,
+    available: Collection[str] | None = None,
 ) -> dict:
     """Add an effect to a fxchain element.
 
@@ -72,6 +74,9 @@ def add_effect(
         wet: Wet/dry mix (0.0-1.0, 1.0=full effect).
         enabled: Whether the effect is active.
         position: Insert position in chain (None=append at end).
+        available: Effect names to list in the "unknown effect" error
+            (None=all known effects). Does not restrict what is added;
+            callers refuse unavailable effects before calling.
 
     Returns:
         Dict with result info.
@@ -86,7 +91,7 @@ def add_effect(
                 f"Effect '{effect_name}' requires external plugins "
                 f"({EXTERNAL_EFFECTS[normalized]}). Use a built-in effect instead."
             )
-        valid = ", ".join(sorted(KNOWN_EFFECTS.keys()))
+        valid = ", ".join(sorted(KNOWN_EFFECTS if available is None else available))
         raise ValueError(f"Unknown effect '{effect_name}'. Valid effects: {valid}")
 
     fxchain = get_fxchain(parent)
