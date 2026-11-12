@@ -572,7 +572,8 @@ def add_note(
             pattern; if a note ends beyond the pattern clip length, the
             clip is extended automatically (notes beyond the clip end
             would otherwise be silent).
-        length: Note length in ticks (48 = 1/16 note, 96 = 1/8 note, 192 = 1 bar)
+        length: Note length in ticks (12 = 1/16 note, 24 = 1/8, 48 = 1/4 (one beat),
+            96 = 1/2, 192 = 1 bar)
         volume: Note velocity (0-200, 100=normal)
         panning: Note panning (-100 to +100)
         pattern_index: Which pattern on the track to edit (default: first).
@@ -606,7 +607,8 @@ def add_note_by_name(
         track_index: Zero-based track index
         note_name: Note name like 'C4', 'A#3', 'F5', 'Bb2'
         pos: Position in ticks (192 ticks = 1 bar)
-        length: Note length in ticks (48 = 1/16, 96 = 1/8, 192 = 1 bar)
+        length: Note length in ticks (12 = 1/16 note, 24 = 1/8, 48 = 1/4 (one beat),
+            96 = 1/2, 192 = 1 bar)
         volume: Note velocity (0-200)
     """
     try:
@@ -635,7 +637,8 @@ def add_notes_batch(
     Args:
         track_index: Zero-based track index
         notes: List of note objects, each with: key (int or str like "C4"),
-            pos (ticks), length (ticks, default 48), volume (0-200, default 100),
+            pos (ticks), length (ticks, default 48 = 1/4 note; 12 = 1/16,
+            192 = 1 bar), volume (0-200, default 100),
             panning (-100 to +100, default 0)
     """
     proj = get_project()
