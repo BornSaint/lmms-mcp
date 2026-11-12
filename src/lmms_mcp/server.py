@@ -1586,7 +1586,7 @@ def add_automation(
 
     auto_name = name or param.replace("_", " ").title()
     try:
-        track = xml_parser.add_automation_track(
+        track = xml_parser.add_automation_curve_track(
             proj.root,
             auto_name,
             tick_points,

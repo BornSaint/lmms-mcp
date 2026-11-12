@@ -900,7 +900,7 @@ AUTOMATION_TARGETS = {
 }
 
 
-def add_automation_track(
+def add_automation_curve_track(
     root: ET.Element,
     name: str,
     points: list[tuple[int, float]],

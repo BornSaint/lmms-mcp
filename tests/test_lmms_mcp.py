@@ -645,10 +645,10 @@ class TestAutomation:
         assert id1 == id2
         assert len(inst.findall("vol")) == 1
 
-    def test_add_automation_track(self):
-        from lmms_mcp.xml_parser import add_automation_track
+    def test_add_automation_curve_track(self):
+        from lmms_mcp.xml_parser import add_automation_curve_track
         root = self._root()
-        track = add_automation_track(
+        track = add_automation_curve_track(
             root, "Ramp", [(0, 120), (1536, 140)], target_id=42
         )
         assert track.get("type") == "5"
@@ -661,9 +661,9 @@ class TestAutomation:
 
     def test_automation_pattern_starts_at_first_point(self):
         """Pattern is placed at the first point; times are relative to it."""
-        from lmms_mcp.xml_parser import add_automation_track
+        from lmms_mcp.xml_parser import add_automation_curve_track
         root = self._root()
-        track = add_automation_track(
+        track = add_automation_curve_track(
             root, "Late", [(5376, 20), (6125, 60), (6144, 45)], target_id=1
         )
         pattern = track.find("automationpattern")
@@ -675,9 +675,9 @@ class TestAutomation:
         assert int(pattern.get("len")) >= 769
 
     def test_automation_pattern_len_covers_long_span(self):
-        from lmms_mcp.xml_parser import add_automation_track
+        from lmms_mcp.xml_parser import add_automation_curve_track
         root = self._root()
-        track = add_automation_track(
+        track = add_automation_curve_track(
             root, "Long", [(192, 10), (192 + 3000, 90)], target_id=1
         )
         pattern = track.find("automationpattern")
@@ -687,9 +687,9 @@ class TestAutomation:
 
     def test_automation_pattern_from_song_start(self):
         """First point at tick 0 keeps the pattern at the song start."""
-        from lmms_mcp.xml_parser import add_automation_track
+        from lmms_mcp.xml_parser import add_automation_curve_track
         root = self._root()
-        track = add_automation_track(
+        track = add_automation_curve_track(
             root, "Ramp", [(0, 120), (1536, 140)], target_id=1
         )
         pattern = track.find("automationpattern")
@@ -698,9 +698,9 @@ class TestAutomation:
         assert int(pattern.get("len")) == 1537
 
     def test_automation_single_point(self):
-        from lmms_mcp.xml_parser import add_automation_track
+        from lmms_mcp.xml_parser import add_automation_curve_track
         root = self._root()
-        track = add_automation_track(root, "One", [(768, 33)], target_id=1)
+        track = add_automation_curve_track(root, "One", [(768, 33)], target_id=1)
         pattern = track.find("automationpattern")
         assert pattern.get("pos") == "768"
         times = pattern.findall("time")
@@ -710,9 +710,9 @@ class TestAutomation:
         assert int(pattern.get("len")) == 192
 
     def test_automation_unsorted_points(self):
-        from lmms_mcp.xml_parser import add_automation_track
+        from lmms_mcp.xml_parser import add_automation_curve_track
         root = self._root()
-        track = add_automation_track(
+        track = add_automation_curve_track(
             root, "Unsorted", [(1000, 3), (400, 1), (700, 2)], target_id=1
         )
         pattern = track.find("automationpattern")
@@ -722,9 +722,9 @@ class TestAutomation:
 
     def test_automation_position_offset(self):
         """`position` is added to the pattern start; times stay relative."""
-        from lmms_mcp.xml_parser import add_automation_track
+        from lmms_mcp.xml_parser import add_automation_curve_track
         root = self._root()
-        track = add_automation_track(
+        track = add_automation_curve_track(
             root, "Offset", [(100, 1), (300, 2)], target_id=1, position=192
         )
         pattern = track.find("automationpattern")
@@ -732,9 +732,9 @@ class TestAutomation:
         assert [t.get("pos") for t in pattern.findall("time")] == ["0", "200"]
 
     def test_get_arrangement_reports_absolute_automation_position(self):
-        from lmms_mcp.xml_parser import add_automation_track, get_arrangement
+        from lmms_mcp.xml_parser import add_automation_curve_track, get_arrangement
         root = self._root()
-        add_automation_track(
+        add_automation_curve_track(
             root, "Late", [(5376, 20), (6144, 45)], target_id=1
         )
         clips = [c for c in get_arrangement(root) if c["kind"] == "automation"]
@@ -762,11 +762,28 @@ class TestAutomation:
         assert [t.get("pos") for t in pattern.findall("time")] == [
             "0", "749", "768"]
 
-    def test_add_automation_track_empty_points(self):
-        from lmms_mcp.xml_parser import add_automation_track
+    def test_add_automation_track_tool_creates_empty_track(self):
+        """The add_automation_track MCP tool creates an empty track."""
+        from lmms_mcp import server as srv
+        proj = LMMSProject()
+        proj.new()
+        srv.set_project(proj)
+        before = len(find_tracks(proj.root))
+        result = json.loads(srv.add_automation_track("Auto"))
+        assert "error" not in result
+        tracks = find_tracks(proj.root)
+        assert len(tracks) == before + 1
+        track = tracks[-1]
+        assert track.get("type") == "5"
+        assert track.get("name") == "Auto"
+        assert track.find("automationtrack") is not None
+        assert track.find("automationpattern") is None
+
+    def test_add_automation_curve_track_empty_points(self):
+        from lmms_mcp.xml_parser import add_automation_curve_track
         root = self._root()
         with pytest.raises(ValueError, match="At least one point"):
-            add_automation_track(root, "Empty", [])
+            add_automation_curve_track(root, "Empty", [])
 
     def test_resolve_song_target(self):
         from lmms_mcp.xml_parser import resolve_automation_target
@@ -803,11 +820,11 @@ class TestAutomation:
     def test_full_automation_roundtrip(self):
         """Automation must survive .mmpz save/load with intact ID links."""
         from lmms_mcp.xml_parser import (
-            resolve_automation_target, add_automation_track,
+            resolve_automation_target, add_automation_curve_track,
         )
         root = self._root()
         model_id, _ = resolve_automation_target(root, "song", 0, "tempo")
-        add_automation_track(
+        add_automation_curve_track(
             root, "Tempo Ramp", [(0, 120), (1536, 140)], target_id=model_id
         )
 
