@@ -2201,29 +2201,6 @@ class TestPluginAvailability:
         srv.set_project(proj)
         return srv, proj
 
-    @pytest.fixture
-    def server_for(self, monkeypatch):
-        """Reload the server module against a fake install (what an agent
-        sees at startup: instructions, tool list, descriptions)."""
-        import importlib
-
-        from lmms_mcp import lmms_app
-        from lmms_mcp import server as srv
-
-        def make(installed, version="1.2.2", stems=None):
-            monkeypatch.setattr(
-                lmms_app, "get_installed_plugins", lambda: set(installed))
-            monkeypatch.setattr(
-                lmms_app, "get_installed_stems",
-                lambda: dict(stems) if stems else {n: n for n in installed})
-            monkeypatch.setattr(
-                lmms_app, "get_lmms_version", lambda: version)
-            return importlib.reload(srv)
-
-        yield make
-        monkeypatch.undo()
-        importlib.reload(srv)
-
     # --- pure detection -------------------------------------------------
 
     def test_compute_available_respects_aliases_and_static(self):
@@ -2945,3 +2922,826 @@ class TestInstrumentPluginNames:
             srv._availability)
         assert "opulenz" in doc and "freeboy" in doc
         assert "lmms_plugin" in doc
+
+
+# ──────────────────────────────────────────────────────────────────
+# Instruments that play a file: sf2player, gigplayer, patman
+# ──────────────────────────────────────────────────────────────────
+
+
+def make_sf2(path, presets=((0, 0, "Piano"),)):
+    """Write a minimal SoundFont whose preset list is `presets`.
+
+    presets: (bank, patch, name) tuples. Only the RIFF skeleton and the
+    phdr chunk exist; enough for reading the preset list.
+    """
+    import struct
+
+    def chunk(cid, body):
+        return cid + struct.pack("<I", len(body)) + body + (
+            b"\0" if len(body) & 1 else b"")
+
+    records = b"".join(
+        struct.pack("<20sHHHIII", name.encode(), patch, bank, 0, 0, 0, 0)
+        for bank, patch, name in presets
+    ) + struct.pack("<20sHHHIII", b"EOP", 255, 255, 0, 0, 0, 0)
+    body = (
+        b"sfbk"
+        + chunk(b"LIST", b"INFO" + chunk(b"ifil", struct.pack("<HH", 2, 1)))
+        + chunk(b"LIST", b"sdta" + chunk(b"smpl", b"\0" * 8))
+        + chunk(b"LIST", b"pdta" + chunk(b"phdr", records))
+    )
+    Path(path).write_bytes(b"RIFF" + struct.pack("<I", len(body)) + body)
+    return Path(path)
+
+
+def touch(path):
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(b"")
+    return path
+
+
+class TestInstrumentFileDiscovery:
+    """Finding soundfonts, GIG libraries and GUS patches (fake folders)."""
+
+    @staticmethod
+    def find(tmp_path, config=None, extra=(), system=None, samples=""):
+        """Search only the given folders ("" = no LMMS factory samples)."""
+        from lmms_mcp import lmms_app
+        return lmms_app.find_instrument_files(
+            config_paths=config or {}, extra_dirs=list(extra),
+            system_dirs=system or {}, home=tmp_path / "home",
+            samples_dir=samples)
+
+    def test_finds_each_kind_in_the_lmms_folders(self, tmp_path):
+        sf2 = touch(tmp_path / "sf" / "a.sf2")
+        gig = touch(tmp_path / "gig" / "b.gig")
+        pat = touch(tmp_path / "home/lmms/samples/patches/c.pat")
+        touch(tmp_path / "sf" / "notes.txt")
+        touch(tmp_path / "sf" / "wrong.gig")  # a gig in the soundfont folder
+        found = self.find(tmp_path, config={
+            "sf2dir": str(tmp_path / "sf"), "gigdir": str(tmp_path / "gig")})
+        assert found.files["sf2player"] == (str(sf2),)
+        assert found.files["gigplayer"] == (str(gig),)
+        assert found.files["patman"] == (str(pat),)
+
+    def test_extension_case_is_ignored_and_sf3_is_not_a_soundfont(
+            self, tmp_path):
+        loud = touch(tmp_path / "sf" / "LOUD.SF2")
+        touch(tmp_path / "sf" / "compressed.sf3")
+        found = self.find(tmp_path, config={"sf2dir": str(tmp_path / "sf")})
+        assert found.files["sf2player"] == (str(loud),)
+
+    def test_default_folders_follow_the_working_directory(self, tmp_path):
+        work = tmp_path / "work"
+        sf2 = touch(work / "samples/soundfonts/x.sf2")
+        gig = touch(work / "samples/gig/y.gig")
+        found = self.find(tmp_path, config={"workingdir": str(work)})
+        assert found.files["sf2player"] == (str(sf2),)
+        assert found.files["gigplayer"] == (str(gig),)
+        assert found.put_in["gigplayer"] == str(work / "samples/gig")
+        assert found.put_in["sf2player"] == str(work / "samples/soundfonts")
+
+    def test_without_config_the_folders_are_under_home(self, tmp_path):
+        found = self.find(tmp_path)
+        home = tmp_path / "home"
+        assert found.put_in["gigplayer"] == str(home / "lmms/samples/gig")
+        assert str(home / ".local/share/soundfonts") in \
+            found.searched["sf2player"]
+
+    def test_system_folders_and_factory_patches_are_searched(self, tmp_path):
+        sf2 = touch(tmp_path / "usr" / "GM.sf2")
+        pat = touch(tmp_path / "factory" / "patches" / "flute.pat")
+        free = touch(tmp_path / "freepats" / "Tone_000" / "piano.pat")
+        found = self.find(
+            tmp_path,
+            system={"sf2player": [tmp_path / "usr"],
+                    "patman": [tmp_path / "freepats"]},
+            samples=tmp_path / "factory")
+        assert found.files["sf2player"] == (str(sf2),)
+        assert found.files["patman"] == (str(pat), str(free))
+
+    def test_extra_folders_come_first_and_apply_to_every_kind(self, tmp_path):
+        mine = tmp_path / "mine"
+        sf_mine = touch(mine / "mine.sf2")
+        gig_mine = touch(mine / "mine.gig")
+        pat_mine = touch(mine / "mine.pat")
+        sf_lmms = touch(tmp_path / "sf" / "lmms.sf2")
+        found = self.find(tmp_path, extra=[mine],
+                          config={"sf2dir": str(tmp_path / "sf")})
+        assert found.files["sf2player"] == (str(sf_mine), str(sf_lmms))
+        assert found.files["gigplayer"] == (str(gig_mine),)
+        assert found.files["patman"] == (str(pat_mine),)
+        assert found.default_soundfont == str(sf_mine)
+
+    def test_extra_folders_come_from_the_environment(
+            self, tmp_path, monkeypatch):
+        import os
+
+        from lmms_mcp import lmms_app
+        one, two = tmp_path / "one", tmp_path / "two"
+        a, b = touch(one / "a.sf2"), touch(two / "b.sf2")
+        monkeypatch.setenv(
+            lmms_app.INSTRUMENT_FILE_DIRS_ENV, f"{one}{os.pathsep}{two}")
+        found = lmms_app.find_instrument_files(
+            config_paths={}, system_dirs={}, home=tmp_path / "home",
+            samples_dir="")
+        assert found.files["sf2player"] == (str(a), str(b))
+
+    def test_search_is_bounded_in_depth(self, tmp_path):
+        top = touch(tmp_path / "sf" / "top.sf2")
+        level2 = touch(tmp_path / "sf" / "a" / "b" / "deep.sf2")
+        touch(tmp_path / "sf" / "a" / "b" / "c" / "too_deep.sf2")
+        found = self.find(tmp_path, config={"sf2dir": str(tmp_path / "sf")})
+        assert found.files["sf2player"] == (str(top), str(level2))
+
+    def test_search_is_bounded_in_size(self, tmp_path, monkeypatch):
+        from lmms_mcp import lmms_app
+        monkeypatch.setattr(lmms_app, "_SCAN_LIMIT", 3)
+        for i in range(10):
+            touch(tmp_path / "sf" / f"f{i}.sf2")
+        found = self.find(tmp_path, config={"sf2dir": str(tmp_path / "sf")})
+        assert len(found.files["sf2player"]) == 3
+
+    def test_duplicates_through_links_are_listed_once(self, tmp_path):
+        real = touch(tmp_path / "sf" / "TimGM.sf2")
+        (tmp_path / "sf" / "default-GM.sf2").symlink_to(real)
+        (tmp_path / "sf" / "dangling.sf2").symlink_to(tmp_path / "gone.sf2")
+        found = self.find(tmp_path, config={"sf2dir": str(tmp_path / "sf")})
+        # names sort case-insensitively: the link comes first and wins
+        assert found.files["sf2player"] == (str(tmp_path / "sf/default-GM.sf2"),)
+
+    def test_nothing_found(self, tmp_path):
+        found = self.find(tmp_path)
+        assert all(not v for v in found.files.values())
+        assert found.default_soundfont is None
+        assert found.for_instrument("gigplayer") == ()
+        assert found.for_instrument("tripleoscillator") == ()
+
+    def test_searched_folders_are_reported_even_if_missing(self, tmp_path):
+        found = self.find(
+            tmp_path, config={"gigdir": str(tmp_path / "nope")},
+            extra=[tmp_path / "extra"])
+        assert found.searched["gigplayer"] == (
+            str(tmp_path / "extra"), str(tmp_path / "nope"))
+
+    # --- the default soundfont ---------------------------------------------
+
+    def test_lmms_default_soundfont_wins(self, tmp_path):
+        touch(tmp_path / "sf" / "a.sf2")
+        chosen = touch(tmp_path / "elsewhere" / "mine.sf2")
+        found = self.find(tmp_path, config={
+            "sf2dir": str(tmp_path / "sf"), "defaultsf2": str(chosen)})
+        assert found.default_soundfont == str(chosen)
+        assert str(chosen) in found.files["sf2player"]
+
+    def test_relative_default_soundfont_is_in_the_soundfont_folder(
+            self, tmp_path):
+        touch(tmp_path / "sf" / "a.sf2")
+        chosen = touch(tmp_path / "sf" / "b.sf2")
+        found = self.find(tmp_path, config={
+            "sf2dir": str(tmp_path / "sf"), "defaultsf2": "b.sf2"})
+        assert found.default_soundfont == str(chosen)
+
+    @pytest.mark.parametrize("default", ["", "gone.sf2", "notes.txt"])
+    def test_unusable_default_soundfont_is_ignored(self, tmp_path, default):
+        first = touch(tmp_path / "sf" / "a.sf2")
+        touch(tmp_path / "sf" / "notes.txt")
+        found = self.find(tmp_path, config={
+            "sf2dir": str(tmp_path / "sf"), "defaultsf2": default})
+        assert found.default_soundfont == str(first)
+
+    def test_default_soundfont_prefers_the_gm_default_name(self, tmp_path):
+        touch(tmp_path / "usr" / "TimGM6mb.sf2")
+        gm = touch(tmp_path / "usr" / "default-GM.sf2")
+        found = self.find(tmp_path, system={"sf2player": [tmp_path / "usr"]})
+        assert found.default_soundfont == str(gm)
+
+    # --- LMMS's config file ---------------------------------------------------
+
+    def test_read_lmms_paths(self, tmp_path):
+        from lmms_mcp import lmms_app
+        rc = tmp_path / ".lmmsrc.xml"
+        rc.write_text(
+            '<lmms><paths sf2dir="/x/sf/" gigdir="/x/gig/" defaultsf2=""/>'
+            '<ui/></lmms>')
+        assert lmms_app.read_lmms_paths(rc) == {
+            "sf2dir": "/x/sf/", "gigdir": "/x/gig/", "defaultsf2": ""}
+
+    def test_read_lmms_paths_tolerates_a_missing_or_broken_file(
+            self, tmp_path):
+        from lmms_mcp import lmms_app
+        assert lmms_app.read_lmms_paths(tmp_path / "missing.xml") == {}
+        broken = tmp_path / "broken.xml"
+        broken.write_text("<lmms><paths")
+        assert lmms_app.read_lmms_paths(broken) == {}
+        no_paths = tmp_path / "none.xml"
+        no_paths.write_text("<lmms><ui/></lmms>")
+        assert lmms_app.read_lmms_paths(no_paths) == {}
+
+
+class TestSoundfontPresets:
+    def test_reads_banks_patches_and_names(self, tmp_path):
+        from lmms_mcp import lmms_app
+        sf2 = make_sf2(tmp_path / "t.sf2", [
+            (0, 0, "Piano"), (0, 48, "Strings"), (128, 0, "Standard")])
+        assert lmms_app.read_soundfont_presets(sf2) == {
+            (0, 0): "Piano", (0, 48): "Strings", (128, 0): "Standard"}
+
+    @pytest.mark.parametrize("content", [b"", b"RIFF", b"not a soundfont" * 4])
+    def test_unreadable_files_give_none(self, tmp_path, content):
+        from lmms_mcp import lmms_app
+        bad = tmp_path / "bad.sf2"
+        bad.write_bytes(content)
+        assert lmms_app.read_soundfont_presets(bad) is None
+        assert lmms_app.read_soundfont_presets(tmp_path / "gone.sf2") is None
+
+    def test_default_preset_is_piano_or_the_first_preset(self, tmp_path):
+        from lmms_mcp import lmms_app
+        gm = make_sf2(tmp_path / "gm.sf2", [(0, 5, "X"), (0, 0, "Piano")])
+        drums = make_sf2(tmp_path / "drums.sf2", [(128, 8, "Room"), (1, 3, "Y")])
+        assert lmms_app.default_soundfont_preset(gm) == (0, 0)
+        assert lmms_app.default_soundfont_preset(drums) == (1, 3)
+        assert lmms_app.default_soundfont_preset(tmp_path / "gone") == (0, 0)
+
+    def test_describe_banks(self):
+        from lmms_mcp import lmms_app
+        presets = {(0, p): "x" for p in (0, 1, 2, 5)}
+        presets.update({(128, 0): "d", (128, 8): "d"})
+        assert lmms_app.describe_soundfont_banks(presets) == (
+            "bank 0: patches 0-2, 5; bank 128: patches 0, 8")
+
+
+def _availability_with(files, installed=LMMS_122_PLUGINS, **kwargs):
+    from lmms_mcp import lmms_app
+    from lmms_mcp import server as srv
+    return lmms_app.build_availability(
+        srv.KNOWN_INSTRUMENTS, srv.effects_mod.KNOWN_EFFECTS,
+        set(installed), "1.2.2", files=files, **kwargs)
+
+
+def _files(**found):
+    """InstrumentFiles from {instrument: [paths]}."""
+    from lmms_mcp import lmms_app
+    sf = found.get("sf2player", [])
+    return lmms_app.InstrumentFiles(
+        files={k: tuple(str(p) for p in v) for k, v in found.items()},
+        searched={k: ("/search/" + k, "/other/" + k)
+                  for k in lmms_app.FILE_INSTRUMENTS},
+        put_in={k: "/put/" + k for k in lmms_app.FILE_INSTRUMENTS},
+        default_soundfont=str(sf[0]) if sf else None,
+    )
+
+
+class TestFileInstrumentOffering:
+    """sf2player, gigplayer and patman are only offered with a file."""
+
+    @pytest.fixture
+    def setup(self, monkeypatch, tmp_path):
+        """(server, project, install) builder for a given set of files."""
+        from lmms_mcp import server as srv
+
+        def make(**found):
+            files = _files(**{k: [touch(tmp_path / v) for v in vs]
+                              if vs and isinstance(vs[0], str) else vs
+                              for k, vs in found.items()})
+            monkeypatch.setattr(srv, "_availability", _availability_with(files))
+            proj = LMMSProject()
+            proj.new()
+            srv.set_project(proj)
+            return srv, proj
+        return make
+
+    def test_snapshot_offers_an_instrument_only_with_a_file(self):
+        av = _availability_with(_files(sf2player=["/a.sf2"]))
+        assert "sf2player" in av.instruments
+        assert "gigplayer" not in av.instruments
+        assert "patman" not in av.instruments
+        assert av.needs_file == {"gigplayer", "patman"}
+        assert "gigplayer" not in av.plugin_names
+        assert av.files.default_soundfont == "/a.sf2"
+
+    def test_snapshot_without_any_files_offers_none(self):
+        av = _availability_with(None)
+        assert not {"sf2player", "gigplayer", "patman"} & av.instruments
+        assert av.needs_file == {"sf2player", "gigplayer", "patman"}
+        assert "tripleoscillator" in av.instruments
+
+    def test_a_missing_library_is_not_a_missing_file(self):
+        av = _availability_with(
+            _files(gigplayer=["/a.gig"]),
+            installed=LMMS_122_PLUGINS - {"gigplayer", "patman"})
+        assert not {"gigplayer", "patman"} & (av.instruments | av.needs_file)
+
+    def test_files_also_gate_when_no_lmms_was_found(self):
+        from lmms_mcp import lmms_app
+        from lmms_mcp import server as srv
+        av = lmms_app.build_availability(
+            srv.KNOWN_INSTRUMENTS, srv.effects_mod.KNOWN_EFFECTS, set(), None,
+            files=_files(patman=["/a.pat"]))
+        assert "patman" in av.instruments
+        assert "gigplayer" not in av.instruments
+        assert "sf2player" not in av.instruments
+
+    def test_instrument_lists_leave_out_file_instruments_without_files(
+            self, setup):
+        srv, _ = setup(sf2player=["a.sf2"])
+        assert "gigplayer" not in srv._instrument_choices(srv._availability)
+        doc = srv.render_plugin_doc(
+            srv.add_instrument_track.__plugin_doc_template__,
+            srv._availability)
+        assert "sf2player" in doc and "gigplayer" not in doc \
+            and "patman" not in doc
+        info = json.loads(srv.list_available_plugins())
+        assert "gigplayer" not in info["built_in_instruments"]
+        entries = json.loads(srv.resource_instruments())["instruments"]
+        assert "gigplayer" not in {e["name"] for e in entries}
+
+    # --- refusals ----------------------------------------------------------
+
+    def test_gigplayer_is_refused_without_a_gig_file(self, setup):
+        srv, proj = setup(sf2player=["a.sf2"])
+        before = proj.get_xml_string()
+        result = json.loads(srv.add_instrument_track("G", "gigplayer"))
+        assert result["error"] == (
+            "'gigplayer' needs a .gig sample library and none was found "
+            "(searched: /search/gigplayer, /other/gigplayer). Put one in "
+            "/put/gigplayer and restart the server, or use 'sf2player' / "
+            "'audiofileprocessor'.")
+        assert result["alternative"] == "sf2player"
+        assert "sf2player" in result["available_instruments"]
+        assert "gigplayer" not in result["available_instruments"]
+        assert proj.get_xml_string() == before
+
+    def test_patman_is_refused_without_a_pat_file(self, setup):
+        srv, proj = setup(sf2player=["a.sf2"])
+        result = json.loads(srv.add_instrument_track("P", "patman"))
+        assert "'patman' needs a .pat GUS patch and none was found" \
+            in result["error"]
+        assert "Put one in /put/patman and restart the server" \
+            in result["error"]
+        assert find_tracks(proj.root) == []
+
+    def test_sf2player_is_refused_without_a_soundfont(self, setup):
+        srv, proj = setup(gigplayer=["a.gig"])
+        for spelling in ("sf2player", "sf2", "fluidsynth"):
+            result = json.loads(srv.add_instrument_track("S", spelling))
+            assert "'sf2player' needs a .sf2 soundfont and none was found" \
+                in result["error"], spelling
+            # gigplayer needs a file too, but this one has one, and the
+            # suggested alternatives are only offered instruments
+            assert result["alternative"] == "audiofileprocessor"
+            assert "'audiofileprocessor'" in result["error"]
+        assert find_tracks(proj.root) == []
+
+    def test_refusal_without_any_alternative(self, setup, monkeypatch):
+        srv, _ = setup(patman=["a.pat"])
+        monkeypatch.setattr(srv, "_availability", _availability_with(
+            _files(patman=["/a.pat"]),
+            installed=LMMS_122_PLUGINS - {"audiofileprocessor"}))
+        result = json.loads(srv.add_instrument_track("G", "gigplayer"))
+        assert result["error"].endswith(
+            "restart the server, or choose one of the available_instruments.")
+        assert "alternative" not in result
+        assert "patman" in result["available_instruments"]
+
+    def test_alias_of_a_missing_library_is_still_the_plain_refusal(
+            self, setup, monkeypatch):
+        srv, _ = setup(sf2player=["a.sf2"])
+        monkeypatch.setattr(srv, "_availability", _availability_with(
+            _files(sf2player=["/a.sf2"]),
+            installed=LMMS_122_PLUGINS - {"gigplayer"}))
+        result = json.loads(srv.add_instrument_track("G", "gigplayer"))
+        assert "'gigplayer' is not available in the installed LMMS" \
+            in result["error"]
+        assert "needs a" not in result["error"]
+
+    def test_list_available_plugins_explains_missing_files(self, setup):
+        srv, _ = setup(sf2player=["a.sf2"])
+        missing = json.loads(
+            srv.list_available_plugins())["unavailable_in_installed_lmms"]
+        assert missing["gigplayer"].startswith("'gigplayer' needs a .gig")
+        assert missing["patman"].endswith("restart the server.")
+        assert "sf2player" not in missing
+
+    # --- new tracks --------------------------------------------------------
+
+    def test_new_sf2player_track_plays_the_default_soundfont(
+            self, setup, tmp_path):
+        sf2 = make_sf2(tmp_path / "gm.sf2", [(0, 0, "Grand Piano")])
+        srv, proj = setup(sf2player=[sf2])
+        result = json.loads(srv.add_instrument_track("Keys", "sf2"))
+        assert "error" not in result and "warning" not in result
+        assert result["instrument"] == "sf2player"
+        assert result["instrument_file"] == {
+            "file": str(sf2), "bank": 0, "patch": 0, "preset": "Grand Piano"}
+        assert "gm.sf2 bank 0 patch 0 (Grand Piano)" in result["hint"]
+        assert "set_instrument_file(track_index=0" in result["hint"]
+        inst = find_tracks(proj.root)[0].find("instrumenttrack/instrument")
+        assert inst.get("name") == "sf2player"
+        assert inst.find("sf2player").attrib == {
+            "src": str(sf2), "bank": "0", "patch": "0", "gain": "1"}
+        assert proj._modified
+
+    def test_default_soundfont_without_bank_zero_starts_on_its_first_preset(
+            self, setup, tmp_path):
+        sf2 = make_sf2(tmp_path / "drums.sf2", [(128, 0, "Kit")])
+        srv, proj = setup(sf2player=[sf2])
+        result = json.loads(srv.add_instrument_track("Drums", "sf2player"))
+        assert result["instrument_file"]["bank"] == 128
+        assert find_tracks(proj.root)[0].find(
+            "instrumenttrack/instrument/sf2player").get("bank") == "128"
+
+    def test_unreadable_default_soundfont_is_still_set(self, setup):
+        srv, _ = setup(sf2player=["plain.sf2"])  # empty stand-in file
+        result = json.loads(srv.add_instrument_track("K", "sf2player"))
+        assert result["instrument_file"]["bank"] == 0
+        assert "preset" not in result["instrument_file"]
+
+    def test_vanished_default_soundfont_warns_and_says_what_to_do(
+            self, setup, tmp_path):
+        srv, proj = setup(sf2player=[tmp_path / "gone.sf2"])
+        result = json.loads(srv.add_instrument_track("K", "sf2player"))
+        assert "File not found" in result["warning"]
+        assert "set_instrument_file(track_index=0" in result["warning"]
+        assert "instrument_file" not in result
+        assert len(find_tracks(proj.root)) == 1
+
+    def test_new_gigplayer_and_patman_tracks_say_to_set_a_file(
+            self, setup, tmp_path):
+        gig, pat = touch(tmp_path / "x.gig"), touch(tmp_path / "x.pat")
+        srv, proj = setup(gigplayer=[gig], patman=[pat])
+        for name, file in (("gigplayer", gig), ("patman", pat)):
+            result = json.loads(srv.add_instrument_track("T", name))
+            assert "error" not in result
+            assert f"{name} is silent until it has a" in result["hint"]
+            assert f"file_path='{file}'" in result["hint"]
+            assert "instrument_file" not in result
+        for track in find_tracks(proj.root):
+            settings = track.find("instrumenttrack/instrument")[0]
+            assert "src" not in settings.attrib
+
+    def test_other_instruments_get_no_file_hint(self, setup):
+        srv, _ = setup(sf2player=["a.sf2"])
+        result = json.loads(srv.add_instrument_track("T", "tripleoscillator"))
+        assert "hint" not in result and "instrument_file" not in result
+
+    # --- what the agent is told -------------------------------------------
+
+    def test_instructions_mention_only_offered_file_instruments(self, setup):
+        srv, _ = setup(sf2player=["a.sf2"])
+        text = srv.build_instructions(srv._availability, "/tmp/p")
+        assert "sf2player plays General MIDI" in text
+        assert "set_instrument_file" in text
+        assert "gigplayer" not in text and "patman" not in text
+
+    def test_instructions_for_gig_and_patch_only(self, setup):
+        srv, _ = setup(gigplayer=["a.gig"], patman=["a.pat"])
+        text = srv.build_instructions(srv._availability, "/tmp/p")
+        assert "gigplayer plays a .gig library and patman plays a GUS .pat" \
+            in text
+        assert "sf2player" not in text
+
+    def test_instructions_without_file_instruments(self, setup):
+        srv, _ = setup()
+        text = srv.build_instructions(srv._availability, "/tmp/p")
+        assert "File-based instruments" not in text
+        assert "set_instrument_file" not in text
+
+    def test_tool_description_follows_the_offered_instruments(self, setup):
+        srv, _ = setup(sf2player=["a.sf2"])
+        doc = srv.render_plugin_doc(
+            srv.set_instrument_file.__plugin_doc_template__,
+            srv._availability)
+        assert "(sf2player)" in doc
+        flat = " ".join(doc.split())
+        assert "patch 0 piano, 24 nylon guitar, 32 acoustic bass" in flat
+        assert "73 flute" in flat and "Bank 128 is the drum kit" in flat
+        assert "gigplayer" not in doc and "patman" not in doc
+        srv2, _ = setup(gigplayer=["a.gig"], patman=["a.pat"])
+        doc = srv2.render_plugin_doc(
+            srv2.set_instrument_file.__plugin_doc_template__,
+            srv2._availability)
+        assert "(gigplayer / patman)" in doc
+        assert "sf2player" not in doc and "General MIDI" not in doc
+
+    def test_add_instrument_track_points_to_the_file_tool(self, setup):
+        srv, _ = setup(sf2player=["a.sf2"])
+        doc = srv.render_plugin_doc(
+            srv.add_instrument_track.__plugin_doc_template__,
+            srv._availability)
+        assert "set_instrument_file" in doc
+        srv, _ = setup()
+        doc = srv.render_plugin_doc(
+            srv.add_instrument_track.__plugin_doc_template__,
+            srv._availability)
+        assert "set_instrument_file" not in doc
+
+    def test_list_available_plugins_shows_the_files(self, setup, tmp_path):
+        sfs = [tmp_path / f"f{i:02}.sf2" for i in range(25)]
+        srv, _ = setup(sf2player=[touch(p) for p in sfs],
+                       patman=[touch(tmp_path / "x.pat")])
+        listed = json.loads(srv.list_available_plugins())["instrument_files"]
+        assert set(listed) == {"sf2player", "patman"}
+        assert listed["patman"] == {"count": 1, "files": [str(tmp_path / "x.pat")]}
+        assert listed["sf2player"]["count"] == 25
+        assert listed["sf2player"]["files"] == [str(p) for p in sfs[:20]]
+        assert listed["sf2player"]["note"] == "first 20 of 25"
+        assert listed["sf2player"]["default"] == str(sfs[0])
+
+    def test_list_available_plugins_without_files_has_no_file_section(
+            self, setup):
+        srv, _ = setup()
+        assert "instrument_files" not in json.loads(srv.list_available_plugins())
+
+    # --- the tool is registered only when it can be used ---------------------
+
+    @pytest.mark.parametrize("found,registered", [
+        ({"sf2player": ("/a.sf2",)}, True),
+        ({"gigplayer": ("/a.gig",)}, True),
+        ({"patman": ("/a.pat",)}, True),
+        ({}, False),
+    ])
+    def test_tool_is_registered_only_if_a_file_instrument_is_offered(
+            self, server_for, found, registered):
+        import asyncio
+        files = _files(**{k: list(v) for k, v in found.items()})
+        srv = server_for(LMMS_122_PLUGINS, files=files)
+        tools = {t.name for t in asyncio.run(srv.mcp.list_tools())}
+        assert ("set_instrument_file" in tools) is registered
+        assert "add_instrument_track" in tools
+
+    def test_tool_is_not_registered_when_the_libraries_are_missing(
+            self, server_for, tmp_path):
+        import asyncio
+        srv = server_for(
+            LMMS_122_PLUGINS - {"sf2player", "gigplayer", "patman"})
+        tools = {t.name for t in asyncio.run(srv.mcp.list_tools())}
+        assert "set_instrument_file" not in tools
+
+    def test_registered_descriptions_match_the_machine(self, server_for):
+        import asyncio
+        srv = server_for(LMMS_122_PLUGINS, files=_files(sf2player=["/a.sf2"]))
+        tools = {t.name: t for t in asyncio.run(srv.mcp.list_tools())}
+        text = srv.mcp.instructions + "\n".join(
+            t.description or "" for t in tools.values())
+        assert "gigplayer" not in text and "patman" not in text
+        assert "sf2player" in tools["set_instrument_file"].description
+
+
+class TestSetInstrumentFile:
+    @pytest.fixture
+    def env(self, monkeypatch, tmp_path):
+        """(server, project, folder): the conftest install with real files."""
+        from lmms_mcp import server as srv
+        proj = LMMSProject()
+        proj.new()
+        srv.set_project(proj)
+        return srv, proj, tmp_path
+
+    @staticmethod
+    def settings(proj, index=0):
+        inst = find_tracks(proj.root)[index].find("instrumenttrack/instrument")
+        return inst.get("name"), inst[0]
+
+    def test_sets_a_soundfont_with_bank_and_patch(self, env):
+        srv, proj, tmp = env
+        sf2 = make_sf2(tmp / "gm.sf2", [(0, 0, "Piano"), (0, 48, "Strings"),
+                                        (128, 0, "Standard")])
+        srv.add_instrument_track("Keys", "sf2player")
+        result = json.loads(srv.set_instrument_file(0, str(sf2), patch=48))
+        assert result == {
+            "track_index": 0, "instrument": "sf2player", "file": str(sf2),
+            "bank": 0, "patch": 48, "preset": "Strings",
+            "message": "Set gm.sf2 bank 0 patch 48 (Strings) on sf2player "
+                       "track 0"}
+        name, node = self.settings(proj)
+        assert name == "sf2player" and node.tag == "sf2player"
+        assert node.attrib == {
+            "src": str(sf2), "bank": "0", "patch": "48", "gain": "1"}
+
+    def test_replaces_the_file_and_keeps_the_gain(self, env):
+        srv, proj, tmp = env
+        a, b = make_sf2(tmp / "a.sf2"), make_sf2(tmp / "b.sf2")
+        srv.add_instrument_track("Keys", "sf2player")
+        _, node = self.settings(proj)
+        node.set("gain", "2.5")
+        json.loads(srv.set_instrument_file(0, str(a)))
+        json.loads(srv.set_instrument_file(0, str(b)))
+        assert node.get("src") == str(b)
+        assert node.get("gain") == "2.5"
+        assert len(list(proj.root.iter("sf2player"))) == 1
+
+    def test_drum_bank(self, env):
+        srv, proj, tmp = env
+        sf2 = make_sf2(tmp / "gm.sf2", [(0, 0, "Piano"), (128, 0, "Standard")])
+        srv.add_instrument_track("Drums", "sf2player")
+        result = json.loads(srv.set_instrument_file(0, str(sf2), bank=128))
+        assert result["preset"] == "Standard"
+        assert self.settings(proj)[1].get("bank") == "128"
+
+    def test_gigplayer_gets_src_bank_patch_and_gain(self, env):
+        srv, proj, tmp = env
+        gig = touch(tmp / "lib.gig")
+        srv.add_instrument_track("G", "gigplayer")
+        result = json.loads(
+            srv.set_instrument_file(0, str(gig), bank=3, patch=7))
+        assert result["instrument"] == "gigplayer"
+        assert "preset" not in result
+        name, node = self.settings(proj)
+        assert name == "gigplayer"
+        assert node.attrib == {
+            "src": str(gig), "bank": "3", "patch": "7", "gain": "1"}
+
+    def test_patman_gets_only_src(self, env):
+        srv, proj, tmp = env
+        pat = touch(tmp / "flute.pat")
+        srv.add_instrument_track("P", "patman")
+        result = json.loads(srv.set_instrument_file(0, str(pat)))
+        assert result["message"] == "Set flute.pat on patman track 0"
+        assert "bank" not in result and "patch" not in result
+        assert self.settings(proj)[1].attrib == {"src": str(pat)}
+
+    @pytest.mark.parametrize("kwargs", [{"bank": 1}, {"patch": 5}])
+    def test_patman_rejects_bank_and_patch(self, env, kwargs):
+        srv, proj, tmp = env
+        pat = touch(tmp / "flute.pat")
+        srv.add_instrument_track("P", "patman")
+        result = json.loads(srv.set_instrument_file(0, str(pat), **kwargs))
+        assert "patman has no bank or patch" in result["error"]
+        assert "src" not in self.settings(proj)[1].attrib
+
+    def test_saved_project_keeps_the_file(self, env):
+        srv, proj, tmp = env
+        sf2 = make_sf2(tmp / "gm.sf2")
+        srv.add_instrument_track("Keys", "sf2player")
+        srv.set_instrument_file(0, str(sf2), patch=0)
+        saved = Path(proj.save(tmp / "p.mmp", compressed=False))
+        assert f'src="{sf2}"' in saved.read_text()
+        reloaded = LMMSProject()
+        reloaded.load(str(saved))
+        assert find_tracks(reloaded.root)[0].find(
+            "instrumenttrack/instrument/sf2player").get("src") == str(sf2)
+
+    # --- wrong track -------------------------------------------------------
+
+    def test_other_instruments_are_refused(self, env):
+        srv, proj, tmp = env
+        sf2 = make_sf2(tmp / "gm.sf2")
+        srv.add_instrument_track("Lead", "tripleoscillator")
+        before = proj.get_xml_string()
+        result = json.loads(srv.set_instrument_file(0, str(sf2)))
+        assert "uses instrument 'tripleoscillator', which does not play a " \
+            "file" in result["error"]
+        assert "sf2player / gigplayer / patman" in result["error"]
+        assert proj.get_xml_string() == before
+
+    def test_audiofileprocessor_is_sent_to_its_own_tool(self, env):
+        srv, _, tmp = env
+        srv.add_instrument_track("Kick", "audiofileprocessor")
+        result = json.loads(srv.set_instrument_file(
+            0, str(touch(tmp / "kick.wav"))))
+        assert "use set_audiofile_sample" in result["error"]
+
+    def test_non_instrument_tracks_and_bad_indexes_are_refused(self, env):
+        srv, _, tmp = env
+        sf2 = make_sf2(tmp / "gm.sf2")
+        srv.add_sample_track("Audio")
+        assert "not an instrument track" in json.loads(
+            srv.set_instrument_file(0, str(sf2)))["error"]
+        for index in (1, -1):
+            assert "out of range" in json.loads(
+                srv.set_instrument_file(index, str(sf2)))["error"]
+
+    def test_the_other_file_tool_refuses_these_tracks(self, env):
+        srv, _, _tmp = env
+        srv.add_instrument_track("Keys", "sf2player")
+        error = json.loads(srv.set_audiofile_sample(0, "drums/kick01.ogg"))
+        assert "not audiofileprocessor" in error["error"]
+
+    def test_only_offered_kinds_are_named_in_errors(self, env, monkeypatch):
+        srv, _, tmp = env
+        monkeypatch.setattr(srv, "_availability", _availability_with(
+            _files(sf2player=["/a.sf2"])))
+        srv.add_instrument_track("Lead", "tripleoscillator")
+        error = json.loads(srv.set_instrument_file(0, str(tmp / "x.sf2")))
+        assert "sf2player" in error["error"]
+        assert "patman" not in error["error"]
+        assert "gigplayer" not in error["error"]
+
+    def test_a_track_whose_file_is_missing_everywhere_can_still_be_set(
+            self, env, monkeypatch):
+        """A loaded project may hold a gigplayer track while this machine
+        has no .gig library yet; pointing it at a file still works."""
+        srv, proj, tmp = env
+        monkeypatch.setattr(srv, "_availability", _availability_with(
+            _files(sf2player=["/a.sf2"])))
+        proj.add_track("instrument", "G", instrument="gigplayer")
+        gig = touch(tmp / "lib.gig")
+        result = json.loads(srv.set_instrument_file(0, str(gig)))
+        assert "error" not in result
+        assert self.settings(proj)[1].get("src") == str(gig)
+
+    # --- wrong file ----------------------------------------------------------
+
+    def test_missing_file_is_refused(self, env):
+        srv, _, tmp = env
+        srv.add_instrument_track("Keys", "sf2player")
+        result = json.loads(srv.set_instrument_file(0, str(tmp / "gone.sf2")))
+        assert result["error"] == f"File not found: {tmp / 'gone.sf2'}"
+
+    def test_a_folder_is_not_a_file(self, env):
+        srv, _, tmp = env
+        (tmp / "dir.sf2").mkdir()
+        srv.add_instrument_track("Keys", "sf2player")
+        assert "File not found" in json.loads(
+            srv.set_instrument_file(0, str(tmp / "dir.sf2")))["error"]
+
+    @pytest.mark.parametrize("instrument,name", [
+        ("sf2player", "song.wav"), ("sf2player", "lib.gig"),
+        ("gigplayer", "font.sf2"), ("patman", "font.sf2"),
+        ("sf2player", "noextension"),
+    ])
+    def test_wrong_extension_is_refused(self, env, instrument, name):
+        srv, proj, tmp = env
+        srv.add_instrument_track("T", instrument)
+        before = proj.get_xml_string()
+        result = json.loads(
+            srv.set_instrument_file(0, str(touch(tmp / name))))
+        assert f"{instrument} plays " in result["error"]
+        assert f"got '{name}'" in result["error"]
+        assert proj.get_xml_string() == before
+
+    def test_compressed_soundfonts_are_refused_with_the_reason(self, env):
+        srv, _, tmp = env
+        srv.add_instrument_track("Keys", "sf2player")
+        result = json.loads(
+            srv.set_instrument_file(0, str(touch(tmp / "big.sf3"))))
+        assert "sf2player plays .sf2 files" in result["error"]
+        assert "crash" in result["error"]
+
+    def test_extension_case_is_ignored(self, env):
+        srv, _, tmp = env
+        srv.add_instrument_track("Keys", "sf2player")
+        assert "error" not in json.loads(
+            srv.set_instrument_file(0, str(touch(tmp / "LOUD.SF2"))))
+
+    def test_relative_and_empty_paths_are_refused(self, env):
+        srv, _, _tmp = env
+        srv.add_instrument_track("Keys", "sf2player")
+        assert "absolute path" in json.loads(
+            srv.set_instrument_file(0, "gm.sf2"))["error"]
+        assert "must not be empty" in json.loads(
+            srv.set_instrument_file(0, "  "))["error"]
+
+    # --- bank and patch ------------------------------------------------------
+
+    @pytest.mark.parametrize("bank,patch,message", [
+        (-1, 0, "bank must be 0-999"), (1000, 0, "bank must be 0-999"),
+        (0, -1, "patch must be 0-127"), (0, 128, "patch must be 0-127"),
+    ])
+    def test_bank_and_patch_ranges(self, env, bank, patch, message):
+        srv, _, tmp = env
+        gig = touch(tmp / "lib.gig")
+        srv.add_instrument_track("G", "gigplayer")
+        result = json.loads(
+            srv.set_instrument_file(0, str(gig), bank=bank, patch=patch))
+        assert message in result["error"]
+
+    def test_range_limits_are_accepted(self, env):
+        srv, _, tmp = env
+        gig = touch(tmp / "lib.gig")
+        srv.add_instrument_track("G", "gigplayer")
+        assert "error" not in json.loads(
+            srv.set_instrument_file(0, str(gig), bank=999, patch=127))
+
+    def test_missing_preset_is_refused_and_lists_what_exists(self, env):
+        srv, proj, tmp = env
+        sf2 = make_sf2(tmp / "gm.sf2", [
+            (0, 0, "A"), (0, 1, "B"), (0, 2, "C"), (128, 0, "Kit")])
+        srv.add_instrument_track("Keys", "sf2player")
+        before = proj.get_xml_string()
+        result = json.loads(srv.set_instrument_file(0, str(sf2), bank=5))
+        assert result["error"] == (
+            "gm.sf2 has no preset at bank 5, patch 0. It has: "
+            "bank 0: patches 0-2; bank 128: patches 0.")
+        assert "no preset at bank 0, patch 9" in json.loads(
+            srv.set_instrument_file(0, str(sf2), patch=9))["error"]
+        assert proj.get_xml_string() == before
+
+    def test_gig_banks_are_not_checked_against_presets(self, env):
+        srv, _, tmp = env
+        gig = touch(tmp / "lib.gig")
+        srv.add_instrument_track("G", "gigplayer")
+        assert "error" not in json.loads(
+            srv.set_instrument_file(0, str(gig), bank=9, patch=99))
+
+    def test_registered_tool_schema(self, server_for):
+        import asyncio
+        srv = server_for(LMMS_122_PLUGINS)
+        tool = {t.name: t for t in asyncio.run(srv.mcp.list_tools())}[
+            "set_instrument_file"]
+        props = tool.input_schema["properties"]
+        assert set(props) == {"track_index", "file_path", "bank", "patch"}
+        assert tool.input_schema["required"] == ["track_index", "file_path"]

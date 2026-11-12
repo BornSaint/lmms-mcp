@@ -51,8 +51,9 @@ KNOWN_INSTRUMENTS = {
     "monstro": "Powerful 3-oscillator polyphonic synth",
     "nes": "NES 8-bit sound chip emulator (chiptune)",
     "opulenz": "OPL3 FM synthesizer (Yamaha DX100 style)",
-    "patman": "GUS patch sampler",
-    "sf2player": "SoundFont (.sf2) sample player",
+    "patman": "GUS patch (.pat) sampler (needs a patch file)",
+    "sf2player": "SoundFont (.sf2) player: General MIDI piano, guitar, strings, "
+                 "drums ... (needs a soundfont file)",
     "sfxr": "Retro sound effect generator (chiptune)",
     "sid": "Commodore 64 SID chip emulator (chiptune)",
     "slicert": "Beat slicer for chopping audio loops",
@@ -60,7 +61,7 @@ KNOWN_INSTRUMENTS = {
     "watsyn": "4-oscillator wavetable-style synth",
     "xpressive": "Expressive mono lead synth",
     "zynaddsubfx": "ZynAddSubFX powerful feature-rich synth",
-    "gigplayer": "GIG sample library player",
+    "gigplayer": "GIG sample library player (needs a .gig file)",
     "bitinvader": "Bit-crushed wavetable synth",
     "vestige": "VST plugin host (Windows only)",
 }
@@ -94,11 +95,13 @@ INSTRUMENT_ALIASES = {
 
 # Tools that are useless without a plugin; they are removed from the
 # server when the installed LMMS lacks it, so agents are never offered them.
+# A tuple lists alternatives: the tool stays if any one of them is offered.
 TOOL_REQUIRES = {
     "list_zyn_presets": "zynaddsubfx",
     "load_zyn_preset": "zynaddsubfx",
     "set_zyn_params": "zynaddsubfx",
     "set_audiofile_sample": "audiofileprocessor",
+    "set_instrument_file": ("sf2player", "gigplayer", "patman"),
     "scan_vst_directory": "vestige",
     "add_vst_track": "vestige",
 }
@@ -142,11 +145,66 @@ def _wrap_names(names, indent: str = " " * 12, width: int = 78) -> str:
     return ("\n" + indent).join(lines)
 
 
+def _file_instruments(av) -> list[str]:
+    """The offered instruments that play a file (sf2player, gigplayer, patman)."""
+    return [n for n in lmms_app.FILE_INSTRUMENTS if n in av.instruments]
+
+
+def _file_instrument_details(av) -> list[str]:
+    """One short sentence per offered file instrument, for docs and instructions."""
+    pool = av.instruments
+    details = []
+    if "sf2player" in pool:
+        details.append(
+            "sf2player plays a SoundFont (.sf2) with General MIDI programs: "
+            "patch 0 piano, 24 nylon guitar, 32 acoustic bass, 40 violin, "
+            "48 strings, 56 trumpet, 73 flute (bank 0). Bank 128 is the "
+            "drum kit, played on keys 23-69 of this server (the GM drum map "
+            "35-81 one octave down): 24 kick, 26 snare, 30 closed hi-hat, "
+            "34 open hi-hat, 37 crash."
+        )
+    if "gigplayer" in pool:
+        details.append(
+            "gigplayer plays a .gig sample library (bank 0-999 and patch "
+            "0-127 select the instrument inside it)."
+        )
+    if "patman" in pool:
+        details.append(
+            "patman plays a GUS patch (.pat), a single instrument without "
+            "bank or patch."
+        )
+    return details
+
+
+def _doc_bullets(lines: list[str], indent: str = " " * 4) -> str:
+    """Bulleted lines wrapped for a docstring (first line unindented)."""
+    return "\n".join(
+        textwrap.fill(
+            line, width=78, initial_indent=indent + "- ",
+            subsequent_indent=indent + "  ",
+        )
+        for line in lines
+    ).lstrip()
+
+
 def render_plugin_doc(template: str, av) -> str:
-    """Fill $INSTRUMENTS / $EFFECTS in a tool docstring template."""
+    """Fill $INSTRUMENTS / $EFFECTS / $FILE_* in a tool docstring template.
+
+    $FILE_INSTRUMENTS names the offered instruments that play a file,
+    $FILE_DETAILS describes them (bullets) and $FILE_NOTE is a pointer to
+    set_instrument_file (empty when none is offered).
+    """
+    files = _file_instruments(av)
     return string.Template(template).safe_substitute(
         INSTRUMENTS=_wrap_names(_instrument_choices(av)),
         EFFECTS=_wrap_names(_effect_choices(av)),
+        FILE_INSTRUMENTS=" / ".join(files),
+        FILE_DETAILS=_doc_bullets(_file_instrument_details(av)),
+        FILE_NOTE=(
+            f"File-based instruments ({', '.join(files)}) get their file and "
+            f"sound from set_instrument_file."
+            if files else ""
+        ),
     )
 
 
@@ -187,6 +245,38 @@ def _refusal(kind: str, name: str, av) -> str:
         _instrument_choices(av) if kind == "instrument"
         else _effect_choices(av)
     )
+    return json.dumps(payload)
+
+
+def _needs_file_reason(name: str, av) -> str:
+    """Sentence explaining that a file instrument has no file to play."""
+    label, _ = lmms_app.FILE_INSTRUMENTS[name]
+    searched = ", ".join(av.files.searched.get(name, ())) or "nowhere"
+    put_in = av.files.put_in.get(name)
+    where = f"Put one in {put_in} and restart the server" if put_in \
+        else "Put one in a folder LMMS reads and restart the server"
+    return (
+        f"'{name}' needs a {lmms_app.extension_text(name)} {label} and none "
+        f"was found (searched: {searched}). {where}"
+    )
+
+
+def _needs_file_refusal(name: str, av) -> str:
+    """JSON error for a file instrument whose plugin is installed but for
+    which no file exists on this machine. The project is never modified."""
+    alternatives = [
+        n for n in ("sf2player", "audiofileprocessor")
+        if n != name and n in av.instruments
+    ]
+    message = _needs_file_reason(name, av)
+    if alternatives:
+        message += ", or use " + " / ".join(f"'{n}'" for n in alternatives)
+    else:
+        message += ", or choose one of the available_instruments"
+    payload: dict = {"error": message + "."}
+    if alternatives:
+        payload["alternative"] = alternatives[0]
+    payload["available_instruments"] = _instrument_choices(av)
     return json.dumps(payload)
 
 
@@ -272,6 +362,29 @@ pitch). An audiofileprocessor track without a sample is silent."""
             + (" For synthesized drums use kicker instead."
                if "kicker" in pool else "")
         )
+
+    file_lines = []
+    if "sf2player" in pool:
+        file_lines.append(
+            "sf2player plays General MIDI sounds from a SoundFont (.sf2): new "
+            f"tracks start on {Path(av.files.default_soundfont).name} (bank "
+            "0, patch 0 = piano) and set_instrument_file picks other "
+            "programs (strings, guitar, flute ...) or the drum kit (bank 128)."
+            if av.files.default_soundfont else
+            "sf2player plays General MIDI sounds from a SoundFont (.sf2); "
+            "choose them with set_instrument_file."
+        )
+    others = [n for n in ("gigplayer", "patman") if n in pool]
+    if others:
+        what = {"gigplayer": "a .gig library", "patman": "a GUS .pat patch"}
+        plural = len(others) > 1
+        file_lines.append(
+            " and ".join(f"{n} plays {what[n]}" for n in others)
+            + f"; {'both stay' if plural else 'it stays'} silent until "
+              f"set_instrument_file gives {'them' if plural else 'it'} a file."
+        )
+    if file_lines:
+        blocks.append("File-based instruments: " + " ".join(file_lines))
 
     if "zynaddsubfx" in pool:
         blocks.append(
@@ -485,7 +598,56 @@ def _add_instrument(
         warning = _verification_warning(av, instrument)
         if warning:
             result["warning"] = warning
+        if instrument in lmms_app.FILE_INSTRUMENTS:
+            result.update(
+                _start_file_instrument(proj, result["track_index"], instrument, av)
+            )
     return result
+
+
+def _start_file_instrument(proj, index: int, instrument: str, av) -> dict:
+    """What a new sf2player / gigplayer / patman track needs to make sound.
+
+    sf2player starts with the default soundfont (bank 0, patch 0, or the
+    soundfont's first preset when it has no bank 0 patch 0) so it plays at
+    once; gigplayer and patman have no sensible default and stay silent
+    until set_instrument_file gives them a file, which the response says.
+    """
+    if instrument == "sf2player" and av.files.default_soundfont:
+        path = av.files.default_soundfont
+        bank, patch = lmms_app.default_soundfont_preset(path)
+        try:
+            info = xml_parser.set_instrument_file(
+                proj.root, index, path, bank, patch)
+        except ValueError as exc:
+            return {"warning": (
+                f"The default soundfont could not be set ({exc}) so the "
+                f"track is silent. Call set_instrument_file(track_index="
+                f"{index}, file_path=<a .sf2 file>)."
+            )}
+        proj._modified = True
+        preset = f" ({info['preset']})" if info.get("preset") else ""
+        return {
+            "instrument_file": {
+                k: info[k] for k in ("file", "bank", "patch", "preset")
+                if k in info
+            },
+            "hint": (
+                f"Plays {Path(path).name} bank {bank} patch {patch}"
+                f"{preset} already. Change the sound with "
+                f"set_instrument_file(track_index={index}, file_path, bank, "
+                f"patch); its description lists General MIDI patch numbers "
+                f"and the drum kit (bank 128)."
+            ),
+        }
+    first = av.files.for_instrument(instrument)[0]
+    return {"hint": (
+        f"{instrument} is silent until it has a "
+        f"{lmms_app.extension_text(instrument)} file: call "
+        f"set_instrument_file(track_index={index}, file_path='{first}') or "
+        f"use another file listed under instrument_files in "
+        f"list_available_plugins."
+    )}
 
 
 @_plugin_tool
@@ -511,6 +673,8 @@ def add_instrument_track(
     installed LMMS knows that plugin under another name, it also reports
     "lmms_plugin", the name written into the project; keep using the
     "instrument" name yourself.
+
+    $FILE_NOTE
     """
     proj = get_project()
     av = _availability
@@ -554,6 +718,8 @@ def add_instrument_track(
 
     # Refuse plugins the installed LMMS lacks: it would silently load
     # nothing and the track would be silent.
+    if normalized in av.needs_file:
+        return _needs_file_refusal(normalized, av)
     if normalized not in av.instruments:
         return _refusal("instrument", normalized, av)
 
@@ -660,6 +826,60 @@ def set_audiofile_sample(
     if warning:
         result["warning"] = warning
     return json.dumps(result)
+
+
+@_plugin_tool
+def set_instrument_file(
+    track_index: int,
+    file_path: str,
+    bank: int = 0,
+    patch: int = 0,
+) -> str:
+    """Set the file and sound of a file-based instrument track ($FILE_INSTRUMENTS).
+
+    These instruments are silent without a file. Create the track with
+    add_instrument_track, call this on it, then play it with add_note /
+    add_notes_batch. Calling it again replaces the file and sound. Use an
+    absolute path to an existing file; list_available_plugins shows the
+    files found on this machine under "instrument_files". (For an
+    audiofileprocessor track use set_audiofile_sample instead.)
+
+    $FILE_DETAILS
+
+    A soundfont must contain the bank/patch asked for, otherwise the call
+    fails and lists the banks and patches the file has.
+
+    Args:
+        track_index: Zero-based index of the instrument track
+        file_path: Absolute path of the file
+        bank: Bank number 0-999 (0 = melodic sounds)
+        patch: Patch / program number 0-127
+    """
+    proj = get_project()
+    av = _availability
+    kinds = [
+        n for n in lmms_app.FILE_INSTRUMENTS
+        if n in av.instruments or n in av.needs_file
+    ]
+    try:
+        info = xml_parser.set_instrument_file(
+            proj.root, track_index, file_path, bank=bank, patch=patch,
+            kinds=kinds, offered=_file_instruments(av),
+        )
+    except (ValueError, IndexError) as exc:
+        return json.dumps({"error": str(exc)})
+    proj._modified = True
+    sound = ""
+    if "bank" in info:
+        sound = f" bank {info['bank']} patch {info['patch']}"
+        if info.get("preset"):
+            sound += f" ({info['preset']})"
+    return json.dumps({
+        "track_index": track_index,
+        **info,
+        "message": f"Set {Path(info['file']).name}{sound} on "
+                   f"{info['instrument']} track {track_index}",
+    })
 
 
 @mcp.tool()
@@ -1632,6 +1852,10 @@ def render_project(
     return json.dumps(result)
 
 
+# Most files per instrument that list_available_plugins shows.
+_MAX_LISTED_FILES = 20
+
+
 @mcp.tool()
 def list_available_plugins() -> str:
     """List the plugins usable with the installed LMMS.
@@ -1662,7 +1886,8 @@ def list_available_plugins() -> str:
     if av.verified:
         missing = {}
         for name in (*KNOWN_INSTRUMENTS, *effects_mod.KNOWN_EFFECTS):
-            if name in av.instruments or name in av.effects:
+            if name in av.instruments or name in av.effects \
+                    or name in av.needs_file:
                 continue
             required = lmms_app.PLUGIN_REQUIRES.get(name)
             reason = f"requires {required}" if required else "not installed"
@@ -1670,7 +1895,20 @@ def list_available_plugins() -> str:
             if alternative in av.instruments or alternative in av.effects:
                 reason += f"; use {alternative}"
             missing[name] = reason
+        for name in sorted(av.needs_file):
+            missing[name] = _needs_file_reason(name, av) + "."
         result["unavailable_in_installed_lmms"] = missing
+    files = {}
+    for name in _file_instruments(av):
+        found = av.files.for_instrument(name)
+        entry: dict = {"count": len(found), "files": list(found[:_MAX_LISTED_FILES])}
+        if len(found) > _MAX_LISTED_FILES:
+            entry["note"] = f"first {_MAX_LISTED_FILES} of {len(found)}"
+        if name == "sf2player" and av.files.default_soundfont:
+            entry["default"] = av.files.default_soundfont
+        files[name] = entry
+    if files:
+        result["instrument_files"] = files
     result["note"] = (
         "Custom plugins can be tried as instruments by their library name "
         "(without extension, and without the 'lib' prefix on Linux) in "
@@ -2569,8 +2807,9 @@ Steps:
 def _remove_unsupported_tools(av) -> list[str]:
     """Unregister tools whose required plugin the installed LMMS lacks."""
     removed = []
-    for tool_name, plugin in TOOL_REQUIRES.items():
-        if plugin not in av.instruments:
+    for tool_name, plugins in TOOL_REQUIRES.items():
+        needed = (plugins,) if isinstance(plugins, str) else plugins
+        if not any(plugin in av.instruments for plugin in needed):
             mcp.remove_tool(tool_name)
             removed.append(tool_name)
     return removed

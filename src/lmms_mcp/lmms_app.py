@@ -13,11 +13,13 @@ import glob
 import os
 import re
 import shutil
+import struct
 import subprocess
 import sys
 from collections.abc import Collection, Iterable, Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
+from xml.etree import ElementTree as ET
 
 # Support libraries shipped next to the real plugins on Linux (.so files
 # that are not LMMS plugins). Names are lowercase with the "lib" prefix
@@ -124,6 +126,276 @@ def get_samples_dir() -> Path | None:
         if candidate.is_dir():
             return candidate
     return None
+
+
+# ──────────────────────────────────────────────────────────────────
+# FILES THAT SAMPLER INSTRUMENTS PLAY
+# ──────────────────────────────────────────────────────────────────
+
+# Instruments that make no sound without a file: instrument -> (what the
+# file is, accepted extensions). No tool other than set_instrument_file
+# can give them one, so an instrument is only offered when at least one
+# matching file exists on the machine (see find_instrument_files).
+# Compressed .sf3 soundfonts are deliberately not accepted: LMMS 1.2.2
+# crashes (segfault in fluidsynth's sample loading) when sf2player loads
+# one, although fluidsynth alone plays it.
+FILE_INSTRUMENTS: dict[str, tuple[str, tuple[str, ...]]] = {
+    "sf2player": ("soundfont", (".sf2",)),
+    "gigplayer": ("sample library", (".gig",)),
+    "patman": ("GUS patch", (".pat",)),
+}
+
+# Extra directories (os.pathsep separated) searched for soundfonts, GIG
+# libraries and GUS patches, before the usual places.
+INSTRUMENT_FILE_DIRS_ENV = "LMMS_INSTRUMENT_FILE_DIRS"
+
+# Where Linux distributions put soundfonts and GUS patches.
+SYSTEM_FILE_DIRS: dict[str, tuple[str, ...]] = {
+    "sf2player": ("/usr/share/sounds/sf2", "/usr/share/soundfonts"),
+    "gigplayer": (),
+    "patman": ("/usr/share/midi/freepats",),
+}
+
+# A directory is searched this many levels deep and a kind stops at this
+# many files, so a huge samples folder cannot slow the start-up down.
+_SCAN_DEPTH = 2
+_SCAN_LIMIT = 500
+
+
+def extension_text(instrument: str) -> str:
+    """Accepted extensions of a file instrument, e.g. ".sf2"."""
+    return "/".join(FILE_INSTRUMENTS[instrument][1])
+
+
+def file_instrument_for(plugin_name: str) -> str | None:
+    """The file instrument (sf2player, ...) a plugin name in a project is."""
+    name = plugin_name.lower()
+    for instrument in FILE_INSTRUMENTS:
+        if name in plugin_candidates(instrument):
+            return instrument
+    return None
+
+
+def read_lmms_paths(config: str | Path | None = None) -> dict[str, str]:
+    """The attributes of <paths> in LMMS's config file (~/.lmmsrc.xml).
+
+    Holds the user's sf2dir, gigdir, defaultsf2, workingdir, ... Returns
+    an empty dict if the file is missing or unreadable.
+    """
+    path = Path(config) if config else Path.home() / ".lmmsrc.xml"
+    try:
+        node = ET.parse(path).getroot().find("paths")
+    except (OSError, ET.ParseError):
+        return {}
+    return dict(node.attrib) if node is not None else {}
+
+
+@dataclass(frozen=True)
+class InstrumentFiles:
+    """The soundfonts, GIG libraries and GUS patches found on this machine.
+
+    files / searched / put_in are keyed by instrument name (sf2player,
+    gigplayer, patman): the files found (absolute paths, no duplicates),
+    every directory looked in, and the directory where a user should put
+    a file (LMMS's own folder for it). default_soundfont is the one new
+    sf2player tracks start with.
+    """
+
+    files: Mapping[str, tuple[str, ...]] = field(default_factory=dict)
+    searched: Mapping[str, tuple[str, ...]] = field(default_factory=dict)
+    put_in: Mapping[str, str] = field(default_factory=dict)
+    default_soundfont: str | None = None
+
+    def for_instrument(self, name: str) -> tuple[str, ...]:
+        return tuple(self.files.get(name, ()))
+
+
+def _scan_files(
+    directory: Path, extensions: tuple[str, ...], limit: int
+) -> list[str]:
+    """Files with one of the extensions in a directory, a few levels deep.
+
+    Names are sorted case-insensitively and symlinks to files are followed
+    (dangling ones are skipped); symlinked directories are not entered.
+    """
+    found: list[str] = []
+    if not directory.is_dir():
+        return found
+    base = len(directory.parts)
+    for current, dirs, names in os.walk(directory):
+        dirs.sort(key=str.lower)
+        if len(Path(current).parts) - base >= _SCAN_DEPTH:
+            dirs.clear()
+        for name in sorted(names, key=str.lower):
+            full = Path(current, name)
+            if name.lower().endswith(extensions) and full.is_file():
+                found.append(str(full))
+                if len(found) >= limit:
+                    return found
+    return found
+
+
+def find_instrument_files(
+    config_paths: Mapping[str, str] | None = None,
+    extra_dirs: Iterable[str | Path] | None = None,
+    system_dirs: Mapping[str, Iterable[str | Path]] | None = None,
+    home: str | Path | None = None,
+    samples_dir: str | Path | None = None,
+) -> InstrumentFiles:
+    """Find the soundfonts, GIG libraries and GUS patches on this machine.
+
+    Per instrument the directories are searched in this order: extra_dirs
+    (default: LMMS_INSTRUMENT_FILE_DIRS), the folders from LMMS's config
+    (sf2dir, gigdir, the folder of defaultsf2, and the working directory's
+    samples folder), the LMMS factory samples folder (GUS patches),
+    ~/.local/share/soundfonts and the system folders (SYSTEM_FILE_DIRS).
+    Each is searched a few levels deep, bounded in size. The arguments
+    replace the real machine's values (config_paths: the <paths> of
+    ~/.lmmsrc.xml; samples_dir: the factory samples folder) for tests.
+    """
+    paths = read_lmms_paths() if config_paths is None else dict(config_paths)
+    home_dir = Path(home) if home else Path.home()
+    if extra_dirs is None:
+        extra_dirs = [
+            d for d in os.environ.get(INSTRUMENT_FILE_DIRS_ENV, "").split(
+                os.pathsep) if d
+        ]
+    extra = [Path(d).expanduser() for d in extra_dirs]
+    if samples_dir is None:
+        samples_dir = get_samples_dir()
+    system = SYSTEM_FILE_DIRS if system_dirs is None else system_dirs
+
+    user_samples = Path(paths.get("workingdir") or home_dir / "lmms") / "samples"
+    sf2_dir = Path(paths.get("sf2dir") or user_samples / "soundfonts")
+    gig_dir = Path(paths.get("gigdir") or user_samples / "gig")
+    patch_dir = user_samples / "patches"
+    default_sf = None
+    if paths.get("defaultsf2"):
+        default_sf = Path(paths["defaultsf2"])
+        if not default_sf.is_absolute():
+            default_sf = sf2_dir / default_sf
+    factory = Path(samples_dir) if samples_dir else None
+
+    dirs: dict[str, list[Path]] = {
+        "sf2player": [*extra, sf2_dir, home_dir / ".local/share/soundfonts"],
+        "gigplayer": [*extra, gig_dir],
+        "patman": [*extra, patch_dir, *([factory] if factory else [])],
+    }
+    put_in = {
+        "sf2player": str(sf2_dir),
+        "gigplayer": str(gig_dir),
+        "patman": str(patch_dir),
+    }
+
+    files: dict[str, tuple[str, ...]] = {}
+    searched: dict[str, tuple[str, ...]] = {}
+    for instrument, (_label, extensions) in FILE_INSTRUMENTS.items():
+        candidates = [
+            *dirs[instrument], *(Path(d) for d in system.get(instrument, ()))
+        ]
+        seen_dirs: dict[str, None] = {}
+        seen_files: dict[str, str] = {}  # real path -> first path found
+        if instrument == "sf2player" and default_sf is not None \
+                and default_sf.suffix.lower() in extensions \
+                and default_sf.is_file():
+            seen_files[os.path.realpath(default_sf)] = str(default_sf)
+        for directory in candidates:
+            seen_dirs.setdefault(str(directory))
+            for found in _scan_files(directory, extensions, _SCAN_LIMIT):
+                seen_files.setdefault(os.path.realpath(found), found)
+        files[instrument] = tuple(seen_files.values())[:_SCAN_LIMIT]
+        searched[instrument] = tuple(seen_dirs)
+
+    default = None
+    if default_sf is not None and files["sf2player"] \
+            and str(default_sf) == files["sf2player"][0]:
+        default = str(default_sf)
+    elif files["sf2player"]:
+        default = files["sf2player"][0]
+    return InstrumentFiles(
+        files=files, searched=searched, put_in=put_in,
+        default_soundfont=default,
+    )
+
+
+def read_soundfont_presets(path: str | Path) -> dict[tuple[int, int], str] | None:
+    """The presets of a SoundFont as {(bank, patch): name}.
+
+    Reads only the preset list (phdr chunk) of an .sf2 file.
+    Returns None if the file cannot be read as a SoundFont.
+    """
+    try:
+        with open(path, "rb") as f:
+            head = f.read(12)
+            if head[:4] != b"RIFF" or head[8:12] != b"sfbk":
+                return None
+            while True:
+                chunk = f.read(8)
+                if len(chunk) < 8:
+                    return None
+                chunk_id, size = struct.unpack("<4sI", chunk)
+                if chunk_id != b"LIST" or f.read(4) != b"pdta":
+                    # (a non-pdta LIST has its 4-byte form type consumed)
+                    skip = size - 4 if chunk_id == b"LIST" else size
+                    f.seek(skip + (size & 1), os.SEEK_CUR)
+                    continue
+                end = f.tell() + size - 4
+                while f.tell() < end:
+                    sub = f.read(8)
+                    if len(sub) < 8:
+                        return None
+                    sub_id, sub_size = struct.unpack("<4sI", sub)
+                    if sub_id != b"phdr":
+                        f.seek(sub_size + (sub_size & 1), os.SEEK_CUR)
+                        continue
+                    data = f.read(sub_size)
+                    presets = {}
+                    for i in range(0, len(data) - 38, 38):  # last = terminator
+                        name, patch, bank = struct.unpack_from(
+                            "<20sHH", data, i)
+                        presets[(bank, patch)] = (
+                            name.split(b"\0")[0].decode("latin-1").strip()
+                        )
+                    return presets
+                return None
+    except (OSError, struct.error):
+        return None
+
+
+def default_soundfont_preset(path: str | Path) -> tuple[int, int]:
+    """(bank, patch) a new sf2player track should start with.
+
+    General MIDI piano (bank 0, patch 0) if the soundfont has it, else its
+    first preset; (0, 0) if the file cannot be read.
+    """
+    presets = read_soundfont_presets(path)
+    if not presets or (0, 0) in presets:
+        return (0, 0)
+    return min(presets)
+
+
+def _ranges(numbers: Iterable[int]) -> str:
+    """"0-2, 5, 8-9" for [0, 1, 2, 5, 8, 9]."""
+    runs: list[list[int]] = []
+    for n in sorted(set(numbers)):
+        if runs and n == runs[-1][1] + 1:
+            runs[-1][1] = n
+        else:
+            runs.append([n, n])
+    return ", ".join(
+        str(a) if a == b else f"{a}-{b}" for a, b in runs
+    )
+
+
+def describe_soundfont_banks(presets: Mapping[tuple[int, int], str]) -> str:
+    """The banks and patches a SoundFont has, e.g. "bank 0: patches 0-127"."""
+    banks: dict[int, list[int]] = {}
+    for bank, patch in presets:
+        banks.setdefault(bank, []).append(patch)
+    return "; ".join(
+        f"bank {bank}: patches {_ranges(patches)}"
+        for bank, patches in sorted(banks.items())
+    )
 
 
 def get_installed_stems() -> dict[str, str]:
@@ -350,6 +622,10 @@ class PluginAvailability:
     plugin_names: available known instrument -> the plugin name LMMS
         loads for it and that is written into projects, e.g. opulenz ->
         "OPL2", freeboy -> "papu" (see resolve_plugin).
+    files: the soundfonts, GIG libraries and GUS patches found.
+    needs_file: file instruments (FILE_INSTRUMENTS) whose plugin is
+        installed but for which no file was found. They are left out of
+        `instruments`: without a file they could only make silent tracks.
     """
 
     verified: bool
@@ -359,6 +635,8 @@ class PluginAvailability:
     effects: frozenset[str]
     stems: Mapping[str, str] = field(default_factory=dict)
     plugin_names: Mapping[str, str] = field(default_factory=dict)
+    files: InstrumentFiles = field(default_factory=InstrumentFiles)
+    needs_file: frozenset[str] = frozenset()
 
     def plugin_name(self, name: str) -> str:
         """Plugin name to write into the project for an instrument name.
@@ -378,17 +656,26 @@ def build_availability(
     version: str | None,
     stems: Mapping[str, str] | None = None,
     windows: bool | None = None,
+    files: InstrumentFiles | None = None,
 ) -> PluginAvailability:
     """Build an availability snapshot from an installed-plugin set.
 
     stems maps the lowercase installed names to their original-case
     library stems (see get_installed_stems); names it lacks are used in
     lowercase. windows overrides the platform check for statically linked
-    plugins (default: the running platform).
+    plugins (default: the running platform). files are the soundfonts, GIG
+    libraries and GUS patches found (default: none): a file instrument
+    without a file is not offered (see PluginAvailability.needs_file).
     """
     installed = frozenset(installed)
     stems = {k: v for k, v in (stems or {}).items() if k in installed}
+    files = files if files is not None else InstrumentFiles()
     instruments = compute_available(known_instruments, installed, windows)
+    needs_file = frozenset(
+        n for n in instruments
+        if n in FILE_INSTRUMENTS and not files.for_instrument(n)
+    )
+    instruments -= needs_file
     return PluginAvailability(
         verified=bool(installed),
         version=version,
@@ -400,18 +687,28 @@ def build_availability(
             name: resolve_plugin(name, installed, stems, windows) or name
             for name in sorted(instruments)
         },
+        files=files,
+        needs_file=needs_file,
     )
 
 
 def detect_availability(
-    known_instruments: Iterable[str], known_effects: Iterable[str]
+    known_instruments: Iterable[str],
+    known_effects: Iterable[str],
+    files: InstrumentFiles | None = None,
 ) -> PluginAvailability:
-    """Inspect the installed LMMS and build the availability snapshot."""
+    """Inspect the installed LMMS and build the availability snapshot.
+
+    files default to what find_instrument_files finds on this machine.
+    """
     installed = get_installed_plugins()
     version = get_lmms_version() if installed else None
     stems = get_installed_stems() if installed else {}
+    if files is None:
+        files = find_instrument_files()
     return build_availability(
-        known_instruments, known_effects, installed, version, stems
+        known_instruments, known_effects, installed, version, stems,
+        files=files,
     )
 
 

@@ -2,8 +2,11 @@
 
 import struct
 import zlib
+from collections.abc import Collection
 from pathlib import Path
 from xml.etree import ElementTree as ET
+
+from . import lmms_app
 
 
 def _q_compress(data: bytes) -> bytes:
@@ -703,6 +706,129 @@ def set_audiofile_sample(
     afp.set("eframe", _fmt_number(end))
     afp.set("lframe", "0")
     return afp
+
+
+def set_instrument_file(
+    root: ET.Element,
+    track_index: int,
+    src: str,
+    bank: int = 0,
+    patch: int = 0,
+    kinds: Collection[str] | None = None,
+    offered: Collection[str] | None = None,
+) -> dict:
+    """Set the file played by an sf2player, gigplayer or patman track.
+
+    Args:
+        root: Project root element.
+        track_index: Index of an instrument track whose instrument is one
+            of `kinds` (default: every lmms_app.FILE_INSTRUMENTS entry).
+            Error messages name `offered` (default: kinds) as the
+            instruments this is for.
+        src: Absolute path of an existing file with the extension the
+            instrument takes (.sf2, .gig, .pat).
+        bank: Bank 0-999 (sf2player, gigplayer; patman has none).
+        patch: Patch / program 0-127 (sf2player, gigplayer; patman has none).
+
+    Writes src, bank, patch (and gain, kept if already set) for sf2player
+    and gigplayer, and src for patman, into the instrument's settings
+    element (created if missing); repeated calls overwrite the file. A
+    soundfont must contain the bank/patch. Returns {"instrument", "file",
+    "bank", "patch", "preset"} (bank, patch and preset only where they
+    apply; preset is the name in the soundfont). Raises ValueError /
+    IndexError with a message saying what to do instead.
+    """
+    kinds = list(lmms_app.FILE_INSTRUMENTS if kinds is None else kinds)
+    offered = list(kinds if offered is None else offered)
+    tracks = find_tracks(root)
+    if not 0 <= track_index < len(tracks):
+        raise IndexError(
+            f"Track index {track_index} out of range "
+            f"(have {len(tracks)} tracks)"
+        )
+    track = tracks[track_index]
+    names = " / ".join(offered)
+    hint = f"Create a {names} track with add_instrument_track first."
+    if get_track_type(track) != 0:
+        raise ValueError(
+            f"Track {track_index} is a "
+            f"{track_type_name(get_track_type(track))} track, not an "
+            f"instrument track. {hint}"
+        )
+    inst = track.find("instrumenttrack/instrument")
+    plugin = inst.get("name", "") if inst is not None else ""
+    kind = lmms_app.file_instrument_for(plugin)
+    if kind is None or kind not in kinds:
+        if plugin.lower() == "audiofileprocessor":
+            raise ValueError(
+                f"Track {track_index} is an audiofileprocessor track: use "
+                f"set_audiofile_sample for it. set_instrument_file is for "
+                f"{names} tracks."
+            )
+        raise ValueError(
+            f"Track {track_index} uses instrument '{plugin}', which does "
+            f"not play a file. set_instrument_file is for {names} tracks. "
+            f"{hint}"
+        )
+
+    label, extensions = lmms_app.FILE_INSTRUMENTS[kind]
+    if not str(src).strip():
+        raise ValueError("file_path must not be empty")
+    path = Path(str(src).strip()).expanduser()
+    if not path.is_absolute():
+        raise ValueError(
+            f"file_path must be an absolute path, got '{src}'. "
+            f"list_available_plugins shows the {label} files found on this "
+            f"machine."
+        )
+    if path.suffix.lower() not in extensions:
+        extra = (
+            " Compressed .sf3 soundfonts crash LMMS's sf2player."
+            if path.suffix.lower() == ".sf3" else ""
+        )
+        raise ValueError(
+            f"{kind} plays {lmms_app.extension_text(kind)} files "
+            f"({label}), got '{path.name}'.{extra}"
+        )
+    if not path.is_file():
+        raise ValueError(f"File not found: {path}")
+
+    result: dict = {"instrument": kind, "file": str(path)}
+    if kind == "patman":
+        if bank != 0 or patch != 0:
+            raise ValueError(
+                "patman has no bank or patch (a .pat file is a single "
+                "instrument): leave bank and patch at 0."
+            )
+    else:
+        if not 0 <= bank <= 999:
+            raise ValueError(f"bank must be 0-999, got {bank}")
+        if not 0 <= patch <= 127:
+            raise ValueError(
+                f"patch must be 0-127 (General MIDI program number), "
+                f"got {patch}"
+            )
+        result["bank"], result["patch"] = bank, patch
+    if kind == "sf2player":
+        presets = lmms_app.read_soundfont_presets(path)
+        if presets is not None:
+            if (bank, patch) not in presets:
+                raise ValueError(
+                    f"{path.name} has no preset at bank {bank}, patch "
+                    f"{patch}. It has: "
+                    f"{lmms_app.describe_soundfont_banks(presets)}."
+                )
+            result["preset"] = presets[(bank, patch)]
+
+    # LMMS reads the first child of <instrument> as the plugin's settings
+    settings = inst[0] if len(inst) else ET.SubElement(
+        inst, plugin.replace(" ", ""))
+    settings.set("src", str(path))
+    if kind != "patman":
+        settings.set("bank", str(bank))
+        settings.set("patch", str(patch))
+        settings.attrib.setdefault("gain", "1")
+    return result
 
 
 def place_instrument_pattern(
