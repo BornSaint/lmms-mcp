@@ -9,48 +9,118 @@ LMMS 1.2.x and 1.3.x differ in plugin availability, e.g.:
 - Compressor, Dispersion, FrequencyShifter, SlewDistortion effects: 1.3+ only
 """
 
+import glob
 import os
 import re
+import shutil
 import subprocess
 from pathlib import Path
 
-_CANDIDATE_EXES = [
-    Path(os.environ.get("LMMS_EXECUTABLE", "")) if os.environ.get("LMMS_EXECUTABLE") else None,
-    Path("C:/Program Files/LMMS/lmms.exe"),
-    Path("C:/Program Files (x86)/LMMS/lmms.exe"),
-    Path.home() / "AppData/Local/Programs/LMMS/lmms.exe",
-]
+# Support libraries shipped next to the real plugins on Linux (.so files
+# that are not LMMS plugins). Names are lowercase with the "lib" prefix
+# already stripped.
+_SUPPORT_LIBS = {"zynaddsubfxcore"}
+
+
+def _static_exe_candidates() -> list[Path]:
+    """Well-known install locations (Windows and Linux)."""
+    return [
+        Path("C:/Program Files/LMMS/lmms.exe"),
+        Path("C:/Program Files (x86)/LMMS/lmms.exe"),
+        Path.home() / "AppData/Local/Programs/LMMS/lmms.exe",
+        Path("/usr/bin/lmms"),
+        Path("/usr/local/bin/lmms"),
+    ]
 
 
 def find_lmms_exe() -> Path | None:
-    """Locate the installed LMMS executable."""
-    for candidate in _CANDIDATE_EXES:
-        if candidate is not None and candidate.is_file():
+    """Locate the installed LMMS executable.
+
+    Order: LMMS_EXECUTABLE env var, well-known Windows locations, the
+    executable named "lmms" on PATH, well-known Linux locations.
+    Evaluated on every call (not cached).
+    """
+    candidates: list[Path] = []
+    env_exe = os.environ.get("LMMS_EXECUTABLE")
+    if env_exe:
+        candidates.append(Path(env_exe))
+    static = _static_exe_candidates()
+    candidates.extend(p for p in static if p.suffix.lower() == ".exe")
+    on_path = shutil.which("lmms")
+    if on_path:
+        candidates.append(Path(on_path))
+    candidates.extend(p for p in static if p.suffix.lower() != ".exe")
+    for candidate in candidates:
+        if candidate.is_file():
             return candidate
     return None
 
 
+def _has_plugin_files(directory: Path) -> bool:
+    """True if the directory directly contains .dll or .so files."""
+    if not directory.is_dir():
+        return False
+    return any(directory.glob("*.dll")) or any(directory.glob("*.so"))
+
+
 def get_plugins_dir() -> Path | None:
-    """Return the plugins directory of the installed LMMS."""
+    """Return the plugins directory of the installed LMMS.
+
+    Order: LMMS_PLUGINS_DIR env var, Windows layout
+    (<exe dir>/plugins), then Linux layouts (<prefix>/lib/lmms relative
+    to the executable, /usr/lib/<multiarch>/lmms, /usr/lib/lmms,
+    /usr/lib64/lmms, /usr/local/lib/lmms). The first directory that
+    contains plugin files wins.
+    """
+    override = os.environ.get("LMMS_PLUGINS_DIR")
+    if override and Path(override).is_dir():
+        return Path(override)
+
+    candidates: list[Path] = []
     exe = find_lmms_exe()
-    if exe is None:
-        return None
-    plugins = exe.parent / "plugins"
-    return plugins if plugins.is_dir() else None
+    if exe is not None:
+        real_dir = exe.resolve().parent
+        candidates.append(real_dir / "plugins")
+        candidates.append(real_dir.parent / "lib" / "lmms")
+        candidates.append(real_dir.parent / "lib64" / "lmms")
+    candidates.extend(
+        Path(p) for p in sorted(glob.glob("/usr/lib/*/lmms"))
+    )
+    candidates.extend([
+        Path("/usr/lib/lmms"),
+        Path("/usr/lib64/lmms"),
+        Path("/usr/local/lib/lmms"),
+    ])
+    for candidate in candidates:
+        if _has_plugin_files(candidate):
+            return candidate
+    return None
 
 
 def get_installed_plugins() -> set[str]:
     """Set of plugin library names shipped with the installed LMMS.
 
-    Names are lowercase DLL basenames (e.g. "tripleoscillator",
-    "reverbsc"). Returns an empty set if LMMS is not found.
+    Names are lowercase library basenames without extension (e.g.
+    "tripleoscillator", "reverbsc"). On Linux (.so files) the leading
+    "lib" prefix is stripped, so libOPL2.so becomes "opl2"; support
+    libraries such as libZynAddSubFxCore.so are excluded. Only files
+    directly in the plugins dir are considered, so the ladspa/
+    subdirectory is ignored. Returns an empty set if no plugins are
+    found.
     """
     plugins_dir = get_plugins_dir()
     if plugins_dir is None:
         return set()
-    return {
-        f.stem.lower() for f in plugins_dir.glob("*.dll")
-    }
+    names = {f.stem.lower() for f in plugins_dir.glob("*.dll")}
+    for f in plugins_dir.glob("*.so"):
+        if not f.is_file():
+            continue
+        name = f.stem.lower()
+        if name.startswith("lib"):
+            name = name[3:]
+        if name and name not in _SUPPORT_LIBS:
+            names.add(name)
+    return names
 
 
 def get_lmms_version() -> str | None:
@@ -114,10 +184,10 @@ def classify_installed_plugins(
     known_instruments: set[str],
     known_effects: set[str],
 ) -> dict[str, list[str]]:
-    """Classify all installed plugin DLLs by comparing with known names.
+    """Classify all installed plugin libraries by comparing with known names.
 
     Returns dict with keys "instruments", "effects", "unknown".
-    Unknown DLLs are custom/newer plugins the user added - they can be
+    Unknown plugins are custom/newer plugins the user added - they can be
     used but their type (instrument vs effect) is not known from the
     filename alone.
     """
@@ -125,10 +195,11 @@ def classify_installed_plugins(
     result: dict[str, list[str]] = {"instruments": [], "effects": [], "unknown": []}
     for name in sorted(installed):
         if name.startswith("lib"):
-            continue  # support libraries, not plugins
+            continue  # Windows support libraries, not plugins
         if name in known_instruments or any(
-            name in aliases for aliases in PLUGIN_ALIASES.values()
-        ) and name in known_instruments:
+            key in known_instruments and name in aliases
+            for key, aliases in PLUGIN_ALIASES.items()
+        ):
             result["instruments"].append(name)
         elif name in known_effects:
             result["effects"].append(name)

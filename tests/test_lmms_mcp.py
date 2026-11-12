@@ -614,6 +614,146 @@ class TestLmmsApp:
             lmms_app.find_vst_plugins("Z:/no/such/dir")
 
 
+class TestLmmsAppDetection:
+    """Machine-independent tests for exe/plugin detection (fake dirs)."""
+
+    @pytest.fixture
+    def clean_env(self, monkeypatch):
+        monkeypatch.delenv("LMMS_EXECUTABLE", raising=False)
+        monkeypatch.delenv("LMMS_PLUGINS_DIR", raising=False)
+        return monkeypatch
+
+    @staticmethod
+    def _fake_linux_plugins(root):
+        plugins = root / "lmms"
+        (plugins / "ladspa").mkdir(parents=True)
+        for name in (
+            "libtripleoscillator.so", "libOPL2.so", "libreverbsc.so",
+            "libZynAddSubFxCore.so", "RemoteZynAddSubFx",
+        ):
+            (plugins / name).write_bytes(b"\x7fELF fake")
+        (plugins / "ladspa" / "amp_1181.so").write_bytes(b"\x7fELF fake")
+        return plugins
+
+    def test_linux_so_plugins_detected(self, tmp_path, clean_env):
+        from lmms_mcp import lmms_app
+        plugins = self._fake_linux_plugins(tmp_path)
+        clean_env.setenv("LMMS_PLUGINS_DIR", str(plugins))
+        assert lmms_app.get_plugins_dir() == plugins
+        # lib prefix stripped, lowercased; support lib, ladspa/ and the
+        # RemoteZynAddSubFx executable are not plugins
+        assert lmms_app.get_installed_plugins() == {
+            "tripleoscillator", "opl2", "reverbsc",
+        }
+
+    def test_linux_plugin_availability_and_alias(self, tmp_path, clean_env):
+        from lmms_mcp import lmms_app
+        clean_env.setenv(
+            "LMMS_PLUGINS_DIR", str(self._fake_linux_plugins(tmp_path))
+        )
+        ok, _ = lmms_app.check_plugin_available("tripleoscillator")
+        assert ok is True
+        # opulenz is shipped as OPL2 in LMMS 1.2.x
+        ok, reason = lmms_app.check_plugin_available("opulenz")
+        assert ok is True
+        assert "alias" in reason
+        ok, reason = lmms_app.check_plugin_available("slicert")
+        assert ok is False
+        assert "not included" in reason
+
+    def test_linux_classify(self, tmp_path, clean_env):
+        from lmms_mcp import lmms_app
+        clean_env.setenv(
+            "LMMS_PLUGINS_DIR", str(self._fake_linux_plugins(tmp_path))
+        )
+        result = lmms_app.classify_installed_plugins(
+            {"tripleoscillator", "opulenz"}, {"reverbsc", "delay"}
+        )
+        assert result["instruments"] == ["opl2", "tripleoscillator"]
+        assert result["effects"] == ["reverbsc"]
+        assert result["unknown"] == []
+
+    def test_windows_dll_plugins_unchanged(self, tmp_path, clean_env):
+        from lmms_mcp import lmms_app
+        plugins = tmp_path / "plugins"
+        plugins.mkdir()
+        for name in ("tripleoscillator.dll", "libfoo.dll", "reverbsc.dll"):
+            (plugins / name).write_bytes(b"MZ fake")
+        clean_env.setenv("LMMS_PLUGINS_DIR", str(plugins))
+        # no prefix stripping for .dll: lib*.dll are support libraries
+        assert lmms_app.get_installed_plugins() == {
+            "tripleoscillator", "libfoo", "reverbsc",
+        }
+        result = lmms_app.classify_installed_plugins(
+            {"tripleoscillator"}, {"reverbsc"}
+        )
+        assert result["instruments"] == ["tripleoscillator"]
+        assert result["effects"] == ["reverbsc"]
+        assert "libfoo" not in result["unknown"]
+
+    def test_plugins_dir_override_wins_over_exe(self, tmp_path, clean_env):
+        from lmms_mcp import lmms_app
+        bin_dir = tmp_path / "prefix" / "bin"
+        bin_dir.mkdir(parents=True)
+        exe = bin_dir / "lmms"
+        exe.write_bytes(b"")
+        lib = tmp_path / "prefix" / "lib" / "lmms"
+        lib.mkdir(parents=True)
+        (lib / "libkicker.so").write_bytes(b"")
+        override = tmp_path / "other"
+        override.mkdir()
+        (override / "libmonstro.so").write_bytes(b"")
+        clean_env.setenv("LMMS_EXECUTABLE", str(exe))
+        assert lmms_app.get_plugins_dir() == lib
+        clean_env.setenv("LMMS_PLUGINS_DIR", str(override))
+        assert lmms_app.get_plugins_dir() == override
+        assert lmms_app.get_installed_plugins() == {"monstro"}
+
+    def test_plugins_dir_relative_to_symlinked_exe(self, tmp_path, clean_env):
+        """<prefix>/bin/lmms -> <real prefix>/lib/lmms via symlink."""
+        from lmms_mcp import lmms_app
+        real_bin = tmp_path / "opt" / "lmms" / "bin"
+        real_bin.mkdir(parents=True)
+        (real_bin / "lmms").write_bytes(b"")
+        lib = tmp_path / "opt" / "lmms" / "lib" / "lmms"
+        lib.mkdir(parents=True)
+        (lib / "libkicker.so").write_bytes(b"")
+        link_dir = tmp_path / "usr" / "bin"
+        link_dir.mkdir(parents=True)
+        try:
+            (link_dir / "lmms").symlink_to(real_bin / "lmms")
+        except OSError:
+            pytest.skip("symlinks not supported")
+        clean_env.setenv("LMMS_EXECUTABLE", str(link_dir / "lmms"))
+        assert lmms_app.get_plugins_dir() == lib
+        assert lmms_app.get_installed_plugins() == {"kicker"}
+
+    def test_find_exe_falls_back_to_path_lookup(self, tmp_path, clean_env):
+        from lmms_mcp import lmms_app
+        fake = tmp_path / "lmms"
+        fake.write_bytes(b"")
+        clean_env.setattr(lmms_app, "_static_exe_candidates", lambda: [])
+        clean_env.setattr(lmms_app.shutil, "which", lambda name: None)
+        assert lmms_app.find_lmms_exe() is None
+        clean_env.setattr(
+            lmms_app.shutil, "which",
+            lambda name: str(fake) if name == "lmms" else None,
+        )
+        assert lmms_app.find_lmms_exe() == fake
+
+    def test_find_exe_env_var_takes_precedence(self, tmp_path, clean_env):
+        from lmms_mcp import lmms_app
+        env_exe = tmp_path / "custom-lmms"
+        env_exe.write_bytes(b"")
+        path_exe = tmp_path / "lmms"
+        path_exe.write_bytes(b"")
+        clean_env.setattr(
+            lmms_app.shutil, "which", lambda name: str(path_exe)
+        )
+        clean_env.setenv("LMMS_EXECUTABLE", str(env_exe))
+        assert lmms_app.find_lmms_exe() == env_exe
+
+
 class TestCustomPluginsAndVst:
     """Tests for dynamic plugin usage and VST tracks."""
 

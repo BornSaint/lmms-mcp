@@ -1008,7 +1008,8 @@ def get_lmms_info() -> str:
             "message": "LMMS installation not found. Projects can still "
                        "be created and saved, but plugin availability "
                        "cannot be verified and rendering is disabled. "
-                       "Set LMMS_EXECUTABLE env var to your lmms.exe.",
+                       "Set LMMS_EXECUTABLE env var to the LMMS executable "
+                       "(lmms.exe / lmms).",
         })
     installed = sorted(lmms_app.get_installed_plugins())
     # Intersect with our known instruments/effects for quick reference
@@ -1058,7 +1059,8 @@ def render_project(
     exe = lmms_app.find_lmms_exe()
     if exe is None:
         return json.dumps({
-            "error": "LMMS executable not found. Set LMMS_EXECUTABLE env var.",
+            "error": "LMMS executable not found. Set LMMS_EXECUTABLE env var "
+                     "to the LMMS executable (lmms.exe / lmms).",
         })
 
     fmt = file_format.lower()
@@ -1126,9 +1128,10 @@ def list_available_plugins() -> str:
         "built_in_instruments": sorted(known_inst),
         "built_in_effects": sorted(known_eff),
         "custom_plugins_unknown_type": classified["unknown"],
-        "note": "Custom plugins can be used by their DLL name in "
-                "add_instrument_track or add_effect. For VST .dll files "
-                "on disk use add_vst_track instead.",
+        "note": "Custom plugins can be used by their library name "
+                "(without extension, and without the 'lib' prefix on "
+                "Linux) in add_instrument_track or add_effect. For VST "
+                ".dll files on disk use add_vst_track instead.",
     }, indent=2)
 
 
