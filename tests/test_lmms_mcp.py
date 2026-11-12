@@ -659,6 +659,109 @@ class TestAutomation:
         obj = pattern.find("object")
         assert obj.get("id") == "42"
 
+    def test_automation_pattern_starts_at_first_point(self):
+        """Pattern is placed at the first point; times are relative to it."""
+        from lmms_mcp.xml_parser import add_automation_track
+        root = self._root()
+        track = add_automation_track(
+            root, "Late", [(5376, 20), (6125, 60), (6144, 45)], target_id=1
+        )
+        pattern = track.find("automationpattern")
+        assert pattern.get("pos") == "5376"
+        assert pattern.get("autoresize") == "1"
+        times = [(t.get("pos"), t.get("value")) for t in pattern.findall("time")]
+        assert times == [("0", "20"), ("749", "60"), ("768", "45")]
+        # Length covers the whole span (last relative time 768 -> >= 769)
+        assert int(pattern.get("len")) >= 769
+
+    def test_automation_pattern_len_covers_long_span(self):
+        from lmms_mcp.xml_parser import add_automation_track
+        root = self._root()
+        track = add_automation_track(
+            root, "Long", [(192, 10), (192 + 3000, 90)], target_id=1
+        )
+        pattern = track.find("automationpattern")
+        assert pattern.get("pos") == "192"
+        assert pattern.find("time[last()]").get("pos") == "3000"
+        assert int(pattern.get("len")) == 3001
+
+    def test_automation_pattern_from_song_start(self):
+        """First point at tick 0 keeps the pattern at the song start."""
+        from lmms_mcp.xml_parser import add_automation_track
+        root = self._root()
+        track = add_automation_track(
+            root, "Ramp", [(0, 120), (1536, 140)], target_id=1
+        )
+        pattern = track.find("automationpattern")
+        assert pattern.get("pos") == "0"
+        assert [t.get("pos") for t in pattern.findall("time")] == ["0", "1536"]
+        assert int(pattern.get("len")) == 1537
+
+    def test_automation_single_point(self):
+        from lmms_mcp.xml_parser import add_automation_track
+        root = self._root()
+        track = add_automation_track(root, "One", [(768, 33)], target_id=1)
+        pattern = track.find("automationpattern")
+        assert pattern.get("pos") == "768"
+        times = pattern.findall("time")
+        assert len(times) == 1
+        assert times[0].get("pos") == "0"
+        assert times[0].get("value") == "33"
+        assert int(pattern.get("len")) == 192
+
+    def test_automation_unsorted_points(self):
+        from lmms_mcp.xml_parser import add_automation_track
+        root = self._root()
+        track = add_automation_track(
+            root, "Unsorted", [(1000, 3), (400, 1), (700, 2)], target_id=1
+        )
+        pattern = track.find("automationpattern")
+        assert pattern.get("pos") == "400"
+        times = [(t.get("pos"), t.get("value")) for t in pattern.findall("time")]
+        assert times == [("0", "1"), ("300", "2"), ("600", "3")]
+
+    def test_automation_position_offset(self):
+        """`position` is added to the pattern start; times stay relative."""
+        from lmms_mcp.xml_parser import add_automation_track
+        root = self._root()
+        track = add_automation_track(
+            root, "Offset", [(100, 1), (300, 2)], target_id=1, position=192
+        )
+        pattern = track.find("automationpattern")
+        assert pattern.get("pos") == "292"
+        assert [t.get("pos") for t in pattern.findall("time")] == ["0", "200"]
+
+    def test_get_arrangement_reports_absolute_automation_position(self):
+        from lmms_mcp.xml_parser import add_automation_track, get_arrangement
+        root = self._root()
+        add_automation_track(
+            root, "Late", [(5376, 20), (6144, 45)], target_id=1
+        )
+        clips = [c for c in get_arrangement(root) if c["kind"] == "automation"]
+        assert len(clips) == 1
+        assert clips[0]["pos"] == 5376
+        assert clips[0]["len"] == 769
+        assert clips[0]["points"] == 2
+
+    def test_add_automation_tool_uses_absolute_bars(self):
+        """The add_automation tool keeps taking absolute bars."""
+        from lmms_mcp import server as srv
+        proj = LMMSProject()
+        proj.new()
+        srv.set_project(proj)
+        add_instrument_track(proj.root, "Strings")
+        result = json.loads(srv.add_automation(
+            target_type="track", param="volume", target_index=0,
+            points=[{"bar": 28, "value": 20}, {"bar": 31.9, "value": 60},
+                    {"bar": 32, "value": 45}],
+        ))
+        assert "error" not in result
+        track = find_tracks(proj.root)[result["automation_track_index"]]
+        pattern = track.find("automationpattern")
+        assert pattern.get("pos") == "5376"
+        assert [t.get("pos") for t in pattern.findall("time")] == [
+            "0", "749", "768"]
+
     def test_add_automation_track_empty_points(self):
         from lmms_mcp.xml_parser import add_automation_track
         root = self._root()

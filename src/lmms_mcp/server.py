@@ -1545,10 +1545,17 @@ def add_automation(
     - track + volume / panning (target_index = track index)
     - mixer + volume (target_index = mixer channel number)
 
+    Point positions are absolute song positions in bars. The curve is
+    active from the first to the last point only: before the first point
+    the parameter keeps its normal (track/mixer/song) value, and after the
+    last point it stays at the last value (LMMS keeps the last automated
+    value).
+
     Args:
         target_type: "song", "track" or "mixer"
         param: Parameter name (see above)
-        points: Curve points as list of {"bar": float, "value": float}.
+        points: Curve points as list of {"bar": float, "value": float},
+            with "bar" the absolute song position (bar 0 = song start).
             Example: [{"bar": 0, "value": 120}, {"bar": 8, "value": 140}]
         target_index: Track index or mixer channel (ignored for "song")
         name: Automation name (defaults to parameter name)

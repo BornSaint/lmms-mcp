@@ -911,15 +911,26 @@ def add_automation_track(
 ) -> ET.Element:
     """Add an automation track with a pattern (curve).
 
+    ``points`` are given as ABSOLUTE song positions (ticks). The pattern is
+    placed at the first point and each ``<time pos>`` is written relative to
+    the pattern start (first point = 0), because LMMS evaluates an
+    automation pattern as 0 before its first key and the pattern is active
+    from its own start. Placing the pattern at the first point therefore
+    means: before the first point the parameter keeps its normal
+    (track/mixer/song) value, the curve is active from the first to the
+    last point, and after the last point LMMS keeps the last automated
+    value.
+
     Args:
         root: Project root element.
         name: Automation track/pattern name (e.g. "Volume swell").
-        points: List of (tick_position, value) tuples defining the curve.
+        points: List of (absolute_tick_position, value) tuples (any order).
         target_id: Model id to automate (from automate_attribute), or
             None for an unlinked curve.
         progression: 0=linear, 1=cubic hermite (smooth curves).
         tension: Curve tension for smooth interpolation (default 1.0).
-        position: Pattern start offset in ticks.
+        position: Extra offset in ticks added to the pattern start (shifts
+            the whole curve; default 0).
 
     Returns:
         The created track element.
@@ -938,10 +949,16 @@ def add_automation_track(
     })
     ET.SubElement(track, "automationtrack")
 
-    max_pos = max(p[0] for p in points)
+    points = sorted((int(pt_pos), value) for pt_pos, value in points)
+    first_tick = points[0][0]
+    last_tick = points[-1][0]
+    span = last_tick - first_tick
+
+    # Pattern starts at the first point; times are relative to it. The
+    # length covers the span (at least one bar, as LMMS itself would size it).
     pattern = ET.SubElement(track, "automationpattern", {
-        "pos": str(position),
-        "len": str(max(192, max_pos + 1)),
+        "pos": str(position + first_tick),
+        "len": str(max(192, span + 1)),
         "name": name,
         "prog": str(progression),
         "tens": str(tension),
@@ -950,9 +967,9 @@ def add_automation_track(
         "autoresize": "1",
     })
 
-    for pt_pos, value in sorted(points):
+    for pt_pos, value in points:
         ET.SubElement(pattern, "time", {
-            "pos": str(int(pt_pos)),
+            "pos": str(pt_pos - first_tick),
             "value": str(value),
             "outValue": str(value),
             "inTan": "0",
