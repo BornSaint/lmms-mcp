@@ -8,24 +8,59 @@ import gzip
 import os
 from pathlib import Path
 
+from . import lmms_app
+
 PRESET_EXTENSIONS = {".xiz"}
 
-# Candidate locations scanned in order; first existing directory wins.
-# Can be overridden with the LMMS_PRESETS_DIR environment variable
-# (points directly at the ZynAddSubFX folder or its parent presets dir).
-_CANDIDATE_ROOTS = [
-    Path(os.environ.get("LMMS_PRESETS_DIR", "")) if os.environ.get("LMMS_PRESETS_DIR") else None,
-    Path("C:/Program Files/LMMS/data/presets/ZynAddSubFX"),
-    Path("C:/Program Files (x86)/LMMS/data/presets/ZynAddSubFX"),
-    Path.home() / "Documents/LMMS/presets/ZynAddSubFX",
-    Path.home() / ".lmms/presets/ZynAddSubFX",
-]
+
+def _static_preset_candidates() -> list[Path]:
+    """Well-known preset locations (Windows, Linux system, per-user)."""
+    home = Path.home()
+    return [
+        # Windows installs
+        Path("C:/Program Files/LMMS/data/presets/ZynAddSubFX"),
+        Path("C:/Program Files (x86)/LMMS/data/presets/ZynAddSubFX"),
+        # Linux system installs
+        Path("/usr/share/lmms/presets/ZynAddSubFX"),
+        Path("/usr/local/share/lmms/presets/ZynAddSubFX"),
+        # Per-user LMMS working directories
+        home / "lmms/presets/ZynAddSubFX",
+        home / "Documents/LMMS/presets/ZynAddSubFX",
+        home / ".lmms/presets/ZynAddSubFX",
+    ]
 
 
 def get_presets_dir() -> Path | None:
-    """Return the first existing ZynAddSubFX presets directory, if any."""
-    for candidate in _CANDIDATE_ROOTS:
-        if candidate is not None and candidate.is_dir():
+    """Return the first existing ZynAddSubFX presets directory, if any.
+
+    Evaluated on every call (not cached). Order:
+    1. LMMS_PRESETS_DIR env var: either the ZynAddSubFX folder itself or
+       its parent presets folder (containing a ZynAddSubFX/ subfolder).
+    2. Relative to the detected LMMS executable (symlinks resolved):
+       <exe dir>/data/presets/ZynAddSubFX (Windows) and
+       <exe dir>/../share/lmms/presets/ZynAddSubFX (Linux prefix).
+    3. Well-known Windows, Linux system and per-user locations.
+    """
+    candidates: list[Path] = []
+
+    override = os.environ.get("LMMS_PRESETS_DIR")
+    if override:
+        given = Path(override)
+        candidates.append(given / "ZynAddSubFX")
+        candidates.append(given)
+
+    exe = lmms_app.find_lmms_exe()
+    if exe is not None:
+        real_dir = exe.resolve().parent
+        candidates.append(real_dir / "data/presets/ZynAddSubFX")
+        candidates.append(
+            real_dir.parent / "share/lmms/presets/ZynAddSubFX"
+        )
+
+    candidates.extend(_static_preset_candidates())
+
+    for candidate in candidates:
+        if candidate.is_dir():
             return candidate
     return None
 

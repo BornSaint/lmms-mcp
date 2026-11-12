@@ -287,11 +287,11 @@ Typical chains:
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `LMMS_PROJECTS_DIR` | `~/Desktop/Media/lmms/AI-Projects` | Default directory for saving projects |
-| `LMMS_PRESETS_DIR` | auto-detected | Path to ZynAddSubFX presets folder (`data/presets/ZynAddSubFX`) |
+| `LMMS_PRESETS_DIR` | auto-detected | Path to the ZynAddSubFX presets folder (`data/presets/ZynAddSubFX`) or its parent presets folder |
 | `LMMS_EXECUTABLE` | auto-detected | Path to the LMMS executable (`lmms.exe` / `lmms`) (for version/plugin checks and rendering) |
 | `LMMS_PLUGINS_DIR` | auto-detected | LMMS plugins folder (overrides detection; `*.dll` on Windows, `lib<name>.so` on Linux) |
 
-**Linux:** `lmms` is found on `PATH` (or `/usr/bin`, `/usr/local/bin`), and plugins are auto-detected in `<prefix>/lib/lmms`, `/usr/lib/<arch>/lmms`, `/usr/lib/lmms`, `/usr/lib64/lmms` or `/usr/local/lib/lmms`. Set the variables above only if your install is elsewhere.
+**Linux:** `lmms` is found on `PATH` (or `/usr/bin`, `/usr/local/bin`), and plugins are auto-detected in `<prefix>/lib/lmms`, `/usr/lib/<arch>/lmms`, `/usr/lib/lmms`, `/usr/lib64/lmms` or `/usr/local/lib/lmms`. ZynAddSubFX presets are auto-detected in `<prefix>/share/lmms/presets/ZynAddSubFX`, `/usr/share/lmms/presets/ZynAddSubFX`, `/usr/local/share/lmms/presets/ZynAddSubFX` or `~/lmms/presets/ZynAddSubFX`. Set the variables above only if your install is elsewhere.
 
 ## Configuration
 

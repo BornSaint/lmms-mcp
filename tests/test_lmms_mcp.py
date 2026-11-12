@@ -754,6 +754,107 @@ class TestLmmsAppDetection:
         assert lmms_app.find_lmms_exe() == env_exe
 
 
+class TestPresetsDirDetection:
+    """Machine-independent tests for ZynAddSubFX preset dir detection."""
+
+    XIZ_XML = b"<ZynAddSubFX-data/>"
+
+    @pytest.fixture
+    def isolated(self, monkeypatch):
+        """No env vars, no machine-specific exe or static candidates."""
+        from lmms_mcp import lmms_app, presets
+        monkeypatch.delenv("LMMS_PRESETS_DIR", raising=False)
+        monkeypatch.delenv("LMMS_EXECUTABLE", raising=False)
+        monkeypatch.setattr(presets, "_static_preset_candidates", lambda: [])
+        monkeypatch.setattr(lmms_app, "_static_exe_candidates", lambda: [])
+        monkeypatch.setattr(lmms_app.shutil, "which", lambda name: None)
+        return monkeypatch
+
+    @classmethod
+    def _make_zyn_dir(cls, zyn_dir):
+        import gzip
+        (zyn_dir / "Bass").mkdir(parents=True)
+        with gzip.open(zyn_dir / "Bass" / "x.xiz", "wb") as f:
+            f.write(cls.XIZ_XML)
+        return zyn_dir
+
+    def test_none_when_nothing_found(self, isolated):
+        from lmms_mcp import presets
+        assert presets.get_presets_dir() is None
+        assert presets.list_presets() == []
+
+    def test_env_var_pointing_at_zyn_dir(self, tmp_path, isolated):
+        from lmms_mcp import presets
+        zyn = self._make_zyn_dir(tmp_path / "custom" / "ZynAddSubFX")
+        isolated.setenv("LMMS_PRESETS_DIR", str(zyn))
+        assert presets.get_presets_dir() == zyn
+
+    def test_env_var_pointing_at_parent_presets_dir(self, tmp_path, isolated):
+        from lmms_mcp import presets
+        parent = tmp_path / "presets"
+        zyn = self._make_zyn_dir(parent / "ZynAddSubFX")
+        (parent / "TripleOscillator").mkdir()
+        isolated.setenv("LMMS_PRESETS_DIR", str(parent))
+        assert presets.get_presets_dir() == zyn
+        assert presets.list_categories() == ["Bass"]
+
+    def test_exe_relative_linux_prefix(self, tmp_path, isolated):
+        from lmms_mcp import presets
+        prefix = tmp_path / "prefix"
+        (prefix / "bin").mkdir(parents=True)
+        exe = prefix / "bin" / "lmms"
+        exe.write_bytes(b"")
+        zyn = self._make_zyn_dir(
+            prefix / "share" / "lmms" / "presets" / "ZynAddSubFX"
+        )
+        isolated.setenv("LMMS_EXECUTABLE", str(exe))
+        assert presets.get_presets_dir() == zyn
+        xml = presets.load_preset_xml("Bass/x")
+        assert xml == self.XIZ_XML.decode()
+        assert presets.load_preset_xml("x") == self.XIZ_XML.decode()
+        assert [p["name"] for p in presets.list_presets("Bass")] == ["x"]
+
+    def test_exe_relative_windows_data_dir(self, tmp_path, isolated):
+        from lmms_mcp import presets
+        install = tmp_path / "LMMS"
+        install.mkdir()
+        exe = install / "lmms.exe"
+        exe.write_bytes(b"")
+        zyn = self._make_zyn_dir(install / "data" / "presets" / "ZynAddSubFX")
+        isolated.setenv("LMMS_EXECUTABLE", str(exe))
+        assert presets.get_presets_dir() == zyn
+
+    def test_env_var_wins_over_exe_relative(self, tmp_path, isolated):
+        from lmms_mcp import presets
+        prefix = tmp_path / "prefix"
+        (prefix / "bin").mkdir(parents=True)
+        exe = prefix / "bin" / "lmms"
+        exe.write_bytes(b"")
+        self._make_zyn_dir(
+            prefix / "share" / "lmms" / "presets" / "ZynAddSubFX"
+        )
+        override = self._make_zyn_dir(tmp_path / "mine" / "ZynAddSubFX")
+        isolated.setenv("LMMS_EXECUTABLE", str(exe))
+        isolated.setenv("LMMS_PRESETS_DIR", str(override))
+        assert presets.get_presets_dir() == override
+
+    def test_static_candidates_used_as_fallback(self, tmp_path, isolated):
+        from lmms_mcp import presets
+        zyn = self._make_zyn_dir(tmp_path / "static" / "ZynAddSubFX")
+        isolated.setattr(
+            presets, "_static_preset_candidates",
+            lambda: [tmp_path / "missing", zyn],
+        )
+        assert presets.get_presets_dir() == zyn
+
+    def test_stale_env_var_falls_through(self, tmp_path, isolated):
+        from lmms_mcp import presets
+        zyn = self._make_zyn_dir(tmp_path / "static" / "ZynAddSubFX")
+        isolated.setattr(presets, "_static_preset_candidates", lambda: [zyn])
+        isolated.setenv("LMMS_PRESETS_DIR", str(tmp_path / "does-not-exist"))
+        assert presets.get_presets_dir() == zyn
+
+
 class TestCustomPluginsAndVst:
     """Tests for dynamic plugin usage and VST tracks."""
 

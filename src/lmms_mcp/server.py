@@ -890,7 +890,9 @@ def list_zyn_presets(category: str | None = None) -> str:
         return json.dumps({
             "error": "No ZynAddSubFX presets directory found.",
             "hint": "Set the LMMS_PRESETS_DIR environment variable to your "
-                    "LMMS data/presets/ZynAddSubFX folder.",
+                    "LMMS presets/ZynAddSubFX folder (e.g. "
+                    "/usr/share/lmms/presets/ZynAddSubFX on Linux or "
+                    "data/presets/ZynAddSubFX on Windows).",
         })
     try:
         presets = zyn_presets.list_presets(category)
