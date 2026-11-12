@@ -1180,20 +1180,72 @@ def list_zyn_presets(category: str | None = None) -> str:
 def load_zyn_preset(track_index: int, preset: str) -> str:
     """Load a ZynAddSubFX preset (.xiz) into a zynaddsubfx instrument track.
 
-    The track must use the 'zynaddsubfx' instrument. Presets can be
-    referenced by filename (e.g. "Bass 1"), "Category/Name", or full path.
+    The track must use the 'zynaddsubfx' instrument. Accepted forms for
+    `preset`: "Category/Name" (e.g. "Strings/Dark Strings", preferred
+    because it is unambiguous), a plain "Name" (e.g. "Bass 1"), the file
+    name with its number ("0034-Dark Strings"), or an absolute path to a
+    .xiz file. Numeric prefixes are optional and case is ignored.
+
+    The response says exactly what was loaded: `file` is the .xiz file
+    used, `preset` is its "Category/Name", and `internal_name` is the
+    name stored inside the file. The internal name often differs from
+    the file name; that is normal and does not mean the wrong preset was
+    loaded. If a plain name matched several presets, `other_matches`
+    lists the alternatives; pass "Category/Name" to choose one. If
+    nothing matches, the error suggests close names; list_zyn_presets
+    shows everything available.
 
     Args:
         track_index: Index of the target track
-        preset: Preset name, "Category/Name" or absolute path
+        preset: "Category/Name", plain name, "0034-Name" or absolute path
     """
     proj = get_project()
     try:
-        preset_xml = zyn_presets.load_preset_xml(preset)
-        result = xml_parser.embed_zyn_preset(proj.root, track_index, preset_xml, preset)
-        return json.dumps(result)
+        preset_xml, match = zyn_presets.load_preset(preset)
+        result = xml_parser.embed_zyn_preset(
+            proj.root, track_index, preset_xml, match.name
+        )
+    except zyn_presets.PresetNotFoundError as exc:
+        return json.dumps({
+            "error": str(exc),
+            "suggestions": exc.suggestions,
+        })
     except (ValueError, FileNotFoundError, RuntimeError) as exc:
         return json.dumps({"error": str(exc)})
+
+    internal_name = result.get("internal_name")
+    response = {
+        "track_index": track_index,
+        "requested": preset,
+        "file": str(match.path),
+        "preset": match.name,
+        "internal_name": internal_name,
+        "message": (
+            f"Loaded ZynAddSubFX preset '{match.name}' (file {match.path}) "
+            f"into track {track_index}"
+        ),
+    }
+    notes = []
+    if internal_name and internal_name.lower() != (
+        match.name.rsplit("/", 1)[-1].lower()
+    ):
+        notes.append(
+            f"The preset file stores the internal name '{internal_name}', "
+            f"which differs from its file name. This is normal; "
+            f"'{match.name}' is the preset that was loaded."
+        )
+    if match.other_matches:
+        response["other_matches"] = match.other_matches
+        more = match.other_total - len(match.other_matches)
+        extra = f" (and {more} more)" if more > 0 else ""
+        notes.append(
+            f"'{preset}' matched several presets; loaded '{match.name}'. "
+            f"To pick another, pass \"Category/Name\" from "
+            f"other_matches{extra}."
+        )
+    if notes:
+        response["note"] = " ".join(notes)
+    return json.dumps(response)
 
 
 @mcp.tool()

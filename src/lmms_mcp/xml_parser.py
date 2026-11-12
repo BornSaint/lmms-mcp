@@ -1302,7 +1302,9 @@ def embed_zyn_preset(
         preset_name: Optional display name for the result message.
 
     Returns:
-        Dict with result info.
+        Dict with result info: track_index, preset (the preset's internal
+        name, falling back to preset_name), internal_name (the name stored
+        inside the preset, or None) and message.
 
     Raises:
         ValueError: If track is not a zynaddsubfx instrument or the
@@ -1328,14 +1330,18 @@ def embed_zyn_preset(
             f"'ZynAddSubFX-data'. Is this really a .xiz file?"
         )
 
-    # Extract patch name from preset INFO if available
+    # Extract patch name from preset INFO if available. This internal name
+    # is whatever the preset's author typed; it often differs from the
+    # file name, so callers should not treat it as the preset's identity.
     patch_name = preset_name
+    internal_name = None
     try:
         info = preset_root.find("INSTRUMENT/INFO")
         if info is not None:
             name_el = info.find("string[@name='name']")
-            if name_el is not None and name_el.text:
-                patch_name = name_el.text.strip()
+            if name_el is not None and name_el.text and name_el.text.strip():
+                internal_name = name_el.text.strip()
+                patch_name = internal_name
     except (AttributeError, TypeError):
         pass
 
@@ -1350,6 +1356,7 @@ def embed_zyn_preset(
     return {
         "track_index": track_index,
         "preset": patch_name or preset_name or "unknown",
+        "internal_name": internal_name,
         "message": f"Loaded ZynAddSubFX preset '{patch_name}' into track "
                    f"{track_index}",
     }

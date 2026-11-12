@@ -3,6 +3,7 @@
 import json
 import tempfile
 from pathlib import Path
+from xml.etree import ElementTree as ET
 
 import pytest
 
@@ -568,12 +569,18 @@ class TestZynAddSubFX:
         proj.new()
         srv.set_project(proj)
         srv.add_instrument_track("Z", instrument="zynaddsubfx")
+        from lmms_mcp.presets import PresetMatch
         monkeypatch.setattr(
-            srv.zyn_presets, "load_preset_xml",
-            lambda name: self.ZYN_PRESET_XML,
+            srv.zyn_presets, "load_preset",
+            lambda name: (
+                self.ZYN_PRESET_XML,
+                PresetMatch(Path("/x/Any/0001-Thing.xiz"), "Any/Thing"),
+            ),
         )
         loaded = json.loads(srv.load_zyn_preset(0, "Any/Thing"))
-        assert loaded["preset"] == "TestPatch"
+        # `preset` is the file-derived name, not the name inside the file.
+        assert loaded["preset"] == "Any/Thing"
+        assert loaded["internal_name"] == "TestPatch"
         params = json.loads(srv.set_zyn_params(0, filterfreq=20))
         assert params["applied"] == {"filterfreq": 20}
         assert params["modifiedcontrollers"] == [74]
@@ -1229,6 +1236,213 @@ class TestPresetsDirDetection:
         isolated.setattr(presets, "_static_preset_candidates", lambda: [zyn])
         isolated.setenv("LMMS_PRESETS_DIR", str(tmp_path / "does-not-exist"))
         assert presets.get_presets_dir() == zyn
+
+
+class TestLoadZynPresetReport:
+    """load_zyn_preset must say which file it loaded and never mislead.
+
+    Uses a fake presets dir whose files have internal names that differ
+    from their file names (like the factory library does).
+    """
+
+    @staticmethod
+    def _xiz(internal_name):
+        return (
+            '<?xml version="1.0" encoding="UTF-8"?>\n'
+            '<!DOCTYPE ZynAddSubFX-data>\n'
+            '<ZynAddSubFX-data version-major="1" version-minor="0">'
+            '<INFORMATION/><BASE_PARAMETERS/>'
+            '<INSTRUMENT><INFO>'
+            f'<string name="name">{internal_name}</string>'
+            '</INFO></INSTRUMENT></ZynAddSubFX-data>'
+        ).encode()
+
+    @pytest.fixture
+    def zyn(self, tmp_path, monkeypatch):
+        """Fake presets dir + a project with one zynaddsubfx track."""
+        import gzip
+        from lmms_mcp import lmms_app, presets
+        from lmms_mcp import server as srv
+
+        zyn_dir = tmp_path / "ZynAddSubFX"
+        files = {
+            "Strings/0034-Dark Strings.xiz": "Internal X",
+            "Strings/0035-Bright Strings.xiz": "Bright Strings",
+            "Pads/0001-Warm Pad.xiz": "Something Else",
+            "Bass/0001-Bass 1.xiz": "Plain Bass",
+            "Bass/0035-FM Bass 1.xiz": "FM Thing",
+            "Synth/0007-Bass 1.xiz": "Synth Bass One",
+            "0002-Root Preset.xiz": "Root Preset",
+        }
+        for rel, internal in files.items():
+            path = zyn_dir / rel
+            path.parent.mkdir(parents=True, exist_ok=True)
+            with gzip.open(path, "wb") as f:
+                f.write(self._xiz(internal))
+        monkeypatch.setenv("LMMS_PRESETS_DIR", str(zyn_dir))
+        monkeypatch.setattr(presets, "_static_preset_candidates", lambda: [])
+        monkeypatch.setattr(lmms_app, "find_lmms_exe", lambda: None)
+
+        proj = LMMSProject()
+        proj.new()
+        srv.set_project(proj)
+        srv.add_instrument_track("Z", instrument="zynaddsubfx")
+        return srv, zyn_dir
+
+    def test_reports_file_and_names(self, zyn):
+        srv, zyn_dir = zyn
+        result = json.loads(
+            srv.load_zyn_preset(0, "Strings/0034-Dark Strings"))
+        file = zyn_dir / "Strings" / "0034-Dark Strings.xiz"
+        assert result["track_index"] == 0
+        assert result["requested"] == "Strings/0034-Dark Strings"
+        assert result["file"] == str(file)
+        assert result["preset"] == "Strings/Dark Strings"
+        assert result["internal_name"] == "Internal X"
+        assert result["message"] == (
+            f"Loaded ZynAddSubFX preset 'Strings/Dark Strings' "
+            f"(file {file}) into track 0"
+        )
+        assert "other_matches" not in result
+
+    def test_note_when_internal_name_differs(self, zyn):
+        srv, _ = zyn
+        result = json.loads(srv.load_zyn_preset(0, "Strings/Dark Strings"))
+        assert result["preset"] == "Strings/Dark Strings"
+        assert "Internal X" in result["note"]
+        assert "normal" in result["note"]
+
+    def test_no_note_when_names_agree(self, zyn):
+        srv, _ = zyn
+        result = json.loads(srv.load_zyn_preset(0, "Strings/Bright Strings"))
+        assert result["internal_name"] == "Bright Strings"
+        assert "note" not in result
+
+    @pytest.mark.parametrize("request_name", [
+        "Strings/Dark Strings", "Dark Strings", "0034-Dark Strings",
+        "dark strings", "Strings/0034-Dark Strings.xiz",
+    ])
+    def test_accepted_forms_load_same_file(self, zyn, request_name):
+        srv, zyn_dir = zyn
+        result = json.loads(srv.load_zyn_preset(0, request_name))
+        assert result["file"] == str(
+            zyn_dir / "Strings" / "0034-Dark Strings.xiz")
+        assert result["preset"] == "Strings/Dark Strings"
+        assert result["requested"] == request_name
+
+    def test_absolute_path(self, zyn):
+        srv, zyn_dir = zyn
+        file = zyn_dir / "Pads" / "0001-Warm Pad.xiz"
+        result = json.loads(srv.load_zyn_preset(0, str(file)))
+        assert result["file"] == str(file)
+        assert result["preset"] == "Pads/Warm Pad"
+        assert result["internal_name"] == "Something Else"
+
+    def test_root_preset_has_plain_name(self, zyn):
+        srv, zyn_dir = zyn
+        result = json.loads(srv.load_zyn_preset(0, "Root Preset"))
+        assert result["file"] == str(zyn_dir / "0002-Root Preset.xiz")
+        assert result["preset"] == "Root Preset"
+
+    def test_ambiguous_plain_name_lists_other_matches(self, zyn):
+        srv, zyn_dir = zyn
+        result = json.loads(srv.load_zyn_preset(0, "Bass 1"))
+        assert result["preset"] == "Bass/Bass 1"
+        assert result["file"] == str(zyn_dir / "Bass" / "0001-Bass 1.xiz")
+        # Same name in another category; the "FM Bass 1" suffix-only match
+        # is not an equally good match and is not listed.
+        assert result["other_matches"] == ["Synth/Bass 1"]
+        assert "Category/Name" in result["note"]
+        assert "other_matches" in result["note"]
+
+    def test_category_name_picks_the_other_match(self, zyn):
+        srv, zyn_dir = zyn
+        result = json.loads(srv.load_zyn_preset(0, "Synth/Bass 1"))
+        assert result["preset"] == "Synth/Bass 1"
+        assert result["file"] == str(zyn_dir / "Synth" / "0007-Bass 1.xiz")
+        assert result["internal_name"] == "Synth Bass One"
+        assert "other_matches" not in result
+
+    def test_end_of_name_match_is_a_fallback(self, zyn):
+        srv, _ = zyn
+        # No preset is called exactly "Strings", but two end with it.
+        result = json.loads(srv.load_zyn_preset(0, "Strings"))
+        assert result["preset"].endswith("Strings")
+        assert len(result["other_matches"]) == 1
+        # A fragment that is not at the end of any name is not a match.
+        assert "error" in json.loads(srv.load_zyn_preset(0, "FM Bass"))
+
+    def test_other_matches_capped_at_five(self, zyn):
+        import gzip
+        srv, zyn_dir = zyn
+        for i in range(8):
+            d = zyn_dir / f"Cat{i}"
+            d.mkdir()
+            with gzip.open(d / f"{i:04d}-Dup.xiz", "wb") as f:
+                f.write(self._xiz("Dup"))
+        result = json.loads(srv.load_zyn_preset(0, "Dup"))
+        assert len(result["other_matches"]) == 5
+        assert "and 2 more" in result["note"]
+
+    def test_not_found_suggests_close_names(self, zyn):
+        srv, _ = zyn
+        result = json.loads(srv.load_zyn_preset(0, "Dark Strngs"))
+        assert "error" in result
+        assert result["suggestions"][0] == "Strings/Dark Strings"
+        assert len(result["suggestions"]) <= 5
+        assert "Strings/Dark Strings" in result["error"]
+        assert "list_zyn_presets" in result["error"]
+
+    def test_not_found_without_close_names_still_points_to_list(self, zyn):
+        srv, _ = zyn
+        result = json.loads(srv.load_zyn_preset(0, "qqqqzzzz"))
+        assert result["suggestions"] == []
+        assert "list_zyn_presets" in result["error"]
+
+    def test_unknown_category_falls_back_to_name_search(self, zyn):
+        srv, zyn_dir = zyn
+        result = json.loads(srv.load_zyn_preset(0, "Nope/Dark Strings"))
+        assert result["preset"] == "Strings/Dark Strings"
+        assert result["requested"] == "Nope/Dark Strings"
+
+    def test_wrong_category_is_an_error_not_a_silent_swap(self, zyn):
+        srv, _ = zyn
+        result = json.loads(srv.load_zyn_preset(0, "Pads/Dark Strings"))
+        assert "error" in result
+        assert "Strings/Dark Strings" in result["suggestions"]
+
+    def test_failed_load_leaves_track_unchanged(self, zyn):
+        srv, _ = zyn
+        before = ET.tostring(srv.get_project().root)
+        json.loads(srv.load_zyn_preset(0, "qqqqzzzz"))
+        assert ET.tostring(srv.get_project().root) == before
+
+    def test_xml_keeps_internal_name_for_lmms(self, zyn):
+        srv, _ = zyn
+        srv.load_zyn_preset(0, "Strings/Dark Strings")
+        inst = find_tracks(srv.get_project().root)[0].find(
+            "instrumenttrack/instrument")
+        info = inst.find(
+            "zynaddsubfx/ZynAddSubFX-data/MASTER/PART[@id='0']/INSTRUMENT/"
+            "INFO/string[@name='name']")
+        assert info.text == "Internal X"
+
+    def test_load_preset_xml_still_returns_text(self, zyn):
+        from lmms_mcp import presets
+        xml = presets.load_preset_xml("Strings/Dark Strings")
+        assert "Internal X" in xml
+
+    def test_embed_result_has_internal_name(self):
+        from lmms_mcp.xml_parser import embed_zyn_preset
+        root = create_empty_project()
+        add_instrument_track(root, "Z", instrument="zynaddsubfx")
+        xml = self._xiz("Named").decode()
+        assert embed_zyn_preset(root, 0, xml, "File Name")[
+            "internal_name"] == "Named"
+        nameless = xml.replace('<string name="name">Named</string>', "")
+        result = embed_zyn_preset(root, 0, nameless, "File Name")
+        assert result["internal_name"] is None
+        assert result["preset"] == "File Name"
 
 
 class TestCustomPluginsAndVst:
