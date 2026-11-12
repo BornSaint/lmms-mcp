@@ -113,7 +113,7 @@ python -m lmms_mcp
 | Tool | Description |
 |------|-------------|
 | `add_note` | Add a note by MIDI key number |
-| `add_note_by_name` | Add a note by name (e.g. "C4", "A#3") |
+| `add_note_by_name` | Add a note by name (e.g. "C4", "A#3", "Bb2") |
 | `add_notes_batch` | Add multiple notes at once |
 
 ### Mixer

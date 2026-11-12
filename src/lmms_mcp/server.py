@@ -16,6 +16,8 @@ from . import lmms_app
 from . import presets as zyn_presets
 from . import xml_parser
 from .models import (
+    MIDI_KEY_MAX,
+    MIDI_KEY_MIN,
     NOTE_NAMES,
     TICKS_PER_BAR,
     TICKS_PER_STEP,
@@ -660,6 +662,102 @@ def solo_track(track_index: int, solo: bool = True) -> str:
 # ──────────────────────────────────────────────────────────────────
 
 
+def _as_int(value, label: str) -> int:
+    """Return value as an int, or raise ValueError saying what is wrong.
+
+    Whole floats (48.0) are accepted; LMMS rejects float strings such as
+    "48.0" in integer attributes, so they are normalised here.
+    """
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ValueError(f"{label} must be an integer, got {value!r}.")
+    if isinstance(value, float):
+        if not value.is_integer():
+            raise ValueError(f"{label} must be a whole number, got {value!r}.")
+        return int(value)
+    return value
+
+
+def _validate_note_fields(
+    key, pos, length, volume, panning, pattern_index=None
+) -> dict:
+    """Validate one note's fields; return them normalised as ints.
+
+    key may be a MIDI number (0-127) or a note name ("C4", "Bb2").
+    Raises ValueError with an actionable message on the first problem.
+    """
+    if isinstance(key, str):
+        key = note_name_to_midi(key)
+    elif isinstance(key, bool) or not isinstance(key, (int, float)):
+        raise ValueError(
+            f"key must be a MIDI number 0-127 or a note name like 'Bb2', "
+            f"got {key!r}."
+        )
+    else:
+        key = _as_int(key, "key")
+    if not MIDI_KEY_MIN <= key <= MIDI_KEY_MAX:
+        raise ValueError(
+            f"key {key} is out of range: MIDI keys are "
+            f"{MIDI_KEY_MIN}-{MIDI_KEY_MAX} (C-1 to G9, 60 = C4)."
+        )
+
+    pos = _as_int(pos, "pos")
+    if pos < 0:
+        raise ValueError(
+            f"pos must be >= 0 ticks from the pattern start "
+            f"(192 = 1 bar), got {pos}."
+        )
+
+    length = _as_int(length, "length")
+    if length <= 0:
+        raise ValueError(
+            f"length must be > 0 ticks (12 = 1/16, 24 = 1/8, 48 = 1/4, "
+            f"192 = 1 bar), got {length}."
+        )
+
+    fields = {
+        "key": key,
+        "pos": pos,
+        "length": length,
+        "volume": _as_int(volume, "volume"),
+        "panning": _as_int(panning, "panning"),
+    }
+    if pattern_index is not None:
+        fields["pattern_index"] = _as_int(pattern_index, "pattern_index")
+    return fields
+
+
+def _track_index_error(proj: LMMSProject, track_index) -> str | None:
+    """Return an error message if track_index is not a valid track, else None."""
+    if isinstance(track_index, bool) or not isinstance(track_index, int):
+        return f"track_index must be an integer, got {track_index!r}."
+    count = len(xml_parser.find_tracks(proj.root))
+    if count == 0:
+        return (
+            f"Track index {track_index} out of range: the project has no "
+            f"tracks yet. Add one with add_instrument_track first."
+        )
+    if not 0 <= track_index < count:
+        return (
+            f"Track index {track_index} out of range (project has {count} "
+            f"tracks, valid indices 0-{count - 1}). Use list_tracks to see "
+            f"the tracks."
+        )
+    return None
+
+
+def _add_checked_note(proj: LMMSProject, track_index: int, note: dict) -> dict:
+    """Validate one note dict and add it. Raises ValueError / IndexError."""
+    fields = _validate_note_fields(
+        note.get("key", 60),
+        note.get("pos", 0),
+        note.get("length", 48),
+        note.get("volume", 100),
+        note.get("panning", 0),
+        note.get("pattern_index"),
+    )
+    return proj.add_note(track_index=track_index, **fields)
+
+
 @mcp.tool()
 def add_note(
     track_index: int,
@@ -672,13 +770,18 @@ def add_note(
 ) -> str:
     """Add a note to a track's pattern.
 
+    On invalid input (key outside 0-127, negative pos, length <= 0, bad
+    track or pattern index) nothing is added and the response is
+    {"error": "..."} explaining what to fix.
+
     Args:
         track_index: Zero-based track index (must be an instrument or pattern track)
-        key: MIDI note number (0-127). 60=C4 (middle C), 69=A4
+        key: MIDI note number (0-127). 60=C4 (middle C), 69=A4, 127=G9.
+            To use a note name instead (e.g. 'Bb2') call add_note_by_name.
         pos: Position in ticks RELATIVE TO THE PATTERN START
-            (192 ticks = 1 bar). Notes are placed inside the target
-            pattern; if a note ends beyond the pattern clip length, the
-            clip is extended automatically (notes beyond the clip end
+            (192 ticks = 1 bar, 48 = 1/4 note). Notes are placed inside the
+            target pattern; if a note ends beyond the pattern clip length,
+            the clip is extended automatically (notes beyond the clip end
             would otherwise be silent).
         length: Note length in ticks (12 = 1/16 note, 24 = 1/8, 48 = 1/4 (one beat),
             96 = 1/2, 192 = 1 bar)
@@ -689,15 +792,20 @@ def add_note(
             song positions first.
     """
     proj = get_project()
-    result = proj.add_note(
-        track_index=track_index,
-        key=key,
-        pos=pos,
-        length=length,
-        volume=volume,
-        panning=panning,
-        pattern_index=pattern_index,
-    )
+    error = _track_index_error(proj, track_index)
+    if error:
+        return json.dumps({"error": error})
+    try:
+        result = _add_checked_note(proj, track_index, {
+            "key": key,
+            "pos": pos,
+            "length": length,
+            "volume": volume,
+            "panning": panning,
+            "pattern_index": pattern_index,
+        })
+    except (ValueError, IndexError) as e:
+        return json.dumps({"error": f"Note NOT added: {e}"})
     return json.dumps(result)
 
 
@@ -709,12 +817,24 @@ def add_note_by_name(
     length: int = 48,
     volume: int = 100,
 ) -> str:
-    """Add a note using a note name (e.g. 'C4', 'A#3', 'F#5').
+    """Add a note using a note name (e.g. 'C4', 'A#3', 'F#5', 'Bb2').
+
+    Sharps (#) and flats (b) are both accepted and enharmonic spellings
+    map to the same key: 'Bb2' = 'A#2' = MIDI 46, 'Db3' = 'C#3' = 49,
+    'Cb4' = 'B3' = 59, 'B#3' = 'C4' = 60. The note letter is
+    case-insensitive ('bb2' = Bb2, 'b3' = B3). Valid range is C-1 (key 0)
+    to G9 (key 127); C4 = 60.
+
+    On invalid input (unknown note name, out-of-range note, negative pos,
+    length <= 0, bad track index) nothing is added and the response is
+    {"error": "..."} explaining the accepted format.
 
     Args:
         track_index: Zero-based track index
-        note_name: Note name like 'C4', 'A#3', 'F5', 'Bb2'
-        pos: Position in ticks (192 ticks = 1 bar)
+        note_name: Note name like 'C4', 'A#3', 'F5', 'Bb2' (letter A-G,
+            optional # or b, octave -1..9)
+        pos: Position in ticks RELATIVE TO THE PATTERN START
+            (192 ticks = 1 bar, 48 = 1/4 note)
         length: Note length in ticks (12 = 1/16 note, 24 = 1/8, 48 = 1/4 (one beat),
             96 = 1/2, 192 = 1 bar)
         volume: Note velocity (0-200)
@@ -722,16 +842,21 @@ def add_note_by_name(
     try:
         key = note_name_to_midi(note_name)
     except ValueError as e:
-        return json.dumps({"error": str(e)})
+        return json.dumps({"error": f"Note NOT added: {e}"})
 
     proj = get_project()
-    result = proj.add_note(
-        track_index=track_index,
-        key=key,
-        pos=pos,
-        length=length,
-        volume=volume,
-    )
+    error = _track_index_error(proj, track_index)
+    if error:
+        return json.dumps({"error": error})
+    try:
+        result = _add_checked_note(proj, track_index, {
+            "key": key,
+            "pos": pos,
+            "length": length,
+            "volume": volume,
+        })
+    except (ValueError, IndexError) as e:
+        return json.dumps({"error": f"Note NOT added: {e}"})
     return json.dumps(result)
 
 
@@ -742,36 +867,66 @@ def add_notes_batch(
 ) -> str:
     """Add multiple notes to a track at once.
 
+    Each note is validated on its own: invalid notes are skipped (NOT
+    added) and reported, valid ones are still added. Check the result:
+    {"added": <count actually added>, "failed": <count>, "errors":
+    [{"index": i, "note": <the input>, "error": "..."}], "notes": [...]}.
+    When any note failed there is also a top-level "warning"; when every
+    note failed (or the track index is bad) there is a top-level "error".
+
     Args:
         track_index: Zero-based track index
-        notes: List of note objects, each with: key (int or str like "C4"),
-            pos (ticks), length (ticks, default 48 = 1/4 note; 12 = 1/16,
-            192 = 1 bar), volume (0-200, default 100),
-            panning (-100 to +100, default 0)
+        notes: List of note objects, each with: key (int 0-127, or a note
+            name str like "C4", "A#3", "Bb2" - sharps and flats both work,
+            e.g. "Bb2" = "A#2" = 46; range C-1..G9, 60 = C4),
+            pos (ticks >= 0, relative to the pattern start; 192 = 1 bar,
+            48 = 1/4 note), length (ticks > 0, default 48 = 1/4 note;
+            24 = 1/8, 12 = 1/16, 192 = 1 bar), volume (0-200, default 100),
+            panning (-100 to +100, default 0), pattern_index (optional)
     """
     proj = get_project()
+    error = _track_index_error(proj, track_index)
+    if error:
+        return json.dumps({"error": error, "added": 0, "failed": 0})
+    if not isinstance(notes, list) or not notes:
+        return json.dumps({
+            "error": "notes must be a non-empty list of note objects, e.g. "
+                     '[{"key": "Bb2", "pos": 0, "length": 48}].',
+            "added": 0,
+            "failed": 0,
+        })
+
     added = []
-    for note_data in notes:
-        key = note_data.get("key", 60)
-        if isinstance(key, str):
-            try:
-                key = note_name_to_midi(key)
-            except ValueError as e:
-                added.append({"error": str(e), "note": note_data})
-                continue
+    errors = []
+    for index, note_data in enumerate(notes):
+        try:
+            if not isinstance(note_data, dict):
+                raise ValueError(
+                    "each note must be an object like "
+                    '{"key": "C4", "pos": 0, "length": 48}.'
+                )
+            added.append(_add_checked_note(proj, track_index, note_data))
+        except (ValueError, IndexError) as e:
+            errors.append({"index": index, "note": note_data, "error": str(e)})
 
-        result = proj.add_note(
-            track_index=track_index,
-            key=key,
-            pos=note_data.get("pos", 0),
-            length=note_data.get("length", 48),
-            volume=note_data.get("volume", 100),
-            panning=note_data.get("panning", 0),
-            pattern_index=note_data.get("pattern_index"),
+    response: dict = {
+        "added": len(added),
+        "failed": len(errors),
+        "errors": errors,
+        "notes": added,
+    }
+    if errors and not added:
+        response["error"] = (
+            f"None of the {len(notes)} notes were added. First error "
+            f"(note {errors[0]['index']}): {errors[0]['error']} "
+            f"See 'errors' for every note."
         )
-        added.append(result)
-
-    return json.dumps({"added": len(added), "notes": added})
+    elif errors:
+        response["warning"] = (
+            f"{len(errors)} of {len(notes)} notes were NOT added; "
+            f"see errors."
+        )
+    return json.dumps(response)
 
 
 # ──────────────────────────────────────────────────────────────────
@@ -1698,6 +1853,10 @@ def set_master_pitch(pitch: int) -> str:
 def note_name_to_key(name: str) -> str:
     """Convert a note name (e.g. 'C4') to its MIDI key number.
 
+    Sharps and flats both work and enharmonics agree ('Bb2' = 'A#2' = 46,
+    'Cb4' = 'B3' = 59). Range C-1 (0) to G9 (127); C4 = 60. Invalid names
+    return {"error": "..."} stating the accepted format.
+
     Args:
         name: Note name like 'C4', 'A#3', 'F#5', 'Bb2'
     """
@@ -1751,7 +1910,7 @@ def generate_scale(
     """Generate a musical scale as MIDI key numbers and note names.
 
     Args:
-        root_note: Root note name (e.g. 'C4', 'A3')
+        root_note: Root note name (e.g. 'C4', 'A3', 'Bb2'; sharps and flats both work)
         scale_type: Scale type: major, minor, dorian, mixolydian, pentatonic_major,
             pentatonic_minor, blues, chromatic, harmonic_minor, melodic_minor
         num_octaves: Number of octaves to generate

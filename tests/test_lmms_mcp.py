@@ -28,6 +28,47 @@ class TestModels:
             name = midi_to_note_name(key)
             assert note_name_to_midi(name) == key
 
+    @pytest.mark.parametrize("name,key", [
+        ("Bb2", 46), ("A#2", 46), ("Eb4", 63), ("Db3", 49),
+        ("Cb4", 59), ("B#3", 60), ("E#4", 65), ("Fb4", 64),
+        ("bb2", 46), ("b3", 59), ("B3", 59), ("c4", 60), ("c#4", 61),
+        ("C-1", 0), ("G9", 127), ("Cb0", 11), ("B\u266d2", 46),
+        ("F\u266f3", 54), ("Bbb3", 57), ("F##3", 55), (" Bb2 ", 46),
+    ])
+    def test_note_name_to_midi_flats_and_enharmonics(self, name, key):
+        assert note_name_to_midi(name) == key
+
+    def test_flat_and_sharp_enharmonics_agree(self):
+        # Every sharp name (C#, D#, F#, G#, A#) has a flat twin one letter
+        # up in the same octave (Db, Eb, Gb, Ab, Bb).
+        for key in range(128):
+            sharp = midi_to_note_name(key)
+            if "#" not in sharp:
+                continue
+            flat_letter = "ABCDEFG"[("ABCDEFG".index(sharp[0]) + 1) % 7]
+            octave = sharp[2:]
+            assert note_name_to_midi(f"{flat_letter}b{octave}") == key
+
+    @pytest.mark.parametrize("name", ["G#9", "Ab9", "C10", "Cb-1", "C-2"])
+    def test_note_name_out_of_midi_range(self, name):
+        with pytest.raises(ValueError, match="out of range.*0-127"):
+            note_name_to_midi(name)
+
+    @pytest.mark.parametrize("name", [
+        "H2", "", "  ", "C", "4", "60", "BB2", "C#b4", "Cbbb4", "bbbb3",
+        "C 4", "Do4", "C#",
+    ])
+    def test_note_name_invalid_states_format(self, name):
+        with pytest.raises(ValueError) as exc:
+            note_name_to_midi(name)
+        msg = str(exc.value)
+        assert f"Invalid note name {name!r}" in msg
+        assert "Bb2" in msg and "F#3" in msg and "C4 = 60" in msg
+
+    def test_note_name_non_string_rejected(self):
+        with pytest.raises(ValueError, match="Invalid note name"):
+            note_name_to_midi(60)
+
     def test_bars_to_ticks(self):
         assert bars_to_ticks(1) == 192
         assert bars_to_ticks(4) == 768
@@ -1658,3 +1699,167 @@ if __name__ == "__main__":
     import sys
     print("Run with: pytest tests/")
     sys.exit(1)
+
+
+class TestNoteValidation:
+    """add_note / add_note_by_name / add_notes_batch must never silently
+    swallow bad input: failures are reported clearly."""
+
+    def _srv(self):
+        from lmms_mcp import server as srv
+        proj = LMMSProject()
+        proj.new()
+        srv.set_project(proj)
+        srv.add_instrument_track("Bass", instrument="tripleoscillator")
+        return srv, proj
+
+    @staticmethod
+    def _note_elems(proj):
+        return find_tracks(proj.root)[0].findall(".//note")
+
+    def test_add_note_by_name_flat(self):
+        srv, proj = self._srv()
+        res = json.loads(srv.add_note_by_name(0, "Bb2", pos=0, length=48))
+        assert "error" not in res
+        notes = self._note_elems(proj)
+        assert [n.get("key") for n in notes] == ["46"]
+
+    def test_add_note_by_name_invalid_reports_error(self):
+        srv, proj = self._srv()
+        res = json.loads(srv.add_note_by_name(0, "H2"))
+        assert "error" in res
+        assert "Invalid note name 'H2'" in res["error"]
+        assert "Bb2" in res["error"]
+        assert self._note_elems(proj) == []
+
+    def test_add_note_by_name_out_of_range(self):
+        srv, proj = self._srv()
+        res = json.loads(srv.add_note_by_name(0, "G#9"))
+        assert "error" in res and "out of range" in res["error"]
+        assert self._note_elems(proj) == []
+
+    def test_add_note_validation(self):
+        srv, proj = self._srv()
+        for kwargs, fragment in [
+            ({"key": 128}, "key 128 is out of range"),
+            ({"key": -1}, "key -1 is out of range"),
+            ({"pos": -48}, "pos must be >= 0"),
+            ({"length": 0}, "length must be > 0"),
+            ({"length": -12}, "length must be > 0"),
+        ]:
+            res = json.loads(srv.add_note(0, **kwargs))
+            assert "error" in res, kwargs
+            assert fragment in res["error"], res
+        assert self._note_elems(proj) == []
+
+    def test_add_note_bad_track_index(self):
+        srv, proj = self._srv()
+        res = json.loads(srv.add_note(5, key=60))
+        assert "error" in res and "Track index 5 out of range" in res["error"]
+        res = json.loads(srv.add_note(-1, key=60))
+        assert "error" in res
+        res = json.loads(srv.add_note_by_name(5, "C4"))
+        assert "error" in res
+
+    def test_add_note_valid_still_works(self):
+        srv, proj = self._srv()
+        res = json.loads(srv.add_note(0, key=127, pos=0, length=12))
+        assert "error" not in res and "message" in res
+        assert [n.get("key") for n in self._note_elems(proj)] == ["127"]
+
+    def test_batch_all_valid(self):
+        srv, proj = self._srv()
+        res = json.loads(srv.add_notes_batch(0, [
+            {"key": "Bb2", "pos": 0, "length": 24},
+            {"key": "C#3", "pos": 24, "length": 24},
+            {"key": 60, "pos": 48},
+        ]))
+        assert res["added"] == 3
+        assert res["failed"] == 0
+        assert res["errors"] == []
+        assert len(res["notes"]) == 3
+        assert "warning" not in res and "error" not in res
+        assert [n.get("key") for n in self._note_elems(proj)] == ["46", "49", "60"]
+
+    def test_batch_mixed_valid_and_invalid(self):
+        srv, proj = self._srv()
+        bad = {"key": "H2", "pos": 0, "length": 48}
+        good = {"key": "Bb2", "pos": 48, "length": 48}
+        res = json.loads(srv.add_notes_batch(0, [bad, good]))
+        assert res["added"] == 1
+        assert res["failed"] == 1
+        assert len(res["notes"]) == 1
+        assert "error" not in res
+        assert "1 of 2 notes were NOT added" in res["warning"]
+        assert len(res["errors"]) == 1
+        err = res["errors"][0]
+        assert err["index"] == 0
+        assert err["note"] == bad
+        assert "Invalid note name 'H2'" in err["error"]
+        assert [n.get("key") for n in self._note_elems(proj)] == ["46"]
+
+    def test_batch_numeric_and_range_validation(self):
+        srv, proj = self._srv()
+        res = json.loads(srv.add_notes_batch(0, [
+            {"key": 128, "pos": 0},
+            {"key": -1, "pos": 0},
+            {"key": 60, "pos": -1},
+            {"key": 60, "pos": 0, "length": 0},
+            {"key": 60, "pos": "x"},
+            {"key": 60, "pos": 0, "length": 24},
+        ]))
+        assert res["added"] == 1
+        assert res["failed"] == 5
+        assert [e["index"] for e in res["errors"]] == [0, 1, 2, 3, 4]
+        assert "out of range" in res["errors"][0]["error"]
+        assert "out of range" in res["errors"][1]["error"]
+        assert "pos must be >= 0" in res["errors"][2]["error"]
+        assert "length must be > 0" in res["errors"][3]["error"]
+        assert "pos must be an integer" in res["errors"][4]["error"]
+        assert "5 of 6 notes were NOT added" in res["warning"]
+        assert len(self._note_elems(proj)) == 1
+
+    def test_batch_all_invalid_returns_error(self):
+        srv, proj = self._srv()
+        res = json.loads(srv.add_notes_batch(0, [
+            {"key": 128, "pos": 0},
+            {"key": "H2", "pos": 0},
+        ]))
+        assert res["added"] == 0
+        assert res["failed"] == 2
+        assert "error" in res
+        assert "None of the 2 notes were added" in res["error"]
+        assert len(res["errors"]) == 2
+        assert self._note_elems(proj) == []
+
+    def test_batch_non_dict_note_and_empty_list(self):
+        srv, proj = self._srv()
+        res = json.loads(srv.add_notes_batch(0, [60, {"key": 60}]))
+        assert res["added"] == 1 and res["failed"] == 1
+        assert res["errors"][0]["index"] == 0
+        assert "each note must be an object" in res["errors"][0]["error"]
+        res = json.loads(srv.add_notes_batch(0, []))
+        assert "error" in res and res["added"] == 0
+
+    def test_batch_bad_track_index(self):
+        srv, proj = self._srv()
+        res = json.loads(srv.add_notes_batch(7, [{"key": 60}]))
+        assert "error" in res and "Track index 7 out of range" in res["error"]
+        assert res["added"] == 0
+        assert self._note_elems(proj) == []
+
+    def test_batch_bad_pattern_index_reported_per_note(self):
+        srv, proj = self._srv()
+        res = json.loads(srv.add_notes_batch(0, [
+            {"key": 60, "pattern_index": 9},
+            {"key": 62},
+        ]))
+        assert res["added"] == 1 and res["failed"] == 1
+        assert "Pattern index 9 out of range" in res["errors"][0]["error"]
+
+    def test_note_name_to_key_tool_flats(self):
+        from lmms_mcp import server as srv
+        assert json.loads(srv.note_name_to_key("Bb2"))["midi_key"] == 46
+        assert "error" in json.loads(srv.note_name_to_key("H2"))
+        scale = json.loads(srv.generate_scale("Bb2", "major"))
+        assert scale["notes"][0]["key"] == 46

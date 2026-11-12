@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass, field
 from enum import IntEnum
 
@@ -172,23 +173,68 @@ def midi_to_note_name(midi_key: int) -> str:
     return f"{note}{octave}"
 
 
+MIDI_KEY_MIN = 0
+MIDI_KEY_MAX = 127
+
+# Semitone offset of each natural note within an octave.
+_NATURAL_SEMITONES = {"C": 0, "D": 2, "E": 4, "F": 5, "G": 7, "A": 9, "B": 11}
+
+# letter (any case), optional accidental (# or b, single or double),
+# octave. The first character is always the note letter, so "b3" is B3
+# and "bb3" is Bb3 (B flat) - there is no ambiguity.
+_NOTE_NAME_RE = re.compile(r"([A-Ga-g])(##|bb|#|b|)(-?[0-9]+)")
+
+NOTE_NAME_FORMAT_HINT = (
+    "Use a letter A-G, optional # or b, and an octave, "
+    "e.g. C4, F#3, Bb2 (C4 = 60)."
+)
+
+
 def note_name_to_midi(name: str) -> int:
-    """Convert a note name like 'C4', 'A#3', 'C-1' to a MIDI key number."""
-    import re
+    """Convert a note name to a MIDI key number (0-127, C4 = 60).
 
-    name = name.strip()
-    m = re.match(r"^([A-G]#?)(-?\d+)$", name)
+    Accepts sharps and flats ('A#3', 'Bb3', also the unicode sharp and
+    flat signs), a case-insensitive note letter ('bb2' = Bb2,
+    'b3' = B3) and double accidentals ('F##3', 'Bbb3'). Enharmonic
+    spellings wrap across the octave boundary like on a piano:
+    Cb4 = B3 = 59, B#3 = C4 = 60, E#4 = F4, Fb4 = E4.
+
+    Raises ValueError with a message explaining the accepted format when
+    the name is malformed or the result is outside MIDI 0-127
+    (C-1 .. G9).
+    """
+    if not isinstance(name, str):
+        raise ValueError(
+            f"Invalid note name {name!r}: expected a string. {NOTE_NAME_FORMAT_HINT}"
+        )
+
+    cleaned = name.strip().replace("\u266f", "#").replace("\u266d", "b")
+    m = _NOTE_NAME_RE.fullmatch(cleaned)
     if not m:
-        raise ValueError(f"Invalid note name: {name}")
+        hint = NOTE_NAME_FORMAT_HINT
+        if re.fullmatch(r"-?[0-9]+", cleaned):
+            hint += (
+                " A bare number is a MIDI key, not a note name: pass it "
+                "as an integer (e.g. 60), not a string."
+            )
+        raise ValueError(f"Invalid note name {name!r}. {hint}")
 
-    note_part = m.group(1)
-    octave = int(m.group(2))
+    letter, accidental, octave_str = m.groups()
+    if accidental.startswith("#"):
+        offset = len(accidental)
+    elif accidental:
+        offset = -len(accidental)
+    else:
+        offset = 0
 
-    if note_part not in NOTE_NAMES:
-        raise ValueError(f"Invalid note: {note_part}")
-
-    note_index = NOTE_NAMES.index(note_part)
-    return (octave + 1) * 12 + note_index
+    key = (int(octave_str) + 1) * 12 + _NATURAL_SEMITONES[letter.upper()] + offset
+    if not MIDI_KEY_MIN <= key <= MIDI_KEY_MAX:
+        raise ValueError(
+            f"Note {name!r} is out of range (it would be MIDI key {key}; "
+            f"valid keys are {MIDI_KEY_MIN}-{MIDI_KEY_MAX}, i.e. "
+            f"{midi_to_note_name(MIDI_KEY_MIN)} to {midi_to_note_name(MIDI_KEY_MAX)})."
+        )
+    return key
 
 
 def bars_to_ticks(bars: float, ticks_per_bar: int = TICKS_PER_BAR) -> int:
