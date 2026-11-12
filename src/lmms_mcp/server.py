@@ -1085,17 +1085,6 @@ def set_zyn_params(
         return json.dumps({"error": "No parameters provided"})
     try:
         result = xml_parser.set_instrument_params(proj.root, track_index, params)
-        # Mark modified controllers so LMMS applies them on load
-        inst_track = xml_parser.find_track_element(proj.root, track_index) \
-            .find("instrumenttrack/instrument")
-        controllers = {
-            "portamento": 1, "filterfreq": 2, "filterq": 3,
-            "bandwidth": 4, "fmgain": 5,
-            "rescenterfreq": 6, "resbandwidth": 7,
-        }
-        modified = sorted(controllers[p] for p in params if p in controllers)
-        inst_track.set("modifiedcontrollers", ",".join(map(str, modified)))
-        result["modifiedcontrollers"] = modified
         return json.dumps(result)
     except ValueError as exc:
         return json.dumps({"error": str(exc)})

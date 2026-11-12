@@ -1067,34 +1067,202 @@ def find_track_element(root: ET.Element, index: int) -> ET.Element:
     return tracks[index]
 
 
-def set_instrument_params(
-    root: ET.Element,
-    track_index: int,
-    params: dict,
-) -> dict:
-    """Set parameters on the <instrument> element of an instrument track.
+# LMMS ZynAddSubFX plugin knobs (attributes of the <zynaddsubfx> settings
+# element) -> the MIDI controller number LMMS lists in "modifiedcontrollers".
+# On project load LMMS only re-applies the knobs named there (see
+# ZynAddSubFxInstrument::loadSettings), using ZynAddSubFX's C_* numbers.
+ZYN_KNOB_CONTROLLERS = {
+    "portamento": 65,
+    "filterfreq": 74,
+    "filterq": 71,
+    "bandwidth": 75,
+    "fmgain": 76,
+    "rescenterfreq": 77,
+    "resbandwidth": 78,
+}
 
-    For zynaddsubfx these are: portamento, filterfreq, filterq, bandwidth,
-    fmgain, rescenterfreq, resbandwidth, modifiedcontrollers.
-    """
+# Master-level parameters written next to the part (as LMMS itself does).
+_ZYN_MASTER_PARAMS = [
+    ("par", "volume", "80"),
+    ("par", "key_shift", "64"),
+    ("par_bool", "nrpn_receive", "yes"),
+]
+
+# Version attributes of the data LMMS 1.2 writes.
+_ZYN_DEFAULT_VERSION = {
+    "version-major": "2",
+    "version-minor": "4",
+    "version-revision": "1",
+}
+
+# Part 0 parameters, as in projects saved by LMMS 1.2 (volume 96 is the
+# ZynAddSubFX default; most of the shipped demo projects use it).
+_ZYN_PART_PARAMS = [
+    ("par_bool", "enabled", "yes"),
+    ("par", "volume", "96"),
+    ("par", "panning", "64"),
+    ("par", "min_key", "0"),
+    ("par", "max_key", "127"),
+    ("par", "key_shift", "64"),
+    ("par", "rcv_chn", "0"),
+    ("par", "velocity_sensing", "64"),
+    ("par", "velocity_offset", "64"),
+    ("par_bool", "note_on", "yes"),
+    ("par_bool", "poly_mode", "yes"),
+    ("par", "legato_mode", "0"),
+    ("par", "key_limit", "15"),
+]
+
+
+def _get_zyn_instrument(root: ET.Element, track_index: int) -> ET.Element:
+    """Return the <instrument> element of a zynaddsubfx instrument track."""
     track = find_track_element(root, track_index)
     inst_track = track.find("instrumenttrack")
     if inst_track is None:
         raise ValueError(f"Track {track_index} is not an instrument track")
     inst = inst_track.find("instrument")
-    if inst is None:
-        raise ValueError(f"Track {track_index} has no instrument element")
+    if inst is None or inst.get("name") != "zynaddsubfx":
+        actual = inst.get("name") if inst is not None else "none"
+        raise ValueError(
+            f"Track {track_index} uses '{actual}', not 'zynaddsubfx'. "
+            f"This only works on zynaddsubfx tracks."
+        )
+    return inst
+
+
+def _parse_controller_list(text: str | None) -> set[int]:
+    """Parse a comma-separated "modifiedcontrollers" attribute."""
+    result = set()
+    for part in (text or "").split(","):
+        part = part.strip()
+        if part.lstrip("-").isdigit():
+            result.add(int(part))
+    return result
+
+
+def _zyn_settings_element(inst: ET.Element) -> ET.Element:
+    """Return the <zynaddsubfx> plugin settings element of an instrument.
+
+    LMMS keeps the knob attributes and the embedded <ZynAddSubFX-data> on
+    this child of <instrument>. It is created if missing. Attributes or
+    data that an older version of this tool wrote directly onto
+    <instrument> (where LMMS ignores them) are cleaned up: knob values are
+    moved over, the old data block and the bogus modifiedcontrollers are
+    dropped.
+    """
+    settings = inst.find("zynaddsubfx")
+    if settings is None:
+        settings = ET.SubElement(inst, "zynaddsubfx")
+
+    for old in inst.findall("ZynAddSubFX-data"):
+        inst.remove(old)
+
+    legacy_knobs = [k for k in ZYN_KNOB_CONTROLLERS if k in inst.attrib]
+    for key in legacy_knobs:
+        value = inst.attrib.pop(key)
+        if key not in settings.attrib:
+            settings.set(key, value)
+    if legacy_knobs:
+        # Re-apply the migrated knobs on load.
+        merged = _parse_controller_list(settings.get("modifiedcontrollers"))
+        merged.update(ZYN_KNOB_CONTROLLERS[k] for k in legacy_knobs)
+        settings.set("modifiedcontrollers", ",".join(map(str, sorted(merged))))
+    # Legacy values were made-up indices (1-7), not MIDI controller numbers.
+    inst.attrib.pop("modifiedcontrollers", None)
+    inst.attrib.pop("forwardmidicc", None)
+    return settings
+
+
+def set_instrument_params(
+    root: ET.Element,
+    track_index: int,
+    params: dict,
+) -> dict:
+    """Set the plugin knobs of a zynaddsubfx instrument track.
+
+    Valid names are the keys of ZYN_KNOB_CONTROLLERS (portamento,
+    filterfreq, filterq, bandwidth, fmgain, rescenterfreq, resbandwidth).
+    They are written as attributes of the <zynaddsubfx> child of
+    <instrument>, and their MIDI controller numbers are merged into its
+    "modifiedcontrollers" list so LMMS applies them when the project is
+    loaded.
+    """
+    unknown = [k for k in params if k not in ZYN_KNOB_CONTROLLERS]
+    if unknown:
+        raise ValueError(
+            f"Unknown ZynAddSubFX parameter(s): {', '.join(unknown)}. "
+            f"Valid: {', '.join(ZYN_KNOB_CONTROLLERS)}"
+        )
+    inst = _get_zyn_instrument(root, track_index)
+    settings = _zyn_settings_element(inst)
+    if settings.find("ZynAddSubFX-data") is None:
+        # LMMS skips the whole plugin state, knobs included, when the
+        # settings element has no children, so give it a default part.
+        settings.append(_build_zyn_data(_ZYN_DEFAULT_VERSION, [], None))
 
     applied = {}
     for key, value in params.items():
-        inst.set(key, str(value))
+        settings.set(key, str(value))
         applied[key] = value
+
+    controllers = _parse_controller_list(settings.get("modifiedcontrollers"))
+    controllers.update(ZYN_KNOB_CONTROLLERS[k] for k in params)
+    modified = sorted(controllers)
+    settings.set("modifiedcontrollers", ",".join(map(str, modified)))
+    if "forwardmidicc" not in settings.attrib:
+        settings.set("forwardmidicc", "1")
 
     return {
         "track_index": track_index,
         "instrument": inst.get("name"),
         "applied": applied,
+        "modifiedcontrollers": modified,
     }
+
+
+def _build_zyn_data(
+    attrib: dict,
+    sections: list[ET.Element],
+    instrument: ET.Element | None,
+) -> ET.Element:
+    """Build a <ZynAddSubFX-data> document the way LMMS saves it.
+
+    ZynAddSubFX's Master::loadXML expects a MASTER branch with the
+    instrument inside an enabled PART id="0". Without an instrument the
+    part keeps ZynAddSubFX's default sound.
+    """
+    data = ET.Element("ZynAddSubFX-data", dict(attrib))
+    for section in sections:
+        data.append(section)
+    master = ET.SubElement(data, "MASTER")
+    for tag, name, value in _ZYN_MASTER_PARAMS:
+        ET.SubElement(master, tag, {"name": name, "value": value})
+    part = ET.SubElement(master, "PART", {"id": "0"})
+    for tag, name, value in _ZYN_PART_PARAMS:
+        ET.SubElement(part, tag, {"name": name, "value": value})
+    if instrument is not None:
+        part.append(instrument)
+    return data
+
+
+def _zyn_data_from_preset(preset_root: ET.Element) -> ET.Element:
+    """Wrap a .xiz preset into the full document LMMS hands to ZynAddSubFX.
+
+    A .xiz only has INFORMATION / BASE_PARAMETERS / INSTRUMENT at top
+    level; the instrument has to be moved into MASTER/PART[0].
+    """
+    instrument = preset_root.find("INSTRUMENT")
+    if instrument is None:
+        raise ValueError(
+            "Preset has no INSTRUMENT branch. Is this really a .xiz file?"
+        )
+    sections = [
+        el for el in (
+            preset_root.find("INFORMATION"),
+            preset_root.find("BASE_PARAMETERS"),
+        ) if el is not None
+    ]
+    return _build_zyn_data(preset_root.attrib, sections, instrument)
 
 
 def embed_zyn_preset(
@@ -1104,6 +1272,11 @@ def embed_zyn_preset(
     preset_name: str = "",
 ) -> dict:
     """Embed ZynAddSubFX preset XML into a zynaddsubfx instrument track.
+
+    The result is instrument/zynaddsubfx/ZynAddSubFX-data/MASTER/PART[0]/
+    INSTRUMENT, which is the layout LMMS itself saves. Any previously
+    embedded data (also from the legacy, wrong place directly under
+    <instrument>) is replaced.
 
     Args:
         root: Project root element.
@@ -1118,17 +1291,7 @@ def embed_zyn_preset(
         ValueError: If track is not a zynaddsubfx instrument or the
             preset XML is invalid.
     """
-    track = find_track_element(root, track_index)
-    inst_track = track.find("instrumenttrack")
-    if inst_track is None:
-        raise ValueError(f"Track {track_index} is not an instrument track")
-    inst = inst_track.find("instrument")
-    if inst is None or inst.get("name") != "zynaddsubfx":
-        actual = inst.get("name") if inst is not None else "none"
-        raise ValueError(
-            f"Track {track_index} uses '{actual}', not 'zynaddsubfx'. "
-            f"Zyn presets can only be loaded on zynaddsubfx tracks."
-        )
+    inst = _get_zyn_instrument(root, track_index)
 
     # Validate and normalize the preset XML: strip leading whitespace and
     # the DOCTYPE (ElementTree cannot parse it and LMMS does not need it).
@@ -1148,11 +1311,6 @@ def embed_zyn_preset(
             f"'ZynAddSubFX-data'. Is this really a .xiz file?"
         )
 
-    # Remove any existing embedded data, then append the new one
-    for old in inst.findall("ZynAddSubFX-data"):
-        inst.remove(old)
-    inst.append(preset_root)
-
     # Extract patch name from preset INFO if available
     patch_name = preset_name
     try:
@@ -1163,6 +1321,14 @@ def embed_zyn_preset(
                 patch_name = name_el.text.strip()
     except (AttributeError, TypeError):
         pass
+
+    data = _zyn_data_from_preset(preset_root)
+
+    # Replace any existing data, then append the new one.
+    settings = _zyn_settings_element(inst)
+    for old in settings.findall("ZynAddSubFX-data"):
+        settings.remove(old)
+    settings.append(data)
 
     return {
         "track_index": track_index,

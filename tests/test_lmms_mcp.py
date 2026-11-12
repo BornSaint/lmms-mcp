@@ -291,19 +291,93 @@ class TestZynAddSubFX:
         '<?xml version="1.0" encoding="UTF-8"?>\n'
         '<!DOCTYPE ZynAddSubFX-data>\n'
         '<ZynAddSubFX-data version-major="1" version-minor="0">'
+        '<INFORMATION><par_bool name="PADsynth_used" value="no"/>'
+        '</INFORMATION>'
+        '<BASE_PARAMETERS><par name="max_midi_parts" value="16"/>'
+        '</BASE_PARAMETERS>'
         '<INSTRUMENT><INFO>'
         "<string name=\"name\">TestPatch</string>"
         '</INFO></INSTRUMENT></ZynAddSubFX-data>'
     )
 
+    @staticmethod
+    def _zyn_inst(root):
+        return find_tracks(root)[0].find("instrumenttrack/instrument")
+
+    @staticmethod
+    def _part_par(part, name):
+        return part.find(f"*[@name='{name}']").get("value")
+
     def test_embed_preset(self):
+        """LMMS only loads a preset laid out as instrument/zynaddsubfx/
+        ZynAddSubFX-data/MASTER/PART[0]/INSTRUMENT (Master::loadXML needs
+        the MASTER branch)."""
         from lmms_mcp.xml_parser import embed_zyn_preset
         root = self._make_zyn_project()
         result = embed_zyn_preset(root, 0, self.ZYN_PRESET_XML)
         assert result["preset"] == "TestPatch"
-        inst = find_tracks(root)[0].find("instrumenttrack/instrument")
-        data = inst.find("ZynAddSubFX-data")
-        assert data.tag == "ZynAddSubFX-data"
+        inst = self._zyn_inst(root)
+        # not in the legacy place directly under <instrument>
+        assert inst.find("ZynAddSubFX-data") is None
+        data = inst.find("zynaddsubfx/ZynAddSubFX-data")
+        assert data is not None
+        assert data.get("version-major") == "1"
+        assert data.find("INFORMATION/par_bool") is not None
+        assert data.find("BASE_PARAMETERS/par") is not None
+        # the instrument lives inside the enabled part 0, not at top level
+        assert data.find("INSTRUMENT") is None
+        part = data.find("MASTER/PART[@id='0']")
+        assert part is not None
+        assert self._part_par(part, "enabled") == "yes"
+        assert self._part_par(part, "panning") == "64"
+        assert self._part_par(part, "min_key") == "0"
+        assert self._part_par(part, "max_key") == "127"
+        assert self._part_par(part, "key_shift") == "64"
+        assert self._part_par(part, "rcv_chn") == "0"
+        assert self._part_par(part, "note_on") == "yes"
+        assert self._part_par(part, "poly_mode") == "yes"
+        name = part.find("INSTRUMENT/INFO/string[@name='name']")
+        assert name.text == "TestPatch"
+        assert data.find("MASTER/par[@name='volume']") is not None
+
+    def test_embed_preset_twice_keeps_one_data_block(self):
+        from lmms_mcp.xml_parser import embed_zyn_preset
+        root = self._make_zyn_project()
+        embed_zyn_preset(root, 0, self.ZYN_PRESET_XML)
+        embed_zyn_preset(root, 0, self.ZYN_PRESET_XML.replace(
+            "TestPatch", "Other"))
+        inst = self._zyn_inst(root)
+        assert len(inst.findall("zynaddsubfx")) == 1
+        assert len(inst.findall("zynaddsubfx/ZynAddSubFX-data")) == 1
+        assert len(inst.findall("ZynAddSubFX-data")) == 0
+        names = inst.findall(
+            "zynaddsubfx/ZynAddSubFX-data/MASTER/PART/INSTRUMENT/INFO/"
+            "string[@name='name']")
+        assert [n.text for n in names] == ["Other"]
+
+    def test_embed_preset_cleans_legacy_layout(self):
+        """Old projects had the data and knobs on <instrument> itself."""
+        import xml.etree.ElementTree as ET
+        from lmms_mcp.xml_parser import embed_zyn_preset
+        root = self._make_zyn_project()
+        inst = self._zyn_inst(root)
+        inst.set("filterfreq", "70")
+        inst.set("modifiedcontrollers", "2")
+        ET.SubElement(inst, "ZynAddSubFX-data")
+        embed_zyn_preset(root, 0, self.ZYN_PRESET_XML)
+        assert inst.find("ZynAddSubFX-data") is None
+        assert "filterfreq" not in inst.attrib
+        assert "modifiedcontrollers" not in inst.attrib
+        settings = inst.find("zynaddsubfx")
+        assert settings.get("filterfreq") == "70"
+        assert settings.get("modifiedcontrollers") == "74"
+        assert len(settings.findall("ZynAddSubFX-data")) == 1
+
+    def test_embed_preset_without_instrument_branch(self):
+        from lmms_mcp.xml_parser import embed_zyn_preset
+        root = self._make_zyn_project()
+        with pytest.raises(ValueError, match="INSTRUMENT"):
+            embed_zyn_preset(root, 0, "<ZynAddSubFX-data/>")
 
     def test_embed_preset_wrong_instrument(self):
         from lmms_mcp.xml_parser import embed_zyn_preset
@@ -325,14 +399,93 @@ class TestZynAddSubFX:
             embed_zyn_preset(root, 0, "<something-else/>")
 
     def test_set_instrument_params(self):
+        """Knobs are attributes of <zynaddsubfx>, not of <instrument>, and
+        modifiedcontrollers lists their MIDI CC numbers (portamento=65,
+        filterfreq=74, ...)."""
         from lmms_mcp.xml_parser import set_instrument_params
         root = self._make_zyn_project()
         result = set_instrument_params(
             root, 0, {"filterfreq": 100, "portamento": 30}
         )
         assert result["applied"]["filterfreq"] == 100
-        inst = find_tracks(root)[0].find("instrumenttrack/instrument")
-        assert inst.get("filterfreq") == "100"
+        assert result["modifiedcontrollers"] == [65, 74]
+        inst = self._zyn_inst(root)
+        assert "filterfreq" not in inst.attrib
+        assert "portamento" not in inst.attrib
+        assert "modifiedcontrollers" not in inst.attrib
+        settings = inst.find("zynaddsubfx")
+        assert settings.get("filterfreq") == "100"
+        assert settings.get("portamento") == "30"
+        assert settings.get("modifiedcontrollers") == "65,74"
+        assert settings.get("forwardmidicc") == "1"
+        # LMMS ignores the knobs of a settings element without children,
+        # so a default part is written.
+        data = settings.find("ZynAddSubFX-data")
+        assert self._part_par(data.find("MASTER/PART[@id='0']"),
+                              "enabled") == "yes"
+
+    def test_all_knob_controller_numbers(self):
+        from lmms_mcp.xml_parser import set_instrument_params
+        root = self._make_zyn_project()
+        set_instrument_params(root, 0, {
+            "portamento": 1, "filterfreq": 2, "filterq": 3, "bandwidth": 4,
+            "fmgain": 5, "rescenterfreq": 6, "resbandwidth": 7,
+        })
+        settings = self._zyn_inst(root).find("zynaddsubfx")
+        assert settings.get("modifiedcontrollers") == "65,71,74,75,76,77,78"
+        assert settings.get("resbandwidth") == "7"
+
+    def test_set_params_merges_modified_controllers(self):
+        from lmms_mcp.xml_parser import set_instrument_params
+        root = self._make_zyn_project()
+        settings = self._zyn_inst(root).find("zynaddsubfx")
+        settings.set("modifiedcontrollers", "1,74,")
+        settings.set("forwardmidicc", "0")
+        result = set_instrument_params(root, 0, {"filterq": 90})
+        assert result["modifiedcontrollers"] == [1, 71, 74]
+        assert settings.get("modifiedcontrollers") == "1,71,74"
+        assert settings.get("forwardmidicc") == "0"  # not overwritten
+
+    def test_set_params_keeps_loaded_preset(self):
+        from lmms_mcp.xml_parser import embed_zyn_preset, set_instrument_params
+        root = self._make_zyn_project()
+        embed_zyn_preset(root, 0, self.ZYN_PRESET_XML)
+        set_instrument_params(root, 0, {"filterfreq": 20})
+        settings = self._zyn_inst(root).find("zynaddsubfx")
+        assert len(settings.findall("ZynAddSubFX-data")) == 1
+        assert settings.find(
+            "ZynAddSubFX-data/MASTER/PART[@id='0']/INSTRUMENT") is not None
+        # and loading a preset afterwards keeps the knobs
+        embed_zyn_preset(root, 0, self.ZYN_PRESET_XML)
+        assert settings.get("filterfreq") == "20"
+        assert settings.get("modifiedcontrollers") == "74"
+
+    def test_set_params_migrates_legacy_attributes(self):
+        from lmms_mcp.xml_parser import set_instrument_params
+        root = self._make_zyn_project()
+        inst = self._zyn_inst(root)
+        inst.set("filterq", "50")
+        inst.set("modifiedcontrollers", "3")  # made-up legacy index
+        set_instrument_params(root, 0, {"filterfreq": 20})
+        assert "filterq" not in inst.attrib
+        assert "modifiedcontrollers" not in inst.attrib
+        settings = inst.find("zynaddsubfx")
+        assert settings.get("filterq") == "50"
+        assert settings.get("filterfreq") == "20"
+        assert settings.get("modifiedcontrollers") == "71,74"
+
+    def test_set_params_unknown_parameter(self):
+        from lmms_mcp.xml_parser import set_instrument_params
+        root = self._make_zyn_project()
+        with pytest.raises(ValueError, match="Unknown"):
+            set_instrument_params(root, 0, {"cutoff": 10})
+
+    def test_set_params_wrong_instrument(self):
+        from lmms_mcp.xml_parser import set_instrument_params
+        root = create_empty_project()
+        add_instrument_track(root, "Not Zyn")
+        with pytest.raises(ValueError, match="not 'zynaddsubfx'"):
+            set_instrument_params(root, 0, {"filterfreq": 10})
 
     def test_set_params_out_of_range_track(self):
         from lmms_mcp.xml_parser import set_instrument_params
@@ -345,6 +498,48 @@ class TestZynAddSubFX:
         root = self._make_zyn_project()
         with pytest.raises(ValueError, match="out of range"):
             find_track_element(root, 5)
+
+    def test_preset_and_params_survive_save_load(self, tmp_path):
+        from lmms_mcp.xml_parser import embed_zyn_preset, set_instrument_params
+        root = self._make_zyn_project()
+        embed_zyn_preset(root, 0, self.ZYN_PRESET_XML)
+        set_instrument_params(root, 0, {"filterfreq": 20, "filterq": 100})
+        path = tmp_path / "zyn.mmpz"
+        save_project(path, root)
+        loaded = load_project(path)
+        inst = self._zyn_inst(loaded)
+        assert inst.get("name") == "zynaddsubfx"
+        assert inst.find("ZynAddSubFX-data") is None
+        settings = inst.find("zynaddsubfx")
+        assert settings.get("filterfreq") == "20"
+        assert settings.get("filterq") == "100"
+        assert settings.get("modifiedcontrollers") == "71,74"
+        assert settings.get("forwardmidicc") == "1"
+        instrument = settings.find(
+            "ZynAddSubFX-data/MASTER/PART[@id='0']/INSTRUMENT")
+        assert instrument.find("INFO/string[@name='name']").text == "TestPatch"
+        part = settings.find("ZynAddSubFX-data/MASTER/PART[@id='0']")
+        assert self._part_par(part, "enabled") == "yes"
+
+    def test_server_tools(self, monkeypatch):
+        from lmms_mcp import server as srv
+        proj = LMMSProject()
+        proj.new()
+        srv.set_project(proj)
+        srv.add_instrument_track("Z", instrument="zynaddsubfx")
+        monkeypatch.setattr(
+            srv.zyn_presets, "load_preset_xml",
+            lambda name: self.ZYN_PRESET_XML,
+        )
+        loaded = json.loads(srv.load_zyn_preset(0, "Any/Thing"))
+        assert loaded["preset"] == "TestPatch"
+        params = json.loads(srv.set_zyn_params(0, filterfreq=20))
+        assert params["applied"] == {"filterfreq": 20}
+        assert params["modifiedcontrollers"] == [74]
+        inst = self._zyn_inst(proj.root)
+        assert inst.find("zynaddsubfx").get("filterfreq") == "20"
+        assert inst.get("filterfreq") is None
+        assert "error" in json.loads(srv.set_zyn_params(0, filterfreq=200))
 
 
 class TestArrangement:
