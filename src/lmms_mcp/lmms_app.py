@@ -14,8 +14,9 @@ import os
 import re
 import shutil
 import subprocess
-from collections.abc import Collection, Iterable
-from dataclasses import dataclass
+import sys
+from collections.abc import Collection, Iterable, Mapping
+from dataclasses import dataclass, field
 from pathlib import Path
 
 # Support libraries shipped next to the real plugins on Linux (.so files
@@ -125,6 +126,35 @@ def get_samples_dir() -> Path | None:
     return None
 
 
+def get_installed_stems() -> dict[str, str]:
+    """Installed plugin libraries as {lowercase name: original-case stem}.
+
+    The stem is the library file name without extension (and without the
+    "lib" prefix on Linux), in its original case, e.g. libOPL2.so gives
+    {"opl2": "OPL2"}. LMMS loads an instrument by the plugin name in the
+    project XML, and on Linux that name is matched case-sensitively
+    against the library stem (OPL2 loads, opl2 loads nothing), so the
+    original case is what must be written into projects. Support
+    libraries such as libZynAddSubFxCore.so are excluded. Only files
+    directly in the plugins dir are considered, so the ladspa/
+    subdirectory is ignored. Returns an empty dict if no plugins are
+    found.
+    """
+    plugins_dir = get_plugins_dir()
+    if plugins_dir is None:
+        return {}
+    stems = {f.stem.lower(): f.stem for f in plugins_dir.glob("*.dll")}
+    for f in plugins_dir.glob("*.so"):
+        if not f.is_file():
+            continue
+        stem = f.stem
+        if stem.lower().startswith("lib"):
+            stem = stem[3:]
+        if stem and stem.lower() not in _SUPPORT_LIBS:
+            stems[stem.lower()] = stem
+    return stems
+
+
 def get_installed_plugins() -> set[str]:
     """Set of plugin library names shipped with the installed LMMS.
 
@@ -134,21 +164,9 @@ def get_installed_plugins() -> set[str]:
     libraries such as libZynAddSubFxCore.so are excluded. Only files
     directly in the plugins dir are considered, so the ladspa/
     subdirectory is ignored. Returns an empty set if no plugins are
-    found.
+    found. See get_installed_stems for the original-case names.
     """
-    plugins_dir = get_plugins_dir()
-    if plugins_dir is None:
-        return set()
-    names = {f.stem.lower() for f in plugins_dir.glob("*.dll")}
-    for f in plugins_dir.glob("*.so"):
-        if not f.is_file():
-            continue
-        name = f.stem.lower()
-        if name.startswith("lib"):
-            name = name[3:]
-        if name and name not in _SUPPORT_LIBS:
-            names.add(name)
-    return names
+    return set(get_installed_stems())
 
 
 def get_lmms_version() -> str | None:
@@ -167,21 +185,28 @@ def get_lmms_version() -> str | None:
         return None
 
 
-# Known aliases across versions (XML name -> possible DLL names).
-# Some instruments are statically linked into lmms.exe and have no DLL;
-# those are listed in STATIC_PLUGINS.
+# Plugins that official Windows builds link into the main binary instead
+# of shipping a library. Only trusted on Windows: on Linux a plugin must
+# have a library, otherwise LMMS loads nothing and the track is silent.
 STATIC_PLUGINS = {
-    # Official Windows builds link FreeBoy into the main binary
     "freeboy",
 }
 
+# MCP-facing instrument name -> library names (lowercase) that provide it
+# in some LMMS version/platform, preferred first. The name that is written
+# into the project XML is the original-case stem of the first one that is
+# installed (see resolve_plugin), e.g. opulenz -> OPL2 in LMMS 1.2.x
+# (libOPL2.so) but opulenz in 1.3 (libopulenz.so); freeboy -> papu on
+# Linux 1.2.x, where the FreeBoy instrument is the library libpapu.so.
+# nes (Nescaline, libnes.so) is a different instrument from papu and never
+# resolves to it.
 PLUGIN_ALIASES = {
-    "nes": {"nes", "papu", "nescaline"},
-    "papu": {"nes", "papu", "nescaline"},
-    "malletsstk": {"malletsstk", "stk"},
-    "audiofileprocessor": {"audiofileprocessor"},
-    "sf2player": {"sf2player", "fluidsynth"},
-    "opulenz": {"opl2", "opulenz"},  # named OPL2 in LMMS 1.2.x
+    "nes": ("nes", "nescaline"),
+    "freeboy": ("freeboy", "papu"),
+    "malletsstk": ("malletsstk", "stk"),
+    "audiofileprocessor": ("audiofileprocessor",),
+    "sf2player": ("sf2player", "fluidsynth"),
+    "opulenz": ("opulenz", "opl2"),  # named OPL2 in LMMS 1.2.x
 }
 
 
@@ -225,17 +250,51 @@ NON_TRACK_PLUGINS = {
 }
 
 
-def _installed_match(name: str, installed: Collection[str]) -> str | None:
+def _is_windows(windows: bool | None) -> bool:
+    return sys.platform == "win32" if windows is None else windows
+
+
+def plugin_candidates(name: str) -> tuple[str, ...]:
+    """Library names (lowercase) that can provide a plugin, preferred first."""
+    name = name.lower()
+    return (name, *(a for a in PLUGIN_ALIASES.get(name, ()) if a != name))
+
+
+def resolve_plugin(
+    name: str,
+    installed: Collection[str],
+    stems: Mapping[str, str] | None = None,
+    windows: bool | None = None,
+) -> str | None:
+    """The plugin name to write into a project for an MCP-facing name.
+
+    Returns the original-case stem (from `stems`, a lowercase -> stem
+    mapping; the lowercase name if unknown) of the first installed library
+    among plugin_candidates(name), e.g. opulenz -> "OPL2" when libOPL2.so
+    is installed. A statically linked plugin (STATIC_PLUGINS) with no
+    library resolves to its own name on Windows only. Returns None if the
+    installed LMMS cannot load the plugin.
+    """
+    for candidate in plugin_candidates(name):
+        if candidate in installed:
+            return (stems or {}).get(candidate, candidate)
+    if name.lower() in STATIC_PLUGINS and _is_windows(windows):
+        return name.lower()
+    return None
+
+
+def _installed_match(
+    name: str, installed: Collection[str], windows: bool | None = None
+) -> str | None:
     """How a lowercase plugin name is satisfied by the installed set.
 
-    Returns "built-in", "installed", "installed (alias)" or None.
+    Returns "installed", "installed (alias)", "built-in" or None.
     """
-    if name in STATIC_PLUGINS:
+    for candidate in plugin_candidates(name):
+        if candidate in installed:
+            return "installed" if candidate == name else "installed (alias)"
+    if name in STATIC_PLUGINS and _is_windows(windows):
         return "built-in"
-    if name in installed:
-        return "installed"
-    if any(alias in installed for alias in PLUGIN_ALIASES.get(name, ())):
-        return "installed (alias)"
     return None
 
 
@@ -246,7 +305,7 @@ def check_plugin_available(plugin_name: str) -> tuple[bool, str]:
     everything is considered available (cannot verify).
     """
     name = plugin_name.lower()
-    installed = set() if name in STATIC_PLUGINS else get_installed_plugins()
+    installed = get_installed_plugins()
     match = _installed_match(name, installed)
     if match:
         return True, match
@@ -260,18 +319,21 @@ def check_plugin_available(plugin_name: str) -> tuple[bool, str]:
 
 
 def compute_available(
-    known: Iterable[str], installed: Collection[str]
+    known: Iterable[str],
+    installed: Collection[str],
+    windows: bool | None = None,
 ) -> set[str]:
     """Which of the known plugin names the given installed set provides.
 
-    Aliases (opulenz <-> opl2, ...) and statically linked plugins are
-    respected. An empty installed set means no LMMS installation was
-    found, so nothing can be verified and every known name is returned.
+    Aliases (opulenz <-> opl2, freeboy <-> papu, ...) are respected;
+    statically linked plugins only count on Windows. An empty installed
+    set means no LMMS installation was found, so nothing can be verified
+    and every known name is returned.
     """
     known = {name.lower() for name in known}
     if not installed:
         return known
-    return {name for name in known if _installed_match(name, installed)}
+    return {name for name in known if _installed_match(name, installed, windows)}
 
 
 @dataclass(frozen=True)
@@ -283,6 +345,11 @@ class PluginAvailability:
     instruments / effects: the known instrument / effect names that are
         available (all known names when not verified).
     installed: raw plugin library names found (empty when not verified).
+    stems: installed library name (lowercase) -> stem in its original
+        case, e.g. {"opl2": "OPL2"}.
+    plugin_names: available known instrument -> the plugin name LMMS
+        loads for it and that is written into projects, e.g. opulenz ->
+        "OPL2", freeboy -> "papu" (see resolve_plugin).
     """
 
     verified: bool
@@ -290,6 +357,18 @@ class PluginAvailability:
     installed: frozenset[str]
     instruments: frozenset[str]
     effects: frozenset[str]
+    stems: Mapping[str, str] = field(default_factory=dict)
+    plugin_names: Mapping[str, str] = field(default_factory=dict)
+
+    def plugin_name(self, name: str) -> str:
+        """Plugin name to write into the project for an instrument name.
+
+        Known instruments use their resolved name, any other installed
+        library its original-case stem. Without a resolution (nothing
+        could be verified) the name itself is returned.
+        """
+        name = name.lower()
+        return self.plugin_names.get(name) or self.stems.get(name, name)
 
 
 def build_availability(
@@ -297,15 +376,30 @@ def build_availability(
     known_effects: Iterable[str],
     installed: Collection[str],
     version: str | None,
+    stems: Mapping[str, str] | None = None,
+    windows: bool | None = None,
 ) -> PluginAvailability:
-    """Build an availability snapshot from an installed-plugin set."""
+    """Build an availability snapshot from an installed-plugin set.
+
+    stems maps the lowercase installed names to their original-case
+    library stems (see get_installed_stems); names it lacks are used in
+    lowercase. windows overrides the platform check for statically linked
+    plugins (default: the running platform).
+    """
     installed = frozenset(installed)
+    stems = {k: v for k, v in (stems or {}).items() if k in installed}
+    instruments = compute_available(known_instruments, installed, windows)
     return PluginAvailability(
         verified=bool(installed),
         version=version,
         installed=installed,
-        instruments=frozenset(compute_available(known_instruments, installed)),
-        effects=frozenset(compute_available(known_effects, installed)),
+        instruments=frozenset(instruments),
+        effects=frozenset(compute_available(known_effects, installed, windows)),
+        stems=stems,
+        plugin_names={
+            name: resolve_plugin(name, installed, stems, windows) or name
+            for name in sorted(instruments)
+        },
     )
 
 
@@ -315,8 +409,9 @@ def detect_availability(
     """Inspect the installed LMMS and build the availability snapshot."""
     installed = get_installed_plugins()
     version = get_lmms_version() if installed else None
+    stems = get_installed_stems() if installed else {}
     return build_availability(
-        known_instruments, known_effects, installed, version
+        known_instruments, known_effects, installed, version, stems
     )
 
 

@@ -912,11 +912,29 @@ class TestLmmsApp:
         ok, _ = lmms_app.check_plugin_available("tripleoscillator")
         assert ok is True
 
-    def test_check_static_plugin(self):
+    def test_check_static_plugin_only_built_in_on_windows(self, monkeypatch):
+        from types import SimpleNamespace
+
         from lmms_mcp import lmms_app
+        monkeypatch.setattr(
+            lmms_app, "get_installed_plugins", lambda: {"nes", "sid"})
+        monkeypatch.setattr(lmms_app, "sys", SimpleNamespace(platform="win32"))
         ok, reason = lmms_app.check_plugin_available("freeboy")
         assert ok is True
         assert "built-in" in reason
+        # On Linux there is no such thing: FreeBoy needs a library
+        monkeypatch.setattr(lmms_app, "sys", SimpleNamespace(platform="linux"))
+        ok, reason = lmms_app.check_plugin_available("freeboy")
+        assert ok is False
+        assert "not included" in reason
+
+    def test_check_freeboy_is_the_papu_library(self, monkeypatch):
+        from lmms_mcp import lmms_app
+        monkeypatch.setattr(
+            lmms_app, "get_installed_plugins", lambda: {"nes", "papu"})
+        ok, reason = lmms_app.check_plugin_available("freeboy")
+        assert ok is True
+        assert reason == "installed (alias)"
 
     def test_check_plugin_matches_dll_reality(self):
         """check_plugin_available must agree with the actual plugins dir."""
@@ -1008,6 +1026,27 @@ class TestLmmsAppDetection:
         assert lmms_app.get_installed_plugins() == {
             "tripleoscillator", "opl2", "reverbsc",
         }
+
+    def test_installed_stems_keep_the_library_case(self, tmp_path, clean_env):
+        from lmms_mcp import lmms_app
+        plugins = self._fake_linux_plugins(tmp_path)
+        (plugins / "libpapu.so").write_bytes(b"\x7fELF fake")
+        clean_env.setenv("LMMS_PLUGINS_DIR", str(plugins))
+        # libOPL2.so is loaded as "OPL2" (case-sensitive), not "opl2"
+        assert lmms_app.get_installed_stems() == {
+            "tripleoscillator": "tripleoscillator", "opl2": "OPL2",
+            "reverbsc": "reverbsc", "papu": "papu",
+        }
+        # the lowercase set is unchanged
+        assert lmms_app.get_installed_plugins() == {
+            "tripleoscillator", "opl2", "reverbsc", "papu",
+        }
+
+    def test_installed_stems_empty_without_plugins(self, tmp_path, clean_env):
+        from lmms_mcp import lmms_app
+        clean_env.setenv("LMMS_PLUGINS_DIR", str(tmp_path / "missing"))
+        clean_env.setattr(lmms_app, "get_plugins_dir", lambda: None)
+        assert lmms_app.get_installed_stems() == {}
 
     def test_samples_dir_linux_layout(self, tmp_path, clean_env):
         from lmms_mcp import lmms_app
@@ -2145,9 +2184,12 @@ class TestPluginAvailability:
         from lmms_mcp import lmms_app
         from lmms_mcp import server as srv
 
-        def make(installed, version="1.2.2"):
+        def make(installed, version="1.2.2", stems=None):
             monkeypatch.setattr(
                 lmms_app, "get_installed_plugins", lambda: set(installed))
+            monkeypatch.setattr(
+                lmms_app, "get_installed_stems",
+                lambda: dict(stems) if stems else {n: n for n in installed})
             monkeypatch.setattr(
                 lmms_app, "get_lmms_version", lambda: version)
             return importlib.reload(srv)
@@ -2161,10 +2203,24 @@ class TestPluginAvailability:
     def test_compute_available_respects_aliases_and_static(self):
         from lmms_mcp import lmms_app
         known = ["tripleoscillator", "opulenz", "nes", "slicert", "freeboy"]
-        # opl2 satisfies opulenz, papu satisfies nes, freeboy is built in
+        # opl2 satisfies opulenz and papu satisfies freeboy; papu is the
+        # Game Boy chip, so it does not make nes (Nescaline) available
         available = lmms_app.compute_available(
-            known, {"tripleoscillator", "opl2", "papu"})
-        assert available == {"tripleoscillator", "opulenz", "nes", "freeboy"}
+            known, {"tripleoscillator", "opl2", "papu"}, windows=False)
+        assert available == {"tripleoscillator", "opulenz", "freeboy"}
+        available = lmms_app.compute_available(
+            known, {"tripleoscillator", "nes", "opulenz"}, windows=False)
+        assert available == {"tripleoscillator", "opulenz", "nes"}
+
+    def test_freeboy_is_static_only_on_windows(self):
+        from lmms_mcp import lmms_app
+        installed = {"tripleoscillator", "nes"}
+        assert lmms_app.compute_available(
+            ["freeboy", "nes"], installed, windows=True
+        ) == {"freeboy", "nes"}
+        assert lmms_app.compute_available(
+            ["freeboy", "nes"], installed, windows=False
+        ) == {"nes"}
 
     def test_compute_available_without_install_allows_everything(self):
         from lmms_mcp import lmms_app
@@ -2566,3 +2622,300 @@ class TestPluginAvailability:
         assert "add_vst_track" in tools
         assert "compressor" in tools["add_effect"].description
         assert "No LMMS installation was detected" in srv.mcp.instructions
+
+    def test_registered_server_resolves_names_from_the_install(
+            self, server_for):
+        stems = _stems_of(LINUX_122_LIBS)
+        srv = server_for(set(stems), stems=stems)
+        proj = LMMSProject()
+        proj.new()
+        srv.set_project(proj)
+        result = json.loads(srv.add_instrument_track("FM", instrument="opulenz"))
+        assert result["lmms_plugin"] == "OPL2"
+        assert srv._availability.plugin_names["freeboy"] == "papu"
+
+
+# The plugin library files of a made-up Linux LMMS 1.2.2: the case of the
+# file names matters, LMMS loads libOPL2.so only as "OPL2".
+LINUX_122_LIBS = (
+    "libtripleoscillator.so", "libkicker.so", "libaudiofileprocessor.so",
+    "libnes.so", "libpapu.so", "libOPL2.so", "libsid.so", "libsf2player.so",
+    "libzynaddsubfx.so", "libMyCustomSynth.so", "libeq.so", "libdelay.so",
+)
+
+
+def _stems_of(libs):
+    """{lowercase name: original-case stem} for Linux library file names."""
+    return {f[3:-3].lower(): f[3:-3] for f in libs}
+
+
+class TestInstrumentPluginNames:
+    """Instruments are written into projects under the name LMMS loads.
+
+    LMMS matches the <instrument name="..."> of a project case-sensitively
+    against its plugin names: opulenz only plays as "OPL2" in LMMS 1.2 and
+    the FreeBoy instrument is the library "papu". Writing the offered name
+    produces a silent track.
+    """
+
+    @staticmethod
+    def _availability(libs=LINUX_122_LIBS, version="1.2.2", windows=False):
+        from lmms_mcp import lmms_app
+        from lmms_mcp import server as srv
+        stems = _stems_of(libs)
+        return lmms_app.build_availability(
+            srv.KNOWN_INSTRUMENTS, srv.effects_mod.KNOWN_EFFECTS,
+            set(stems), version, stems=stems, windows=windows)
+
+    @pytest.fixture
+    def linux122(self, monkeypatch):
+        """(server, project) with the fake Linux LMMS 1.2.2 installed."""
+        from lmms_mcp import server as srv
+        monkeypatch.setattr(srv, "_availability", self._availability())
+        proj = LMMSProject()
+        proj.new()
+        srv.set_project(proj)
+        return srv, proj
+
+    @staticmethod
+    def _instrument_xml(proj, index=0):
+        inst = find_tracks(proj.root)[index].find("instrumenttrack/instrument")
+        return inst.get("name"), [child.tag for child in inst]
+
+    # --- resolution ------------------------------------------------------
+
+    def test_resolve_opulenz_to_the_opl2_library(self):
+        from lmms_mcp import lmms_app
+        stems = _stems_of(LINUX_122_LIBS)
+        assert lmms_app.resolve_plugin("opulenz", set(stems), stems) == "OPL2"
+
+    def test_resolve_opulenz_when_the_library_is_called_opulenz(self):
+        from lmms_mcp import lmms_app
+        stems = _stems_of(["libopulenz.so", "libnes.so"])  # LMMS 1.3
+        assert lmms_app.resolve_plugin(
+            "opulenz", set(stems), stems) == "opulenz"
+
+    def test_resolve_prefers_the_exact_library(self):
+        from lmms_mcp import lmms_app
+        stems = _stems_of(["libopulenz.so", "libOPL2.so"])
+        assert lmms_app.resolve_plugin(
+            "opulenz", set(stems), stems) == "opulenz"
+
+    def test_resolve_freeboy_to_the_papu_library(self):
+        from lmms_mcp import lmms_app
+        stems = _stems_of(LINUX_122_LIBS)
+        assert lmms_app.resolve_plugin(
+            "freeboy", set(stems), stems, windows=False) == "papu"
+
+    def test_resolve_freeboy_prefers_a_freeboy_library(self):
+        from lmms_mcp import lmms_app
+        stems = _stems_of(["libpapu.so", "libfreeboy.so"])
+        assert lmms_app.resolve_plugin(
+            "freeboy", set(stems), stems, windows=False) == "freeboy"
+
+    def test_resolve_nes_stays_nes_and_never_becomes_papu(self):
+        from lmms_mcp import lmms_app
+        stems = _stems_of(LINUX_122_LIBS)
+        assert lmms_app.resolve_plugin("nes", set(stems), stems) == "nes"
+        only_papu = _stems_of(["libpapu.so", "libsid.so"])
+        assert lmms_app.resolve_plugin(
+            "nes", set(only_papu), only_papu) is None
+
+    def test_resolve_ignores_case_of_the_requested_name(self):
+        from lmms_mcp import lmms_app
+        stems = _stems_of(LINUX_122_LIBS)
+        assert lmms_app.resolve_plugin("OpUlEnZ", set(stems), stems) == "OPL2"
+
+    def test_resolve_without_stems_uses_the_lowercase_name(self):
+        from lmms_mcp import lmms_app
+        assert lmms_app.resolve_plugin("opulenz", {"opl2"}) == "opl2"
+
+    def test_freeboy_without_library_resolves_only_on_windows(self):
+        from lmms_mcp import lmms_app
+        stems = _stems_of(["libnes.so", "libsid.so"])
+        assert lmms_app.resolve_plugin(
+            "freeboy", set(stems), stems, windows=False) is None
+        assert lmms_app.resolve_plugin(
+            "freeboy", set(stems), stems, windows=True) == "freeboy"
+
+    # --- the availability snapshot ---------------------------------------
+
+    def test_snapshot_maps_offered_names_to_plugin_names(self):
+        av = self._availability()
+        assert av.plugin_names["opulenz"] == "OPL2"
+        assert av.plugin_names["freeboy"] == "papu"
+        assert av.plugin_names["nes"] == "nes"
+        assert av.plugin_names["tripleoscillator"] == "tripleoscillator"
+        assert set(av.plugin_names) == set(av.instruments)
+        assert av.stems["opl2"] == "OPL2"
+
+    def test_snapshot_plugin_name_covers_custom_plugins(self):
+        av = self._availability()
+        assert av.plugin_name("mycustomsynth") == "MyCustomSynth"
+        assert av.plugin_name("OPULENZ") == "OPL2"
+        assert av.plugin_name("not_installed") == "not_installed"
+
+    def test_snapshot_freeboy_unavailable_on_linux_without_library(self):
+        libs = [f for f in LINUX_122_LIBS if f != "libpapu.so"]
+        av = self._availability(libs)
+        assert "freeboy" not in av.instruments
+        assert "freeboy" not in av.plugin_names
+        assert "nes" in av.instruments
+
+    def test_snapshot_freeboy_static_on_windows(self):
+        libs = [f for f in LINUX_122_LIBS if f != "libpapu.so"]
+        av = self._availability(libs, windows=True)
+        assert "freeboy" in av.instruments
+        assert av.plugin_names["freeboy"] == "freeboy"
+
+    def test_snapshot_without_lmms_uses_the_offered_names(self):
+        from lmms_mcp import lmms_app
+        from lmms_mcp import server as srv
+        av = lmms_app.build_availability(
+            srv.KNOWN_INSTRUMENTS, srv.effects_mod.KNOWN_EFFECTS, set(), None)
+        assert not av.verified
+        assert av.plugin_name("opulenz") == "opulenz"
+        assert av.plugin_name("freeboy") == "freeboy"
+
+    def test_detect_availability_keeps_the_library_case(self, monkeypatch):
+        from lmms_mcp import lmms_app
+        stems = _stems_of(["libOPL2.so", "libpapu.so", "libdelay.so"])
+        monkeypatch.setattr(
+            lmms_app, "get_installed_plugins", lambda: set(stems))
+        monkeypatch.setattr(lmms_app, "get_installed_stems", lambda: stems)
+        monkeypatch.setattr(lmms_app, "get_lmms_version", lambda: "1.2.2")
+        av = lmms_app.detect_availability(
+            ["opulenz", "freeboy", "nes"], ["delay"])
+        assert av.instruments == {"opulenz", "freeboy"}
+        assert av.plugin_names == {"opulenz": "OPL2", "freeboy": "papu"}
+
+    # --- add_instrument_track --------------------------------------------
+
+    def test_opulenz_is_written_as_opl2(self, linux122):
+        srv, proj = linux122
+        result = json.loads(srv.add_instrument_track("FM", instrument="opulenz"))
+        assert "error" not in result and "warning" not in result
+        assert result["instrument"] == "opulenz"
+        assert result["lmms_plugin"] == "OPL2"
+        name, children = self._instrument_xml(proj)
+        assert name == "OPL2"
+        assert children == ["OPL2"]
+        assert 'name="OPL2"' in proj.get_xml_string()
+
+    def test_opulenz_spellings_resolve_to_the_same_plugin(self, linux122):
+        srv, proj = linux122
+        for i, spelling in enumerate(("OPL3", " Opulenz ", "opl2")):
+            result = json.loads(
+                srv.add_instrument_track("FM", instrument=spelling))
+            assert result["instrument"] == "opulenz", spelling
+            assert result["lmms_plugin"] == "OPL2", spelling
+            assert self._instrument_xml(proj, i)[0] == "OPL2"
+
+    def test_freeboy_is_written_as_papu(self, linux122):
+        srv, proj = linux122
+        result = json.loads(srv.add_instrument_track("GB", instrument="freeboy"))
+        assert "error" not in result
+        assert result["instrument"] == "freeboy"
+        assert result["lmms_plugin"] == "papu"
+        assert self._instrument_xml(proj) == ("papu", ["papu"])
+
+    def test_same_name_plugins_report_no_lmms_plugin(self, linux122):
+        srv, proj = linux122
+        for i, inst in enumerate(("nes", "tripleoscillator", "zyn")):
+            result = json.loads(srv.add_instrument_track("T", instrument=inst))
+            assert "lmms_plugin" not in result, inst
+            assert result["instrument"] == (
+                "zynaddsubfx" if inst == "zyn" else inst)
+            assert self._instrument_xml(proj, i)[0] == result["instrument"]
+
+    def test_freeboy_refused_on_linux_without_papu(self, monkeypatch, linux122):
+        srv, proj = linux122
+        monkeypatch.setattr(srv, "_availability", self._availability(
+            [f for f in LINUX_122_LIBS if f != "libpapu.so"]))
+        result = json.loads(srv.add_instrument_track("GB", instrument="freeboy"))
+        assert "'freeboy' is not available" in result["error"]
+        assert "freeboy" not in result["available_instruments"]
+        assert "nes" in result["available_instruments"]
+        assert find_tracks(proj.root) == []
+        # and it is not advertised anywhere
+        assert "freeboy" not in srv.build_instructions(
+            srv._availability, "/tmp/p")
+        assert "freeboy" not in srv.render_plugin_doc(
+            srv.add_instrument_track.__plugin_doc_template__,
+            srv._availability)
+
+    def test_freeboy_accepted_on_windows_without_library(self, monkeypatch,
+                                                         linux122):
+        srv, proj = linux122
+        monkeypatch.setattr(srv, "_availability", self._availability(
+            [f for f in LINUX_122_LIBS if f != "libpapu.so"], windows=True))
+        result = json.loads(srv.add_instrument_track("GB", instrument="freeboy"))
+        assert "error" not in result
+        assert "lmms_plugin" not in result
+        assert self._instrument_xml(proj)[0] == "freeboy"
+
+    def test_custom_plugin_keeps_its_library_case(self, linux122):
+        srv, proj = linux122
+        result = json.loads(
+            srv.add_instrument_track("Mine", instrument="mycustomsynth"))
+        assert result["custom_plugin"] is True
+        assert result["instrument"] == "mycustomsynth"
+        assert result["lmms_plugin"] == "MyCustomSynth"
+        assert self._instrument_xml(proj) == (
+            "MyCustomSynth", ["MyCustomSynth"])
+
+    def test_custom_plugin_with_lowercase_library(self, linux122):
+        srv, proj = linux122
+        result = json.loads(srv.add_instrument_track("GB", instrument="papu"))
+        assert result["custom_plugin"] is True
+        assert "lmms_plugin" not in result
+        assert self._instrument_xml(proj)[0] == "papu"
+
+    def test_added_tracks_keep_working_with_other_tools(self, linux122,
+                                                        tmp_path):
+        """Name checks in other tools only look at zynaddsubfx/afp."""
+        srv, proj = linux122
+        srv.add_instrument_track("FM", instrument="opulenz")
+        srv.add_instrument_track("Zyn", instrument="zynaddsubfx")
+        srv.add_instrument_track("Drum", instrument="audiofileprocessor")
+        error = json.loads(srv.set_audiofile_sample(0, "drums/kick01.ogg"))
+        assert "uses instrument 'OPL2'" in error["error"]
+        assert "error" not in json.loads(
+            srv.set_audiofile_sample(2, "drums/kick01.ogg"))
+        assert "error" not in json.loads(srv.set_zyn_params(1, portamento=0))
+        assert "error" not in json.loads(srv.add_note(0, 60, 0, 48, 100))
+        tracks = json.loads(srv.list_tracks())["tracks"]
+        assert [t["instrument"] for t in tracks] == [
+            "OPL2", "zynaddsubfx", "audiofileprocessor"]
+        saved = Path(proj.save(tmp_path / "p.mmp", compressed=False))
+        assert '<instrument name="OPL2">' in saved.read_text()
+
+    # --- what the agent is shown -----------------------------------------
+
+    def test_list_available_plugins_reports_renamed_instruments(
+            self, linux122):
+        srv, _ = linux122
+        result = json.loads(srv.list_available_plugins())
+        assert result["lmms_plugin_names"] == {
+            "opulenz": "OPL2", "freeboy": "papu"}
+        assert "opulenz" in result["built_in_instruments"]
+        assert "papu" not in result["custom_plugins_unknown_type"]
+        assert "opl2" not in result["custom_plugins_unknown_type"]
+
+    def test_instruments_resource_reports_renamed_instruments(self, linux122):
+        srv, _ = linux122
+        entries = {
+            e["name"]: e
+            for e in json.loads(srv.resource_instruments())["instruments"]
+        }
+        assert entries["opulenz"]["lmms_plugin"] == "OPL2"
+        assert entries["freeboy"]["lmms_plugin"] == "papu"
+        assert "lmms_plugin" not in entries["nes"]
+
+    def test_tool_description_offers_the_renamed_instruments(self, linux122):
+        srv, _ = linux122
+        doc = srv.render_plugin_doc(
+            srv.add_instrument_track.__plugin_doc_template__,
+            srv._availability)
+        assert "opulenz" in doc and "freeboy" in doc
+        assert "lmms_plugin" in doc

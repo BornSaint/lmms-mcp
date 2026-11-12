@@ -89,6 +89,7 @@ INSTRUMENT_ALIASES = {
     "lb-302": "lb302",
     "303": "lb302",
     "opl3": "opulenz",
+    "opl2": "opulenz",
 }
 
 # Tools that are useless without a plugin; they are removed from the
@@ -455,6 +456,38 @@ def get_project_xml() -> str:
 # ──────────────────────────────────────────────────────────────────
 
 
+def _add_instrument(
+    proj, name: str, instrument: str, av, mixer_channel: int, volume: int,
+    panning: int, custom: bool = False,
+) -> dict:
+    """Add an instrument track using the plugin name LMMS actually loads.
+
+    LMMS loads an instrument by the exact plugin name written into the
+    project (case-sensitive on Linux), which can differ from the name this
+    server offers: opulenz is OPL2 and freeboy is papu in LMMS 1.2. The
+    result reports the offered name as "instrument" and, when it differs,
+    the name written into the project as "lmms_plugin".
+    """
+    plugin = av.plugin_name(instrument)
+    result = proj.add_track(
+        "instrument", name,
+        instrument=plugin,
+        mixer_channel=mixer_channel,
+        volume=volume,
+        panning=panning,
+    )
+    result["instrument"] = instrument
+    if plugin != instrument:
+        result["lmms_plugin"] = plugin
+    if custom:
+        result["custom_plugin"] = True
+    else:
+        warning = _verification_warning(av, instrument)
+        if warning:
+            result["warning"] = warning
+    return result
+
+
 @_plugin_tool
 def add_instrument_track(
     name: str,
@@ -473,6 +506,11 @@ def add_instrument_track(
         mixer_channel: Mixer channel number (0=Master, 1+=custom channels)
         volume: Track volume (0-200, 100=normal)
         panning: Track panning (-100 to +100, 0=center)
+
+    The response reports "instrument" (the name you gave). When the
+    installed LMMS knows that plugin under another name, it also reports
+    "lmms_plugin", the name written into the project; keep using the
+    "instrument" name yourself.
     """
     proj = get_project()
     av = _availability
@@ -491,15 +529,10 @@ def add_instrument_track(
                                  f"instrument.",
                         "available_instruments": _instrument_choices(av),
                     })
-                proj_result = proj.add_track(
-                    "instrument", name,
-                    instrument=normalized,
-                    mixer_channel=mixer_channel,
-                    volume=volume,
-                    panning=panning,
-                )
-                proj_result["custom_plugin"] = True
-                return json.dumps(proj_result)
+                return json.dumps(_add_instrument(
+                    proj, name, normalized, av, mixer_channel, volume,
+                    panning, custom=True,
+                ))
             hint = (
                 "Use one of valid_instruments. Use list_available_plugins "
                 "to see what is installed."
@@ -524,17 +557,9 @@ def add_instrument_track(
     if normalized not in av.instruments:
         return _refusal("instrument", normalized, av)
 
-    result = proj.add_track(
-        "instrument", name,
-        instrument=normalized,
-        mixer_channel=mixer_channel,
-        volume=volume,
-        panning=panning,
-    )
-    warning = _verification_warning(av, normalized)
-    if warning:
-        result["warning"] = warning
-    return json.dumps(result)
+    return json.dumps(_add_instrument(
+        proj, name, normalized, av, mixer_channel, volume, panning,
+    ))
 
 
 def _sample_path_warning(file_path: str) -> str | None:
@@ -1623,6 +1648,11 @@ def list_available_plugins() -> str:
         "lmms_found": lmms_app.find_lmms_exe() is not None,
         "version": av.version,
         "built_in_instruments": _ordered(KNOWN_INSTRUMENTS, av.instruments),
+        "lmms_plugin_names": {
+            n: av.plugin_name(n)
+            for n in _ordered(KNOWN_INSTRUMENTS, av.instruments)
+            if av.plugin_name(n) != n
+        },
         "built_in_effects": _effect_choices(av),
         "custom_plugins_unknown_type": [
             n for n in classified["unknown"]
@@ -1645,7 +1675,9 @@ def list_available_plugins() -> str:
         "Custom plugins can be tried as instruments by their library name "
         "(without extension, and without the 'lib' prefix on Linux) in "
         "add_instrument_track. add_effect only accepts the built-in effects "
-        "listed above."
+        "listed above. lmms_plugin_names lists instruments that LMMS loads "
+        "under another name than the one offered; add_instrument_track "
+        "handles that, keep using the offered name."
     )
     return json.dumps(result, indent=2)
 
@@ -2256,7 +2288,9 @@ def resource_instruments() -> str:
     return json.dumps({
         "note": _reference_note(av, "instruments"),
         "instruments": [
-            {"name": name, "description": KNOWN_INSTRUMENTS[name]}
+            {"name": name, "description": KNOWN_INSTRUMENTS[name],
+             **({"lmms_plugin": av.plugin_name(name)}
+                if av.plugin_name(name) != name else {})}
             for name in sorted(av.instruments)
         ],
         "recommendations_by_use_case": lmms_app.adapt_recommendations(

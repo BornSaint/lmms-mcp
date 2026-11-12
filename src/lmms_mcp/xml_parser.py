@@ -263,8 +263,11 @@ def _make_instrument_track(
         "vol": str(volume),
     })
 
+    # `instrument` is the plugin name LMMS loads (case-sensitive on Linux:
+    # "OPL2", not "opl2"). LMMS names the settings child after the plugin
+    # too, though it only reads the first child.
     inst = ET.SubElement(inst_track, "instrument", {"name": instrument})
-    ET.SubElement(inst, instrument.replace(" ", "").lower())
+    ET.SubElement(inst, instrument.replace(" ", ""))
 
     eldata = ET.SubElement(inst_track, "eldata", {
         "fres": "0.5", "ftype": "0", "fcut": "14000", "fwet": "0",
