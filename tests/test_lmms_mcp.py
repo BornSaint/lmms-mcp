@@ -129,6 +129,32 @@ class TestXMLParser:
         assert tracks[0].get("name") == "My Synth"
         assert tracks[0].get("type") == "0"
 
+    @staticmethod
+    def _settings(root, instrument):
+        """The plugin settings element of a fresh track of `instrument`."""
+        add_instrument_track(root, "T", instrument=instrument)
+        inst = find_tracks(root)[-1].find("instrumenttrack/instrument")
+        assert inst.get("name") == instrument
+        return list(inst)[0]
+
+    def test_vibedstrings_track_starts_with_an_active_string(self):
+        # A fresh Vibed has no active string and renders silence (verified
+        # with LMMS 1.2.2), so the track must be created with string 0 on.
+        settings = self._settings(create_empty_project(), "vibedstrings")
+        assert settings.tag == "vibedstrings"
+        assert settings.get("active0") == "1"
+
+    def test_other_instruments_get_no_default_attributes(self):
+        root = create_empty_project()
+        for name in ("tripleoscillator", "kicker", "organic", "zynaddsubfx"):
+            assert self._settings(root, name).attrib == {}
+
+    def test_instrument_defaults_are_not_shared_between_tracks(self):
+        root = create_empty_project()
+        first = self._settings(root, "vibedstrings")
+        first.set("active0", "0")
+        assert self._settings(root, "vibedstrings").get("active0") == "1"
+
     def test_add_note(self):
         root = create_empty_project()
         add_instrument_track(root, "Test Track")

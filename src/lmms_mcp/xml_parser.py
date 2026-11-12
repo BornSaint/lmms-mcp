@@ -237,6 +237,18 @@ def track_type_name(type_id: int) -> str:
     return TRACK_TYPE_NAMES.get(type_id, f"Unknown({type_id})")
 
 
+# Attributes a fresh instrument's settings element needs for the track to be
+# audible. LMMS fills in its own default for every attribute that is missing,
+# but a few plugins have a default state that makes no sound at all. Keyed by
+# the plugin name LMMS loads; add a plugin here to give it a playable start.
+INSTRUMENT_DEFAULTS: dict[str, dict[str, str]] = {
+    # Vibed has nine strings and a fresh one has none active: without
+    # active0 the track renders silence. The other string 0 values (volume,
+    # length, pickup, sine graph ...) fall back to LMMS's defaults.
+    "vibedstrings": {"active0": "1"},
+}
+
+
 def _make_instrument_track(
     parent: ET.Element,
     name: str,
@@ -267,7 +279,10 @@ def _make_instrument_track(
     # "OPL2", not "opl2"). LMMS names the settings child after the plugin
     # too, though it only reads the first child.
     inst = ET.SubElement(inst_track, "instrument", {"name": instrument})
-    ET.SubElement(inst, instrument.replace(" ", ""))
+    ET.SubElement(
+        inst, instrument.replace(" ", ""),
+        dict(INSTRUMENT_DEFAULTS.get(instrument, {})),
+    )
 
     eldata = ET.SubElement(inst_track, "eldata", {
         "fres": "0.5", "ftype": "0", "fcut": "14000", "fwet": "0",
