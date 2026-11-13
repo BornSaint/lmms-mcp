@@ -7,11 +7,15 @@ manipulating LMMS projects programmatically via the Model Context Protocol.
 import copy
 import difflib
 import errno
+import functools
+import inspect
 import json
 import math
 import os
 import string
+import sys
 import textwrap
+import traceback
 from pathlib import Path, PurePosixPath, PureWindowsPath
 from xml.etree import ElementTree as ET
 
@@ -607,6 +611,73 @@ mcp = MCPServer(
 )
 
 
+TOOL_ERROR_HINT = (
+    "The tool did not handle this error. The project may be partly "
+    "modified; call get_project_info to check. Check the arguments; if it "
+    "persists, report it."
+)
+
+
+def _tool_error_response(tool_name: str, exc: Exception) -> str:
+    """The JSON a tool answers when it raised an exception.
+
+    The mcp library reports an exception that escapes a tool to the
+    client as just "Error executing tool <name>", without its message, so
+    an agent cannot tell what went wrong. This puts the exception type and
+    message in the answer instead, and the traceback on stderr (a stdio
+    server must not print to stdout).
+    """
+    message = str(exc)
+    error = f"{type(exc).__name__}: {message}" if message else type(exc).__name__
+    try:
+        print(f"lmms-mcp: tool {tool_name} raised {error}", file=sys.stderr)
+        traceback.print_exception(exc, file=sys.stderr)
+    except Exception:  # a closed or broken stderr must not hide the error
+        pass
+    return json.dumps({"error": error, "tool": tool_name, "hint": TOOL_ERROR_HINT})
+
+
+def _guard_tool(fn):
+    """Wrap a tool function so an exception becomes a JSON error answer.
+
+    Only Exception is caught: KeyboardInterrupt, SystemExit and
+    asyncio.CancelledError (BaseExceptions) still propagate. functools.wraps
+    keeps the name, docstring and signature, so the tool's description and
+    input schema are those of fn.
+    """
+    name = fn.__name__
+    if inspect.iscoroutinefunction(fn):
+
+        @functools.wraps(fn)
+        async def guarded(*args, **kwargs):
+            try:
+                return await fn(*args, **kwargs)
+            except Exception as exc:
+                return _tool_error_response(name, exc)
+    else:
+
+        @functools.wraps(fn)
+        def guarded(*args, **kwargs):
+            try:
+                return fn(*args, **kwargs)
+            except Exception as exc:
+                return _tool_error_response(name, exc)
+
+    return guarded
+
+
+def _tool(fn):
+    """Register fn as an MCP tool (use instead of @mcp.tool()).
+
+    The registered tool is the guarded wrapper (see _guard_tool); fn itself
+    is returned, so calling a tool function directly (as the tests do) still
+    raises its exceptions. Every tool goes through here so none can fail
+    with a message-less error.
+    """
+    mcp.tool()(_guard_tool(fn))
+    return fn
+
+
 def _plugin_tool(fn):
     """Register a tool whose docstring lists the available plugins.
 
@@ -617,7 +688,7 @@ def _plugin_tool(fn):
     """
     fn.__plugin_doc_template__ = fn.__doc__ or ""
     fn.__doc__ = render_plugin_doc(fn.__plugin_doc_template__, _availability)
-    return mcp.tool()(fn)
+    return _tool(fn)
 
 
 # ──────────────────────────────────────────────────────────────────
@@ -625,7 +696,7 @@ def _plugin_tool(fn):
 # ──────────────────────────────────────────────────────────────────
 
 
-@mcp.tool()
+@_tool
 def create_project(
     bpm: int = 140,
     time_sig_numerator: int = 4,
@@ -739,7 +810,7 @@ def _load_error(path: str, exc: Exception) -> dict:
     return {"error": f"Could not load {path}: {reason}", "path": path}
 
 
-@mcp.tool()
+@_tool
 def load_project(path: str) -> str:
     """Load an existing LMMS project file (.mmpz or .mmp).
 
@@ -910,7 +981,7 @@ def _os_error_reason(exc: Exception, path: str) -> str:
     return reason
 
 
-@mcp.tool()
+@_tool
 def save_project(
     path: str = "",
     compressed: bool | None = None,
@@ -982,7 +1053,7 @@ def save_project(
     return json.dumps(result)
 
 
-@mcp.tool()
+@_tool
 def get_project_info() -> str:
     """Get comprehensive information about the current LMMS project.
 
@@ -993,7 +1064,7 @@ def get_project_info() -> str:
     return json.dumps(info.to_dict(), indent=2)
 
 
-@mcp.tool()
+@_tool
 def get_project_xml() -> str:
     """Get the raw XML representation of the current project.
 
@@ -1214,7 +1285,7 @@ def _tuning_summary(inst_track: ET.Element) -> dict:
         "base_note", "base_note_name", "pitch_cents", "hint")}
 
 
-@mcp.tool()
+@_tool
 def set_audiofile_sample(
     track_index: int,
     file_path: str,
@@ -1477,7 +1548,7 @@ def set_track_tuning(
         "track_index": track_index, "message": message, **report})
 
 
-@mcp.tool()
+@_tool
 def add_sample_track(
     name: str,
     mixer_channel: int = 0,
@@ -1508,7 +1579,7 @@ def add_sample_track(
     return json.dumps(result)
 
 
-@mcp.tool()
+@_tool
 def add_automation_track(name: str = "Automation track") -> str:
     """Add an automation track for parameter automation.
 
@@ -1520,7 +1591,7 @@ def add_automation_track(name: str = "Automation track") -> str:
     return json.dumps(result)
 
 
-@mcp.tool()
+@_tool
 def add_pattern_track(name: str = "Pattern 0") -> str:
     """Add a beat/bassline pattern track for drum sequencing.
 
@@ -1536,7 +1607,7 @@ def add_pattern_track(name: str = "Pattern 0") -> str:
     return json.dumps(result)
 
 
-@mcp.tool()
+@_tool
 def remove_track(track_index: int) -> str:
     """Remove a track by its index.
 
@@ -1548,7 +1619,7 @@ def remove_track(track_index: int) -> str:
     return json.dumps(result)
 
 
-@mcp.tool()
+@_tool
 def get_track(track_index: int) -> str:
     """Get detailed information about a specific track.
 
@@ -1567,7 +1638,7 @@ def get_track(track_index: int) -> str:
     return json.dumps(track.to_dict(), indent=2)
 
 
-@mcp.tool()
+@_tool
 def list_tracks() -> str:
     """List all tracks in the current project with their index, name, and type.
 
@@ -1682,7 +1753,7 @@ def _set_track_model(
         "message": f"Set track {track_index} {label} to {value}", **result})
 
 
-@mcp.tool()
+@_tool
 def set_track_volume(track_index: int, volume: int) -> str:
     """Set the volume of a track.
 
@@ -1698,7 +1769,7 @@ def set_track_volume(track_index: int, volume: int) -> str:
     return _set_track_model(track_index, "vol", "volume", volume)
 
 
-@mcp.tool()
+@_tool
 def set_track_panning(track_index: int, panning: int) -> str:
     """Set the panning of a track.
 
@@ -1714,7 +1785,7 @@ def set_track_panning(track_index: int, panning: int) -> str:
     return _set_track_model(track_index, "pan", "panning", panning)
 
 
-@mcp.tool()
+@_tool
 def set_track_mixer_channel(track_index: int, mixer_channel: int) -> str:
     """Route an existing track to another mixer channel.
 
@@ -1772,7 +1843,7 @@ def set_track_mixer_channel(track_index: int, mixer_channel: int) -> str:
     return json.dumps(result)
 
 
-@mcp.tool()
+@_tool
 def mute_track(track_index: int, muted: bool = True) -> str:
     """Mute or unmute a track.
 
@@ -1796,7 +1867,7 @@ def mute_track(track_index: int, muted: bool = True) -> str:
         **result})
 
 
-@mcp.tool()
+@_tool
 def solo_track(track_index: int, solo: bool = True) -> str:
     """Solo or unsolo a track.
 
@@ -1922,7 +1993,7 @@ def _add_checked_note(proj: LMMSProject, track_index: int, note: dict) -> dict:
     return proj.add_note(track_index=track_index, **fields)
 
 
-@mcp.tool()
+@_tool
 def add_note(
     track_index: int,
     key: int = DEFAULT_KEY,
@@ -1979,7 +2050,7 @@ def add_note(
     return json.dumps(result)
 
 
-@mcp.tool()
+@_tool
 def add_note_by_name(
     track_index: int,
     note_name: str = "C4",
@@ -2031,7 +2102,7 @@ def add_note_by_name(
     return json.dumps(result)
 
 
-@mcp.tool()
+@_tool
 def add_notes_batch(
     track_index: int,
     notes: list[dict],
@@ -2120,7 +2191,7 @@ def add_notes_batch(
 # ──────────────────────────────────────────────────────────────────
 
 
-@mcp.tool()
+@_tool
 def add_mixer_channel(name: str, volume: float = 1.0) -> str:
     """Add a new mixer channel.
 
@@ -2137,7 +2208,7 @@ def add_mixer_channel(name: str, volume: float = 1.0) -> str:
     return json.dumps(result)
 
 
-@mcp.tool()
+@_tool
 def get_mixer_channels() -> str:
     """Get all mixer channels with their settings."""
     proj = get_project()
@@ -2146,7 +2217,7 @@ def get_mixer_channels() -> str:
     return json.dumps({"channels": channels, "count": len(channels)}, indent=2)
 
 
-@mcp.tool()
+@_tool
 def set_mixer_channel_volume(channel_num: int, volume: float) -> str:
     """Set the volume of a mixer channel.
 
@@ -2175,7 +2246,7 @@ def set_mixer_channel_volume(channel_num: int, volume: float) -> str:
     return json.dumps({"error": f"Mixer channel {channel_num} not found"})
 
 
-@mcp.tool()
+@_tool
 def set_mixer_channel_name(channel_num: int, name: str) -> str:
     """Rename a mixer channel.
 
@@ -2338,7 +2409,7 @@ def set_effect_params(
         return json.dumps({"error": str(exc)})
 
 
-@mcp.tool()
+@_tool
 def remove_effect(target_type: str, target_index: int, effect: str | int) -> str:
     """Remove an effect from a chain by name or chain position.
 
@@ -2355,7 +2426,7 @@ def remove_effect(target_type: str, target_index: int, effect: str | int) -> str
         return json.dumps({"error": str(exc)})
 
 
-@mcp.tool()
+@_tool
 def toggle_effect(
     target_type: str, target_index: int, effect: str | int, enabled: bool
 ) -> str:
@@ -2375,7 +2446,7 @@ def toggle_effect(
         return json.dumps({"error": str(exc)})
 
 
-@mcp.tool()
+@_tool
 def get_effect_chain(target_type: str, target_index: int) -> str:
     """List all effects on a track's or mixer channel's effect chain.
 
@@ -2402,7 +2473,7 @@ def get_effect_chain(target_type: str, target_index: int) -> str:
 # ──────────────────────────────────────────────────────────────────
 
 
-@mcp.tool()
+@_tool
 def list_zyn_presets(category: str | None = None) -> str:
     """List available ZynAddSubFX presets (.xiz files).
 
@@ -2435,7 +2506,7 @@ def list_zyn_presets(category: str | None = None) -> str:
     }, indent=2)
 
 
-@mcp.tool()
+@_tool
 def load_zyn_preset(track_index: int, preset: str) -> str:
     """Load a ZynAddSubFX preset (.xiz) into a zynaddsubfx instrument track.
 
@@ -2524,7 +2595,7 @@ def load_zyn_preset(track_index: int, preset: str) -> str:
     return json.dumps(response)
 
 
-@mcp.tool()
+@_tool
 def set_zyn_params(
     track_index: int,
     portamento: int | None = None,
@@ -2714,7 +2785,7 @@ def _preset_mix_note(index: int, preset, inst_track) -> str | None:
     return "The preset was saved with " + " and ".join(parts) + "."
 
 
-@mcp.tool()
+@_tool
 def load_instrument_preset(
     track_index: int | None,
     preset: str,
@@ -2947,7 +3018,7 @@ def load_instrument_preset(
     return json.dumps(result)
 
 
-@mcp.tool()
+@_tool
 def list_instrument_presets(instrument: str | None = None) -> str:
     """List the instrument presets (.xpf) load_instrument_preset can load.
 
@@ -3043,7 +3114,7 @@ def list_instrument_presets(instrument: str | None = None) -> str:
 # ──────────────────────────────────────────────────────────────────
 
 
-@mcp.tool()
+@_tool
 def get_lmms_info() -> str:
     """Get info about the installed LMMS application.
 
@@ -3077,7 +3148,7 @@ def get_lmms_info() -> str:
     }, indent=2)
 
 
-@mcp.tool()
+@_tool
 def render_project(
     output_path: str | None = None,
     file_format: str = "wav",
@@ -3264,7 +3335,7 @@ def _render_failure_message(proc, out_file: Path) -> str:
 _MAX_LISTED_FILES = 20
 
 
-@mcp.tool()
+@_tool
 def list_available_plugins() -> str:
     """List the plugins usable with the installed LMMS.
 
@@ -3328,7 +3399,7 @@ def list_available_plugins() -> str:
     return json.dumps(result, indent=2)
 
 
-@mcp.tool()
+@_tool
 def scan_vst_directory(directory: str, recursive: bool = True) -> str:
     """Scan a folder for VST plugin DLLs (.dll files).
 
@@ -3352,7 +3423,7 @@ def scan_vst_directory(directory: str, recursive: bool = True) -> str:
     }, indent=2)
 
 
-@mcp.tool()
+@_tool
 def add_vst_track(
     name: str,
     dll_path: str,
@@ -3432,7 +3503,7 @@ def add_vst_track(
 # ──────────────────────────────────────────────────────────────────
 
 
-@mcp.tool()
+@_tool
 def assign_sample_file(track_index: int, file_path: str) -> str:
     """Assign an audio file to all clips on a sample track.
 
@@ -3473,7 +3544,7 @@ def assign_sample_file(track_index: int, file_path: str) -> str:
         return json.dumps({"error": str(exc)})
 
 
-@mcp.tool()
+@_tool
 def place_sample_clip(
     track_index: int,
     file_path: str,
@@ -3507,7 +3578,7 @@ def place_sample_clip(
         return json.dumps({"error": str(exc)})
 
 
-@mcp.tool()
+@_tool
 def place_pattern(
     track_index: int,
     pos_bars: float = 0,
@@ -3544,7 +3615,7 @@ def place_pattern(
         return json.dumps({"error": str(exc)})
 
 
-@mcp.tool()
+@_tool
 def place_bb_clip(
     bb_track_index: int,
     pos_bars: float = 0,
@@ -3576,7 +3647,7 @@ def place_bb_clip(
         return json.dumps({"error": str(exc)})
 
 
-@mcp.tool()
+@_tool
 def move_clip(track_index: int, old_pos_bars: float, new_pos_bars: float) -> str:
     """Move a clip (pattern/bbtco/sampleclip) to a new time position.
 
@@ -3598,7 +3669,7 @@ def move_clip(track_index: int, old_pos_bars: float, new_pos_bars: float) -> str
         return json.dumps({"error": str(exc)})
 
 
-@mcp.tool()
+@_tool
 def delete_clip(track_index: int, pos_bars: float) -> str:
     """Delete a clip at a given position from a track.
 
@@ -3614,7 +3685,7 @@ def delete_clip(track_index: int, pos_bars: float) -> str:
         return json.dumps({"error": str(exc)})
 
 
-@mcp.tool()
+@_tool
 def get_arrangement() -> str:
     """Get the full song editor arrangement: all clips sorted by time.
 
@@ -3639,7 +3710,7 @@ def get_arrangement() -> str:
 # ──────────────────────────────────────────────────────────────────
 
 
-@mcp.tool()
+@_tool
 def add_automation(
     target_type: str,
     param: str,
@@ -3728,7 +3799,7 @@ def add_automation(
 # ──────────────────────────────────────────────────────────────────
 
 
-@mcp.tool()
+@_tool
 def set_tempo(bpm: int) -> str:
     """Set the song tempo (BPM).
 
@@ -3748,7 +3819,7 @@ def set_tempo(bpm: int) -> str:
     })
 
 
-@mcp.tool()
+@_tool
 def set_time_signature(numerator: int, denominator: int) -> str:
     """Set the time signature.
 
@@ -3761,7 +3832,7 @@ def set_time_signature(numerator: int, denominator: int) -> str:
     return json.dumps({"message": f"Time signature set to {numerator}/{denominator}"})
 
 
-@mcp.tool()
+@_tool
 def set_master_volume(volume: int) -> str:
     """Set the master volume.
 
@@ -3782,7 +3853,7 @@ def set_master_volume(volume: int) -> str:
     })
 
 
-@mcp.tool()
+@_tool
 def set_master_pitch(pitch: int) -> str:
     """Set the master pitch offset.
 
@@ -3808,7 +3879,7 @@ def set_master_pitch(pitch: int) -> str:
 # ──────────────────────────────────────────────────────────────────
 
 
-@mcp.tool()
+@_tool
 def note_name_to_key(name: str) -> str:
     """Convert a note name (e.g. 'C4') to its LMMS key number.
 
@@ -3831,7 +3902,7 @@ def note_name_to_key(name: str) -> str:
         return json.dumps({"error": str(e)})
 
 
-@mcp.tool()
+@_tool
 def key_to_note_name(key: int) -> str:
     """Convert an LMMS key number to its note name.
 
@@ -3854,7 +3925,7 @@ def key_to_note_name(key: int) -> str:
     })
 
 
-@mcp.tool()
+@_tool
 def bars_to_ticks_converter(bars: int) -> str:
     """Convert bars to ticks (192 ticks per bar in 4/4 time).
 
@@ -3865,7 +3936,7 @@ def bars_to_ticks_converter(bars: int) -> str:
     return json.dumps({"bars": bars, "ticks": ticks, "ticks_per_bar": TICKS_PER_BAR})
 
 
-@mcp.tool()
+@_tool
 def ticks_to_bars_converter(ticks: int) -> str:
     """Convert ticks to bars (192 ticks per bar in 4/4 time).
 
@@ -3876,7 +3947,7 @@ def ticks_to_bars_converter(ticks: int) -> str:
     return json.dumps({"ticks": ticks, "bars": round(bars, 3), "ticks_per_bar": TICKS_PER_BAR})
 
 
-@mcp.tool()
+@_tool
 def generate_scale(
     root_note: str = "C4",
     scale_type: str = "major",
