@@ -8414,3 +8414,400 @@ class TestSettersKeepAutomatedValues:
         ET.SubElement(inst, "vol", {"id": "5", "value": "80"})
         result = lab.load(0, "TripleOscillator/Loud")
         assert "volume 50 (the track keeps 80" in result["note"]
+
+
+class TestLoadProjectErrors:
+    """load_project turns every problem with the file into a JSON error
+    with the reason (an exception reaches the MCP client only as "Error
+    executing tool load_project") and leaves the open project alone."""
+
+    @staticmethod
+    def _open_project():
+        """An open project with a track, to see that failures keep it."""
+        from lmms_mcp import server as srv
+        proj = LMMSProject()
+        proj.new()
+        srv.set_project(proj)
+        srv.add_instrument_track("Keep me")
+        return srv, proj
+
+    @staticmethod
+    def _saved(tmp_path, name):
+        proj = LMMSProject()
+        proj.new()
+        path = tmp_path / name
+        proj.save(str(path))
+        return path
+
+    def _fails(self, srv, path):
+        result = json.loads(srv.load_project(str(path)))
+        assert set(result) == {"error", "path"}, result
+        assert result["path"] == str(path)
+        assert result["error"].startswith(f"Could not load {path}: ")
+        return result["error"]
+
+    def test_missing_file(self, tmp_path):
+        srv, _ = self._open_project()
+        error = self._fails(srv, tmp_path / "nope.mmp")
+        assert "no such file" in error
+        assert "Check the path" in error and "~/" in error
+        assert "does not exist either" not in error
+
+    def test_missing_folder_is_named(self, tmp_path):
+        srv, _ = self._open_project()
+        error = self._fails(srv, tmp_path / "no" / "such" / "x.mmp")
+        assert "no such file" in error
+        assert f"The folder {tmp_path / 'no' / 'such'} does not exist" in error
+
+    @pytest.mark.parametrize("have,ask", [
+        ("song.mmpz", "song.mmp"), ("song.mmp", "song.mmpz"),
+        ("Song.MMPZ", "song.mmp")])
+    def test_other_extension_is_suggested(self, tmp_path, have, ask):
+        srv, _ = self._open_project()
+        self._saved(tmp_path, have)
+        error = self._fails(srv, tmp_path / ask)
+        assert f"A similar file exists: {tmp_path / have}" in error
+        assert "Check the path" not in error
+
+    def test_a_close_name_is_suggested(self, tmp_path):
+        srv, _ = self._open_project()
+        self._saved(tmp_path, "my_song_v2.mmpz")
+        self._saved(tmp_path, "totally-different.mmp")
+        (tmp_path / "notes.txt").write_text("x")
+        error = self._fails(srv, tmp_path / "my_song_v3.mmpz")
+        assert str(tmp_path / "my_song_v2.mmpz") in error
+        assert "totally-different" not in error and "notes.txt" not in error
+
+    def test_relative_name_found_in_the_default_folder(
+            self, monkeypatch, tmp_path):
+        from lmms_mcp import server as srv_mod
+        srv, _ = self._open_project()
+        default = tmp_path / "default"
+        default.mkdir()
+        self._saved(default, "song.mmp")
+        elsewhere = tmp_path / "elsewhere"
+        elsewhere.mkdir()
+        monkeypatch.chdir(elsewhere)
+        monkeypatch.setattr(srv_mod, "DEFAULT_PROJECTS_DIR", str(default))
+        result = json.loads(srv.load_project("song.mmp"))
+        assert result["path"] == "song.mmp"
+        assert f"A similar file exists: {default / 'song.mmp'}" in \
+            result["error"]
+
+    def test_folder(self, tmp_path):
+        srv, _ = self._open_project()
+        folder = tmp_path / "songs"
+        folder.mkdir()
+        self._saved(folder, "a.mmp")
+        self._saved(folder, "b.mmpz")
+        (folder / "readme.txt").write_text("x")
+        error = self._fails(srv, folder)
+        assert "it is a folder, not a project file" in error
+        assert f"{folder / 'a.mmp'}, {folder / 'b.mmpz'}" in error
+        assert "readme.txt" not in error
+
+    def test_empty_folder(self, tmp_path):
+        srv, _ = self._open_project()
+        error = self._fails(srv, tmp_path)
+        assert "it is a folder" in error
+        assert "no .mmp or .mmpz file" in error
+
+    def test_unreadable_file(self, tmp_path):
+        import os
+        srv, _ = self._open_project()
+        path = self._saved(tmp_path, "locked.mmp")
+        path.chmod(0)
+        try:
+            if os.access(path, os.R_OK):
+                pytest.skip("permissions are not enforced (running as root)")
+            error = self._fails(srv, path)
+        finally:
+            path.chmod(0o644)
+        assert "Permission denied" in error
+        assert "permissions" in error
+
+    def test_junk_file(self, tmp_path):
+        srv, _ = self._open_project()
+        path = tmp_path / "junk.mmp"
+        path.write_text("this is not a project")
+        error = self._fails(srv, path)
+        assert "not a valid LMMS project file" in error
+        assert "Cannot parse" not in error  # the path is not named twice
+        assert error.count(str(path)) == 1
+        assert ".mmpz" in error and "corrupt" in error
+
+    def test_truncated_compressed_file(self, tmp_path):
+        srv, _ = self._open_project()
+        good = self._saved(tmp_path, "good.mmpz").read_bytes()
+        path = tmp_path / "cut.mmpz"
+        path.write_bytes(good[: len(good) // 2])
+        assert "not a valid LMMS project file" in self._fails(srv, path)
+
+    @pytest.mark.parametrize("content", [b"", b"abc"])
+    def test_empty_and_tiny_files(self, tmp_path, content):
+        srv, _ = self._open_project()
+        path = tmp_path / "tiny.mmp"
+        path.write_bytes(content)
+        error = self._fails(srv, path)
+        assert "not a valid LMMS project file" in error
+        assert ("(the file is empty)" in error) == (content == b"")
+
+    def test_xml_that_is_not_a_project(self, tmp_path):
+        srv, _ = self._open_project()
+        path = tmp_path / "page.mmp"
+        path.write_text("<html><body/></html>")
+        error = self._fails(srv, path)
+        assert "not a valid LMMS project file" in error
+        assert "<html>" in error and "<lmms-project>" in error
+
+    @pytest.mark.parametrize("make", [
+        lambda tmp: tmp / "nope.mmp",
+        lambda tmp: tmp,
+        lambda tmp: tmp / "junk.mmp",
+    ])
+    def test_the_open_project_is_unchanged_after_a_failure(
+            self, tmp_path, make):
+        srv, proj = self._open_project()
+        proj._modified = True
+        (tmp_path / "junk.mmp").write_text("junk")
+        before = proj.get_xml_string()
+        json.loads(srv.load_project(str(make(tmp_path))))
+        assert srv.get_project() is proj
+        assert proj.get_xml_string() == before
+        assert proj.modified is True
+        assert proj.path is None or proj.path == ""
+        assert json.loads(srv.get_project_info())["track_count"] == 1
+
+    def test_the_path_of_the_open_project_is_kept(self, tmp_path):
+        srv, proj = self._open_project()
+        path = self._saved(tmp_path, "kept.mmp")
+        proj.save(str(path))
+        json.loads(srv.load_project(str(tmp_path / "nope.mmp")))
+        assert srv.get_project() is proj
+        assert proj.path == str(path)
+
+    def test_loading_still_works(self, tmp_path):
+        srv, _ = self._open_project()
+        path = self._saved(tmp_path, "ok.mmpz")
+        result = json.loads(srv.load_project(str(path)))
+        assert "error" not in result
+        assert result["message"] == f"Loaded project from {path}"
+        assert result["track_count"] == 0
+        assert srv.get_project().path == str(path)
+
+    def test_docstring_names_the_errors(self):
+        from lmms_mcp import server as srv
+        doc = srv.load_project.__doc__
+        assert '"error"' in doc and "stays as it was" in doc
+        assert "~" in doc
+
+    def test_parser_accepts_the_old_root_names(self, tmp_path):
+        for tag in ("lmms-project", "multimediaproject", "multimedia-project"):
+            path = tmp_path / f"{tag}.mmp"
+            path.write_text(f"<{tag} version='1.0'><head/></{tag}>")
+            assert load_project(path).tag == tag
+
+    def test_parser_errors(self, tmp_path):
+        (tmp_path / "x.mmp").write_text("<other/>")
+        with pytest.raises(ValueError, match="not a valid LMMS project file"):
+            load_project(tmp_path / "x.mmp")
+        (tmp_path / "short.mmp").write_bytes(b"ab")
+        with pytest.raises(ValueError, match="not a valid LMMS project file"):
+            load_project(tmp_path / "short.mmp")
+        with pytest.raises(FileNotFoundError):
+            load_project(tmp_path / "missing.mmp")
+
+
+class TestTildeExpansion:
+    """A path starting with ~ is in the home folder in every tool that takes
+    a file or folder path (nothing expands it before the server gets it)."""
+
+    @pytest.fixture
+    def home(self, tmp_path, monkeypatch):
+        home = tmp_path / "home"
+        home.mkdir()
+        monkeypatch.setenv("HOME", str(home))
+        monkeypatch.setenv("USERPROFILE", str(home))
+        # relative paths and the default projects folder stay elsewhere
+        elsewhere = tmp_path / "elsewhere"
+        elsewhere.mkdir()
+        monkeypatch.chdir(elsewhere)
+        from lmms_mcp import server as srv
+        monkeypatch.setattr(
+            srv, "DEFAULT_PROJECTS_DIR", str(tmp_path / "default"))
+        return home
+
+    @staticmethod
+    def _new_project():
+        from lmms_mcp import server as srv
+        proj = LMMSProject()
+        proj.new()
+        srv.set_project(proj)
+        return srv, proj
+
+    def test_helper(self, home):
+        from lmms_mcp.server import _expand_user
+        assert _expand_user("~/songs/x.mmp") == str(home / "songs" / "x.mmp")
+        assert _expand_user("~") == str(home)
+        # everything else is unchanged
+        for same in ("drums/kick01.ogg", "/abs/x.wav", "x.mmp", "",
+                     "a/~/b.wav", "~nosuchuser_zzz/x.wav", "C:/x.wav",
+                     "basses\\bass01.ogg"):
+            assert _expand_user(same) == same
+
+    def test_save_project(self, home, tmp_path):
+        srv, proj = self._new_project()
+        result = json.loads(srv.save_project("~/songs/x.mmp"))
+        target = home / "songs" / "x.mmp"
+        assert "error" not in result
+        assert result["path"] == str(target)
+        assert result["created_dirs"] == [str(home / "songs")]
+        assert target.is_file()
+        assert proj.path == str(target)
+        # not a "~" folder under the default projects folder or the cwd
+        assert not (tmp_path / "default").exists()
+        assert not (tmp_path / "elsewhere" / "~").exists()
+
+    def test_save_project_again_after_a_tilde_path(self, home):
+        srv, proj = self._new_project()
+        srv.save_project("~/x.mmpz")
+        result = json.loads(srv.save_project())
+        assert result["path"] == str(home / "x.mmpz")
+
+    def test_load_project(self, home):
+        srv, proj = self._new_project()
+        proj.save(str(home / "song.mmp"))
+        srv.add_instrument_track("Extra")  # differs from the file
+        result = json.loads(srv.load_project("~/song.mmp"))
+        assert "error" not in result
+        assert result["message"] == f"Loaded project from {home / 'song.mmp'}"
+        assert result["track_count"] == 0
+        assert srv.get_project().path == str(home / "song.mmp")
+
+    def test_load_project_error_names_the_expanded_path(self, home):
+        srv, _ = self._new_project()
+        result = json.loads(srv.load_project("~/nope.mmp"))
+        assert result["path"] == str(home / "nope.mmp")
+        assert result["error"].startswith(
+            f"Could not load {home / 'nope.mmp'}: ")
+
+    def test_render_project_output_path(self, home, monkeypatch, tmp_path):
+        srv, calls = TestRenderProjectQuality._setup(monkeypatch, tmp_path)
+        result = json.loads(srv.render_project(output_path="~/out/x.wav"))
+        target = home / "out" / "x.wav"
+        assert result["success"] is True
+        assert result["output_file"] == str(target)
+        assert result["created_dirs"] == [str(home / "out")]
+        cmd = calls[0]
+        assert cmd[cmd.index("-o") + 1] == str(target)
+        assert target.is_file()
+        assert not (tmp_path / "elsewhere" / "~").exists()
+
+    def test_set_audiofile_sample(self, home):
+        srv, proj = self._new_project()
+        srv.add_instrument_track("Kick", instrument="audiofileprocessor")
+        sample = home / "samples" / "hit.wav"
+        sample.parent.mkdir()
+        sample.write_bytes(b"x")
+        result = json.loads(
+            srv.set_audiofile_sample(0, "~/samples/hit.wav"))
+        assert "error" not in result
+        assert result["file"] == str(sample)
+        assert "warning" not in result  # it was looked for where it is
+        assert str(sample) in result["message"]
+        afp = find_tracks(proj.root)[0].find(
+            "instrumenttrack/instrument/audiofileprocessor")
+        assert afp.get("src") == str(sample)
+
+    def test_sample_clip_tools(self, home):
+        srv, proj = self._new_project()
+        srv.add_sample_track("Loop")
+        sample = str(home / "loop.wav")
+        result = json.loads(srv.place_sample_clip(0, "~/loop.wav"))
+        assert result["file"] == sample
+        clips = find_tracks(proj.root)[0].findall("sampleclip")
+        assert [c.get("src") for c in clips] == [sample]
+        other = str(home / "other.wav")
+        result = json.loads(srv.assign_sample_file(0, "~/other.wav"))
+        assert result["file"] == other
+        assert [c.get("src") for c in
+                find_tracks(proj.root)[0].findall("sampleclip")] == [other]
+
+    def test_factory_relative_sample_paths_stay_relative(
+            self, home, monkeypatch, tmp_path):
+        from lmms_mcp import lmms_app
+        samples = tmp_path / "factory"
+        (samples / "drums").mkdir(parents=True)
+        (samples / "drums" / "kick01.ogg").write_bytes(b"x")
+        monkeypatch.setattr(lmms_app, "get_samples_dir", lambda: samples)
+        # a folder of the same name in the home folder changes nothing
+        (home / "drums").mkdir()
+        (home / "drums" / "kick01.ogg").write_bytes(b"x")
+        srv, proj = self._new_project()
+        srv.add_instrument_track("Kick", instrument="audiofileprocessor")
+        srv.add_sample_track("Loop")
+        result = json.loads(
+            srv.set_audiofile_sample(0, "drums/kick01.ogg"))
+        assert result["file"] == "drums/kick01.ogg"
+        assert "warning" not in result
+        afp = find_tracks(proj.root)[0].find(
+            "instrumenttrack/instrument/audiofileprocessor")
+        assert afp.get("src") == "drums/kick01.ogg"
+        assert json.loads(srv.place_sample_clip(
+            1, "drums/kick01.ogg"))["file"] == "drums/kick01.ogg"
+        assert json.loads(srv.assign_sample_file(
+            1, "drums/kick01.ogg"))["file"] == "drums/kick01.ogg"
+        sc = find_tracks(proj.root)[1].findall("sampleclip")
+        assert {c.get("src") for c in sc} == {"drums/kick01.ogg"}
+
+    def test_set_instrument_file(self, home):
+        srv, proj = self._new_project()
+        srv.add_instrument_track("Flute", instrument="patman")
+        pat = home / "flute.pat"
+        pat.write_bytes(b"")
+        result = json.loads(srv.set_instrument_file(0, "~/flute.pat"))
+        assert "error" not in result, result
+        assert result["file"] == str(pat)
+
+    def test_vst_tools(self, home):
+        srv, proj = self._new_project()
+        vst = home / "vst" / "Synth.dll"
+        vst.parent.mkdir()
+        vst.write_bytes(b"MZ")
+        scanned = json.loads(srv.scan_vst_directory("~/vst"))
+        assert "error" not in scanned
+        assert scanned["directory"] == str(home / "vst")
+        assert [p["path"] for p in scanned["plugins"]] == [str(vst)]
+        added = json.loads(srv.add_vst_track("Lead", "~/vst/Synth.dll"))
+        assert "error" not in added, added
+        assert added["vst"] == str(vst)
+
+    def test_load_zyn_preset(self, home):
+        srv, proj = self._new_project()
+        srv.add_instrument_track("Z", instrument="zynaddsubfx")
+        (home / "my.xiz").write_bytes(
+            TestLoadZynPresetReport._xiz("From Home"))
+        result = json.loads(srv.load_zyn_preset(0, "~/my.xiz"))
+        assert "error" not in result, result
+        assert result["file"] == str(home / "my.xiz")
+        assert result["requested"] == "~/my.xiz"
+        assert result["internal_name"] == "From Home"
+
+    def test_load_instrument_preset(self, lab, tmp_path, monkeypatch):
+        monkeypatch.setenv("HOME", str(tmp_path))
+        monkeypatch.setenv("USERPROFILE", str(tmp_path))
+        lab.put("TripleOscillator/Home.xpf", _xpf("Home"))
+        result = lab.load(0, "~/presets/TripleOscillator/Home.xpf")
+        assert "error" not in result, result
+        assert result["file"] == str(
+            tmp_path / "presets" / "TripleOscillator" / "Home.xpf")
+
+    def test_docstrings_mention_the_tilde(self):
+        from lmms_mcp import server as srv
+        for tool in (
+                srv.save_project, srv.load_project, srv.render_project,
+                srv.set_audiofile_sample, srv.set_instrument_file,
+                srv.place_sample_clip, srv.assign_sample_file,
+                srv.add_vst_track, srv.scan_vst_directory,
+                srv.load_zyn_preset, srv.load_instrument_preset):
+            assert "~" in tool.__doc__, tool.__name__

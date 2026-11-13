@@ -5,6 +5,7 @@ manipulating LMMS projects programmatically via the Model Context Protocol.
 """
 
 import copy
+import difflib
 import errno
 import json
 import math
@@ -50,6 +51,18 @@ DEFAULT_PROJECTS_DIR = os.environ.get(
     "LMMS_PROJECTS_DIR",
     str(Path.home() / "Desktop" / "Media" / "lmms" / "AI-Projects"),
 )
+
+
+def _expand_user(path):
+    """Expand a leading "~" (or "~name") in a file or folder path to the
+    home folder, like a shell does; anything else is returned unchanged.
+
+    Every tool that takes a file or folder path runs it through here first
+    (tool arguments reach the server as typed, no shell expands them).
+    Paths that do not start with "~", such as the factory sample
+    "drums/kick01.ogg", stay as they are.
+    """
+    return os.path.expanduser(path) if isinstance(path, str) else path
 
 # Real LMMS built-in instrument plugin names (as used in the XML
 # <instrument name="..."> attribute). Verified against LMMS source.
@@ -648,9 +661,94 @@ def create_project(
     })
 
 
+_PROJECT_SUFFIXES = (".mmp", ".mmpz")
+
+
+def _project_files_in(folder: Path, limit: int = 20) -> list[Path]:
+    """The .mmp / .mmpz files directly in a folder, by name ([] when the
+    folder cannot be listed)."""
+    try:
+        found = sorted(
+            f for f in folder.iterdir()
+            if f.suffix.lower() in _PROJECT_SUFFIXES and f.is_file())
+    except OSError:
+        return []
+    return found[:limit]
+
+
+def _missing_project_hint(path: Path) -> str:
+    """What to try when a project file does not exist: the project files
+    with a similar name (the other extension, other case, a close
+    spelling) in the same folder, or the same relative path in the
+    default projects folder (where save_project puts it), or that the
+    folder itself is missing."""
+    folder = path.parent
+    own = [f for f in _project_files_in(folder) if f != path]
+    same_stem = [f for f in own if f.stem.lower() == path.stem.lower()]
+    close_names = difflib.get_close_matches(
+        path.name.lower(), [f.name.lower() for f in own], n=3, cutoff=0.6)
+    similar = same_stem + [
+        f for f in own
+        if f.name.lower() in close_names and f not in same_stem]
+    if not path.is_absolute():
+        in_default = Path(DEFAULT_PROJECTS_DIR) / path
+        if in_default.is_file():
+            similar.append(in_default)
+    if similar:
+        listed = ", ".join(str(f) for f in similar[:3])
+        return (f" A similar file exists: {listed}. Pass that path if it "
+                f"is the project you meant.")
+    where = ("" if folder.is_dir()
+             else f" The folder {folder} does not exist either.")
+    return (f"{where} Check the path (use an absolute path, or one "
+            f"starting with ~/).")
+
+
+def _load_error(path: str, exc: Exception) -> dict:
+    """The {"error", "path"} response of a project file that could not be
+    loaded, with the reason and what to try."""
+    where = Path(path)
+    if isinstance(exc, FileNotFoundError):
+        reason = f"no such file.{_missing_project_hint(where)}"
+    elif isinstance(exc, IsADirectoryError):
+        files = _project_files_in(where, limit=5)
+        reason = "it is a folder, not a project file."
+        if files:
+            reason += (" Project files in it: "
+                       f"{', '.join(str(f) for f in files)}.")
+        else:
+            reason += (" It has no .mmp or .mmpz file; pass the path of "
+                       "the project file itself.")
+    elif isinstance(exc, PermissionError):
+        reason = (f"{_os_error_reason(exc, path)}. The file or its folder "
+                  f"cannot be read by this server; fix the permissions or "
+                  f"load a copy.")
+    elif isinstance(exc, ValueError):
+        # xml_parser.load_project: "Cannot parse <path>: <why>".
+        reason = str(exc).removeprefix(f"Cannot parse {where}: ")
+        try:
+            if where.stat().st_size == 0:
+                reason += " (the file is empty)"
+        except OSError:
+            pass
+        reason += (". LMMS projects are .mmp (plain XML) or .mmpz "
+                   "(compressed) files; the file may be corrupt or "
+                   "another format.")
+    else:
+        reason = _os_error_reason(exc, path)
+    return {"error": f"Could not load {path}: {reason}", "path": path}
+
+
 @mcp.tool()
 def load_project(path: str) -> str:
     """Load an existing LMMS project file (.mmpz or .mmp).
+
+    If the file cannot be loaded the response is {"error": ..., "path":
+    ...} with the reason (no such file, a folder instead of a file, no
+    permission, not an LMMS project file), and the project that was open
+    stays as it was. When the file does not exist the error lists project
+    files with a similar name (e.g. the same name with the other extension
+    .mmp / .mmpz, or the file in the default projects folder).
 
     A project that uses the mixer names of another LMMS than the installed
     one is converted: LMMS 1.2 ignores the names of LMMS 1.3 (a project an
@@ -663,10 +761,16 @@ def load_project(path: str) -> str:
     channel); set_track_mixer_channel routes them to a channel that exists.
 
     Args:
-        path: Full path to the LMMS project file
+        path: Full path to the LMMS project file (a path starting with ~
+            is expanded to the home folder)
     """
+    path = _expand_user(path)
     proj = LMMSProject()
-    proj.load(path)
+    try:
+        proj.load(path)
+    except (OSError, ValueError) as exc:
+        # The open project is untouched: set_project only runs below.
+        return json.dumps(_load_error(path, exc))
     converted = _convert_mixer(proj, _availability)
     set_project(proj)
     info = proj.get_info()
@@ -823,13 +927,15 @@ def save_project(
         path: File path to save to. If empty, saves to the default projects directory.
             If only a filename is given (e.g. "song.mmpz"), it's saved in the default directory.
             A relative path with folders (e.g. "songs/jazz/take1.mmp") is
-            created under the default directory.
+            created under the default directory. A path starting with ~
+            (e.g. "~/songs/take1.mmp") is in the home folder.
         compressed: If True, saves as .mmpz (compressed). If False, saves as .mmp
             (plain XML). By default (None) the format follows the file extension:
             ".mmp" is always plain XML, everything else compressed. Writing
             compressed data into a .mmp breaks LMMS and other tools.
     """
     proj = get_project()
+    path = _expand_user(path)
 
     if not path and not proj.path:
         save_path = str(Path(DEFAULT_PROJECTS_DIR) / "untitled.mmpz")
@@ -1138,7 +1244,8 @@ def set_audiofile_sample(
     Paths: a relative path is resolved by LMMS against its factory
     samples folder, e.g. "drums/kick_hiphop01.ogg", "drums/snare01.ogg",
     "drums/hihat_closed02.ogg", "basses/bass01.ogg". Use an absolute path
-    for your own files (WAV/OGG/FLAC/MP3). If the file cannot be found
+    (or one starting with ~/) for your own files (WAV/OGG/FLAC/MP3). If
+    the file cannot be found
     the response contains a "warning" (the sample is still set).
 
     Pitch: the sample sounds at its original pitch when the note equals
@@ -1161,7 +1268,8 @@ def set_audiofile_sample(
 
     Args:
         track_index: Zero-based index of the audiofileprocessor track
-        file_path: Sample path, relative to LMMS factory samples or absolute
+        file_path: Sample path, relative to LMMS factory samples, or
+            absolute (a path starting with ~ is in the home folder)
         amp: Amplification in percent (0-500, 100=unchanged)
         reversed: Play the sample backwards
         looped: 0=off (one-shot), 1=loop, 2=ping-pong loop
@@ -1175,6 +1283,7 @@ def set_audiofile_sample(
             that is 18 cents flat). Omit to leave it alone.
     """
     proj = get_project()
+    file_path = _expand_user(file_path)
     inst_track = proj._instrument_track_element(track_index) \
         if isinstance(track_index, int) else None
     previous = None if inst_track is None else inst_track.find(
@@ -1228,8 +1337,9 @@ def set_instrument_file(
     These instruments are silent without a file. Create the track with
     add_instrument_track, call this on it, then play it with add_note /
     add_notes_batch. Calling it again replaces the file and sound. Use an
-    absolute path to an existing file; list_available_plugins shows the
-    files found on this machine under "instrument_files". (For an
+    absolute path (or one starting with ~/) to an existing file;
+    list_available_plugins shows the files found on this machine under
+    "instrument_files". (For an
     audiofileprocessor track use set_audiofile_sample instead.)
 
     $FILE_DETAILS
@@ -1239,7 +1349,8 @@ def set_instrument_file(
 
     Args:
         track_index: Zero-based index of the instrument track
-        file_path: Absolute path of the file
+        file_path: Absolute path of the file (a path starting with ~ is in
+            the home folder)
         bank: Bank number 0-999 (0 = melodic sounds)
         patch: Patch / program number 0-127
     """
@@ -1249,6 +1360,7 @@ def set_instrument_file(
         n for n in lmms_app.FILE_INSTRUMENTS
         if n in av.instruments or n in av.needs_file
     ]
+    file_path = _expand_user(file_path)
     try:
         info = xml_parser.set_instrument_file(
             proj.root, track_index, file_path, bank=bank, patch=patch,
@@ -2350,10 +2462,11 @@ def load_zyn_preset(track_index: int, preset: str) -> str:
     Args:
         track_index: Index of the target track
         preset: "Category/Name", plain name, "0034-Name" or absolute path
+            (a path starting with ~ is in the home folder)
     """
     proj = get_project()
     try:
-        preset_xml, match = zyn_presets.load_preset(preset)
+        preset_xml, match = zyn_presets.load_preset(_expand_user(preset))
         result = xml_parser.embed_zyn_preset(
             proj.root, track_index, preset_xml, match.name
         )
@@ -2666,6 +2779,7 @@ def load_instrument_preset(
             "TripleOscillator/AmazingBubbles"; the folder is the
             instrument), a plain name ("Amazing Bubbles"; case, spaces and
             "-" "_" do not matter), or an absolute path to an .xpf file
+            (a path starting with ~ is in the home folder)
         name: Name of the new track (track_index null), default the
             preset's own name; on an existing track it renames the track
         rename: Give an existing track the preset's own name
@@ -2693,7 +2807,8 @@ def load_instrument_preset(
             return json.dumps({"error": error})
 
     try:
-        match = inst_presets.find_preset(preset, _canonical_instrument)
+        match = inst_presets.find_preset(
+            _expand_user(preset), _canonical_instrument)
         loaded = inst_presets.read_preset(match.path)
     except inst_presets.PresetNotFoundError as exc:
         return json.dumps({"error": str(exc), "suggestions": exc.suggestions})
@@ -2989,7 +3104,7 @@ def render_project(
 
     Args:
         output_path: Output file path (default: <project>.wav in the
-            same directory)
+            same directory); a path starting with ~ is in the home folder
         file_format: "wav", "flac", "ogg" or "mp3"
         samplerate: Sample rate in Hz (44100, 48000, ...)
         bitrate: Bitrate in kbit/s for lossy formats (ogg/mp3)
@@ -3035,6 +3150,7 @@ def render_project(
     proj_path = Path(proj.path)
     if output_path is None:
         output_path = str(proj_path.with_suffix(f".{fmt}"))
+    output_path = _expand_user(output_path)
 
     # Save current state before rendering. Keep the compression format
     # consistent with the file extension - compressed bytes inside a
@@ -3217,9 +3333,11 @@ def scan_vst_directory(directory: str, recursive: bool = True) -> str:
     """Scan a folder for VST plugin DLLs (.dll files).
 
     Args:
-        directory: Path to scan (e.g. "C:/VSTPlugins")
+        directory: Path to scan (e.g. "C:/VSTPlugins"; a path starting with
+            ~ is in the home folder)
         recursive: Include subdirectories
     """
+    directory = _expand_user(directory)
     try:
         plugins = lmms_app.find_vst_plugins(directory, recursive)
     except ValueError as exc:
@@ -3249,7 +3367,8 @@ def add_vst_track(
 
     Args:
         name: Track name (e.g. "Spire Lead")
-        dll_path: Absolute path to the VST .dll file
+        dll_path: Absolute path to the VST .dll file (a path starting with
+            ~ is in the home folder)
         mixer_channel: Mixer channel number (0=Master). The channel must
             exist (add_mixer_channel creates one).
         volume: Track volume (0-200)
@@ -3264,6 +3383,7 @@ def add_vst_track(
                        "add_instrument_track with an available instrument.",
             "available_instruments": _instrument_choices(av),
         })
+    dll_path = _expand_user(dll_path)
     path = Path(dll_path)
     if not path.is_file():
         return json.dumps({
@@ -3317,13 +3437,15 @@ def assign_sample_file(track_index: int, file_path: str) -> str:
     """Assign an audio file to all clips on a sample track.
 
     Use relative paths for LMMS's built-in samples (e.g.
-    "drums/kick01.ogg") or absolute paths for your own files.
+    "drums/kick01.ogg") or absolute paths for your own files (a path
+    starting with ~ is in the home folder).
 
     Args:
         track_index: Index of the sample track
         file_path: Audio file path (WAV/OGG/MP3/FLAC)
     """
     proj = get_project()
+    file_path = _expand_user(file_path)
     try:
         track = xml_parser.find_track_element(proj.root, track_index)
         if xml_parser.get_track_type(track) != 2:
@@ -3362,11 +3484,13 @@ def place_sample_clip(
 
     Args:
         track_index: Index of the sample track
-        file_path: Audio file path (relative to LMMS samples or absolute)
+        file_path: Audio file path (relative to LMMS samples, or absolute;
+            a path starting with ~ is in the home folder)
         pos_bars: Start position in bars (0 = beginning)
         length_bars: Clip length in bars
     """
     proj = get_project()
+    file_path = _expand_user(file_path)
     pos = bars_to_ticks(pos_bars)
     length = bars_to_ticks(length_bars)
     try:

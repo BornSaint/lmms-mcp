@@ -416,34 +416,51 @@ def load_project(path: str | Path) -> ET.Element:
 
     .mmpz files use Qt's qCompress format: 4-byte big-endian length header + zlib.
     We try plain XML first, then qUncompress, then raw zlib.
+
+    Raises OSError when the file cannot be read (missing, a folder, no
+    permission, ...) and ValueError ("Cannot parse <path>: not a valid
+    LMMS project file ...") when its content is not an LMMS project.
     """
     path = Path(path)
     raw = path.read_bytes()
 
+    root = _parse_project_bytes(raw)
+    if root is None:
+        raise ValueError(f"Cannot parse {path}: not a valid LMMS project file")
+    if root.tag not in PROJECT_ROOT_TAGS:
+        raise ValueError(
+            f"Cannot parse {path}: not a valid LMMS project file (it is "
+            f"XML, but its root element is <{root.tag}>, not "
+            f"<lmms-project>)"
+        )
+    return root
+
+
+# Root elements of an LMMS project file (older LMMS versions used the
+# multimedia names).
+PROJECT_ROOT_TAGS = ("lmms-project", "multimediaproject", "multimedia-project")
+
+
+def _parse_project_bytes(raw: bytes) -> ET.Element | None:
+    """The XML of a project file's bytes (plain, qCompress or raw zlib), or
+    None when they are none of these."""
     # Try plain XML first (.mmp files)
     try:
-        root = ET.fromstring(raw)
-        return root
+        return ET.fromstring(raw)
     except ET.ParseError:
         pass
 
     # Try Qt's qCompress format (4-byte header + zlib)
     try:
-        decompressed = _q_uncompress(raw)
-        root = ET.fromstring(decompressed)
-        return root
-    except (struct.error, zlib.error, ET.ParseError):
+        return ET.fromstring(_q_uncompress(raw))
+    except (struct.error, zlib.error, ET.ParseError, ValueError):
         pass
 
     # Try raw zlib (no header)
     try:
-        decompressed = zlib.decompress(raw)
-        root = ET.fromstring(decompressed)
-        return root
+        return ET.fromstring(zlib.decompress(raw))
     except (zlib.error, ET.ParseError):
-        pass
-
-    raise ValueError(f"Cannot parse {path}: not a valid LMMS project file")
+        return None
 
 
 def save_project(path: str | Path, root: ET.Element, compressed: bool = True) -> None:
