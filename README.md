@@ -91,14 +91,14 @@ python -m lmms_mcp
 | `create_project` | Create a new empty LMMS project |
 | `load_project` | Load an existing `.mmpz` or `.mmp` file. A relative path is relative to the default projects folder (`LMMS_PROJECTS_DIR`), like in `save_project`, so the name you saved with loads that file again; if it is not there but exists in the server's working folder, that file is loaded and the response has a `note` (if it exists in both, the default folder's file is loaded and the `note` names the other). The response has the absolute `path` that was loaded |
 | `save_project` | Save the current project. A relative path is relative to the default projects folder (`LMMS_PROJECTS_DIR`). Missing folders in the path are created (listed as `created_dirs`); if the file cannot be written the response is a JSON error with the reason |
-| `get_project_info` | Get project overview (tempo, tracks, mixer) |
+| `get_project_info` | Get project overview (tempo, tracks, mixer) and an estimate of the mix peak before any render: `estimated_mix_peak_dbfs` with its `estimate_range_dbfs`, the `loudest_bar` and the `unknown_level_tracks` (see [Loudness before the first render](#loudness-before-the-first-render)) |
 | `get_project_xml` | Get raw XML of the project |
 
 ### Track Operations
 
 | Tool | Description |
 |------|-------------|
-| `add_instrument_track` | Add a synthesizer/sampler track |
+| `add_instrument_track` | Add a synthesizer/sampler track; the response has `level_at_vol_100`, how loud the instrument is (see [Loudness before the first render](#loudness-before-the-first-render)) |
 | `add_sample_track` | Add an audio sample track |
 | `set_audiofile_sample` | Set the sample (and amp, reverse, loop, start/end) of an `audiofileprocessor` track; optional `base_note` / `pitch_cents` tune it in the same call |
 | `set_track_tuning` | Tune an instrument track: `base_note` (the note a sample was recorded at, e.g. `"C4"`) and a `pitch_cents` fine tune; without arguments it returns the current tuning |
@@ -156,7 +156,7 @@ Only offered when the installed LMMS has the `zynaddsubfx` plugin.
 | Tool | Description |
 |------|-------------|
 | `list_zyn_presets` | Browse ~950 factory presets (.xiz) by category |
-| `load_zyn_preset` | Load a preset into a zynaddsubfx track |
+| `load_zyn_preset` | Load a preset into a zynaddsubfx track (the response has `level_at_vol_100`) |
 | `set_zyn_params` | Set portamento, filter, FM gain, resonance etc. |
 
 ### Instrument Presets (.xpf)
@@ -164,7 +164,7 @@ Only offered when the installed LMMS has the `zynaddsubfx` plugin.
 | Tool | Description |
 |------|-------------|
 | `list_instrument_presets` | Overview of the available presets per instrument (count and a few examples), or all presets of one instrument |
-| `load_instrument_preset` | Load a preset into an instrument track (or create the track from it with `track_index=null`) |
+| `load_instrument_preset` | Load a preset into an instrument track (or create the track from it with `track_index=null`); the response has `level_at_vol_100` |
 
 ### Arrangement (Song Editor Timeline)
 
@@ -514,6 +514,61 @@ at `-x 1` on all 15 factory OpulenZ presets: 13 sound at the key (key 57 =
 441 Hz) as stored, `Funky` and `Combo_organ` an octave low and are
 compensated (base note 45), and `Bubbly_days` has a ×0.5 modulator that is
 too quiet to be heard as the pitch.
+
+## Loudness before the first render
+
+Instruments differ a lot in loudness: at track volume 100 a plain
+`tripleoscillator` track peaks at -2.7 dBFS (and a chord of it at +8.8, LMMS
+does not limit its output), a plain `zynaddsubfx` one at -28 dBFS. An agent
+that does not know this gets a clipping or buried mix and has to render,
+measure and fix it. So the tools that set a sound (`add_instrument_track`,
+`load_zyn_preset`, `load_instrument_preset`, `set_audiofile_sample`,
+`set_instrument_file`) report how loud it is, at track volume 100:
+
+```json
+"level_at_vol_100": {"note_peak_dbfs": -2.7, "chord_peak_dbfs": 8.8,
+                     "rms_dbfs": -7.9, "source": "seed"}
+```
+
+`note_peak_dbfs` is the peak of one note (key 57, velocity 100, one beat),
+`chord_peak_dbfs` that of a four-note chord (keys 48, 52, 55, 60) and
+`rms_dbfs` the RMS while the note is held; all in dBFS of a 32-bit float
+render with no effects and Master at 100. The peaks are the loudest of three
+tries at different places of a song (some presets change by a few dB with the
+song position, ZynAddSubFX starts its notes at random phases). Track volume
+V changes a level by 20 * log10(V / 100) dB.
+
+`source` says where the level comes from: `seed` (measured beforehand with LMMS
+1.2.2 for every instrument at its default settings, `levels.SEED_LEVELS`: a
+plain `add_instrument_track` never renders), `cache` (measured before,
+here or in an earlier session) or `measured` (rendered now, about 1 s, the
+first time a preset, sample or soundfont patch is used). What identifies a
+sound is its instrument and settings, preset data, sample / soundfont file
+(size and modification time), bank and patch, envelope, chord and arpeggio
+settings and the LMMS version; the cache is
+`${XDG_CACHE_HOME:-~/.cache}/lmms-mcp/levels.json` and a damaged file is
+rebuilt. Nothing is written into the project. If a level cannot be measured
+(no LMMS, a timeout) the field is left out and a `note` says so; the tool does
+not fail. `LMMS_MCP_MEASURE_LEVELS=0` forbids the measuring renders (seed and
+cache are still used). `bitinvader` and `watsyn` tracks without settings
+(what `add_instrument_track` writes) play garbage in LMMS 1.2.2, so they have
+no level.
+
+`get_project_info` adds the levels up for the project, bar by bar: each track
+with notes in the bar counts with its single-note peak (its chord peak when 2
+or more notes sound together) plus its track volume, the velocity of its
+loudest note, its mixer channel's volume and sends, and the song and Master
+volumes. The tracks are added two ways: as power (peaks that never meet) and as
+amplitude (every peak at the same instant). `estimate_range_dbfs` is
+`[power, amplitude]` for the loudest bar and `estimated_mix_peak_dbfs` its
+midpoint in dB. The real peak is in between, nearer the middle than the power
+sum, because tracks that play on the same beat (kick and hat) add almost as
+amplitude: on 4 test mixes of 6 tracks the midpoint was within +2.1 / -1.1 dB
+of the rendered peak, while the power sum alone read up to 4.3 dB too low. The response also has the
+`loudest_bar` (0-based) with the peak of each of its tracks, and the
+`unknown_level_tracks` (sample tracks and sounds whose level is not known) that
+are left out. Effects and automation are not included: it is an estimate, and
+`render_project` measures the real level.
 
 ## Available Instruments
 
@@ -882,6 +937,7 @@ Shapes: `linear` (no change (the LMMS default)); `soft_clip` (tanh saturation, a
 | `LMMS_PROJECTS_DIR` | `~/Desktop/Media/lmms/AI-Projects` | Default directory for projects: where `save_project` saves when no path is given, and what relative paths of `save_project`, `load_project` and `render_project`'s `output_path` are relative to |
 | `LMMS_PRESETS_DIR` | auto-detected | Path to the ZynAddSubFX presets folder (`data/presets/ZynAddSubFX`) or its parent presets folder |
 | `LMMS_PRESET_DIRS` | none | Extra folders (separated by `:` on Linux, `;` on Windows) with instrument presets (`.xpf`), searched before your LMMS presets folder and the factory presets |
+| `LMMS_MCP_MEASURE_LEVELS` | `1` | `0` forbids the short LMMS renders that measure how loud a preset, sample or soundfont is (see [Loudness before the first render](#loudness-before-the-first-render)); the built-in levels and the cache are still used |
 | `LMMS_EXECUTABLE` | auto-detected | Path to the LMMS executable (`lmms.exe` / `lmms`) (for version/plugin checks and rendering) |
 | `LMMS_PLUGINS_DIR` | auto-detected | LMMS plugins folder (overrides detection; `*.dll` on Windows, `lib<name>.so` on Linux) |
 

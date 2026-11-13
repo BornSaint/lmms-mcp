@@ -28,8 +28,10 @@ from . import audio_analysis
 from . import effect_params
 from . import effects as effects_mod
 from . import instrument_presets as inst_presets
+from . import levels
 from . import lmms_app
 from . import mix_analysis
+from . import mix_estimate
 from . import pitch
 from . import presets as zyn_presets
 from . import xml_parser
@@ -600,6 +602,17 @@ is compensated for you."""
     )
 
     blocks.append(
+        "Loudness: instruments differ by 30 dB or more, so set track "
+        "volumes before the first render. Adding an instrument track and "
+        "every tool that gives it a sound (a preset, a sample, a "
+        "soundfont) return level_at_vol_100, how loud that sound is at "
+        "track volume 100 in dBFS (volume V changes it by 20*log10(V/100) "
+        "dB), and get_project_info estimates the mix peak "
+        "(estimated_mix_peak_dbfs) from them, so a peak above 0 can be "
+        "fixed with set_track_volume before rendering."
+    )
+
+    blocks.append(
         f"""Default projects directory: {projects_dir}
 When saving a project, use this directory if no specific path is given.
 Example: save to {projects_dir}/my_song.mmpz
@@ -1150,10 +1163,27 @@ def get_project_info() -> str:
     """Get comprehensive information about the current LMMS project.
 
     Returns tempo, time signature, tracks, mixer channels, and more.
+
+    It also estimates the loudness of the mix before any render, from the
+    "level_at_vol_100" of each instrument sound (see add_instrument_track),
+    the notes, track volumes, note velocities, mixer channel and Master
+    volumes: "estimated_mix_peak_dbfs" of the loudest bar, the midpoint in
+    dB of "estimate_range_dbfs" = [tracks added as power (peaks that never
+    meet), tracks added as amplitude (every peak at the same instant)];
+    the real peak lies in between, near the middle when tracks play on the
+    same beat. Also "loudest_bar" (0-based) with its "loudest_bar_tracks"
+    (peak of each, loudest first), "unknown_level_tracks" (sample tracks and
+    sounds whose level is not known, left out) and "estimate_basis". A peak
+    above 0 means clipping: lower track volumes (20*log10(V/100) dB) before
+    rendering. It is an estimate: effects and automation are not included,
+    and render_project gives the real level.
     """
     proj = get_project()
     info = proj.get_info()
-    return json.dumps(info.to_dict(), indent=2)
+    data = info.to_dict()
+    data.update(mix_estimate.estimate(
+        proj.root, lambda track: _project_levels(proj, track)))
+    return json.dumps(data, indent=2)
 
 
 @_tool
@@ -1169,6 +1199,65 @@ def get_project_xml() -> str:
 # ──────────────────────────────────────────────────────────────────
 # TRACK TOOLS
 # ──────────────────────────────────────────────────────────────────
+
+
+# ──────────────────────────────────────────────────────────────────
+# LEVELS: how loud a sound is at track volume 100 (see levels.py)
+# ──────────────────────────────────────────────────────────────────
+
+
+def _render_for_levels(project_path: Path, output: Path) -> None:
+    """levels.Render: render the measuring project as a float wav (-x 1,
+    private config, one LMMS at a time); LevelError when that fails."""
+    import subprocess
+    exe = lmms_app.find_lmms_exe()
+    if exe is None:
+        raise levels.LevelError("LMMS was not found")
+    try:
+        proc, _ = _run_lmms_render(
+            exe, project_path, output, "wav", levels.RENDER_SAMPLERATE, 160,
+            1, "sincfastest", float_output=True,
+            timeout=levels.RENDER_TIMEOUT)
+    except subprocess.TimeoutExpired:
+        raise levels.LevelError(
+            f"LMMS did not finish within {levels.RENDER_TIMEOUT} s")
+    except OSError as exc:
+        raise levels.LevelError(f"LMMS could not be started: {exc}")
+    if proc.returncode != 0 or not output.is_file():
+        reason = _render_failure_message(proc, output).splitlines()[0]
+        raise levels.LevelError(reason[:200])
+
+
+def _add_level(
+    result: dict, proj, inst_track: ET.Element | None, measure: bool = True,
+) -> None:
+    """Add "level_at_vol_100" to a tool response: how loud the track's sound
+    is at track volume 100, from the seed, the cache or (when `measure`, the
+    first time, about 1 s) a render of the sound. When it cannot be measured
+    (no LMMS, a timeout, a silent sound) the field is left out and a short
+    "note" says why: a level never makes the tool fail."""
+    if inst_track is None:
+        return
+    try:
+        found = levels.resolve_level(
+            inst_track, _availability.version, proj.level_table,
+            render=_render_for_levels if measure else None)
+    except levels.LevelError as exc:
+        note = (f"The level of this sound could not be measured ({exc}); "
+                f"render_project shows how loud it is.")
+        result["note"] = f"{result['note']} {note}" if result.get("note") \
+            else note
+        return
+    if found is not None:
+        level, source = found
+        result["level_at_vol_100"] = level.to_dict(source)
+
+
+def _project_levels(proj, inst_track: ET.Element) -> levels.Level | None:
+    """The known level of a track's sound (no render), or None."""
+    found = levels.find_level(
+        inst_track, _availability.version, proj.level_table)
+    return None if found is None else found[0]
 
 
 def _add_instrument(
@@ -1210,6 +1299,11 @@ def _add_instrument(
             result.update(
                 _start_file_instrument(proj, result["track_index"], instrument, av)
             )
+    # The seed (or the cache) answers; a plugin without a seed (another LMMS
+    # version) is rendered once. A custom plugin is never rendered here: an
+    # unknown plugin could take the whole timeout.
+    _add_level(result, proj, proj._instrument_track_element(
+        result["track_index"]), measure=not custom)
     return result
 
 
@@ -1289,6 +1383,18 @@ def add_instrument_track(
     instruments excepted). When the instrument does not play all keys
     0-108 at the right pitch, the response has "playable_keys": [lowest,
     highest]; add_note warns about notes outside.
+
+    Loudness: the response has "level_at_vol_100", how loud this
+    instrument is at track volume 100 in dBFS (a 32-bit float render, so a
+    peak can be above 0): "note_peak_dbfs" (one note, key 57, velocity 100),
+    "chord_peak_dbfs" (a 4-note chord), "rms_dbfs" (while the note is held)
+    and "source": "seed" (measured beforehand), "cache" or "measured"
+    (rendered now, about 1 s, the first time only; the env var
+    LMMS_MCP_MEASURE_LEVELS=0 forbids that). Use it to set track volumes
+    before the first render: volume V changes it by 20*log10(V/100) dB, and
+    get_project_info adds the tracks up as "estimated_mix_peak_dbfs". The
+    field is left out when the level is unknown (a sampler without its file;
+    a "note" says when LMMS could not measure it).
 
     $FILE_NOTE
     """
@@ -1429,6 +1535,11 @@ def set_audiofile_sample(
     length at least as long as the sample (24 ticks is enough for most
     short hits; use 48+ for open hats, crashes and other long samples).
 
+    Loudness: the response has "level_at_vol_100", how loud the sample is
+    at track volume 100 in dBFS (see add_instrument_track). The first time
+    a sample is set it is measured with a short render (about 1 s) and
+    cached, so choose the track volume by it, not by trial renders.
+
     Args:
         track_index: Zero-based index of the audiofileprocessor track
         file_path: Sample path, relative to LMMS factory samples, or
@@ -1485,6 +1596,8 @@ def set_audiofile_sample(
                 f"with set_track_tuning({track_index}, base_note=57, "
                 f"pitch_cents=0)."
             )
+    # a sample that was not found plays nothing: nothing to measure
+    _add_level(result, proj, inst_track, measure="warning" not in result)
     return json.dumps(result)
 
 
@@ -1509,6 +1622,11 @@ def set_instrument_file(
 
     A soundfont must contain the bank/patch asked for, otherwise the call
     fails and lists the banks and patches the file has.
+
+    The response has "level_at_vol_100", how loud this sound is at track
+    volume 100 in dBFS (see add_instrument_track); the first time a
+    file/bank/patch is used it is measured with a short render (about 1 s)
+    and cached.
 
     Args:
         track_index: Zero-based index of the instrument track
@@ -1537,12 +1655,14 @@ def set_instrument_file(
         sound = f" bank {info['bank']} patch {info['patch']}"
         if info.get("preset"):
             sound += f" ({info['preset']})"
-    return json.dumps({
+    result = {
         "track_index": track_index,
         **info,
         "message": f"Set {Path(info['file']).name}{sound} on "
                    f"{info['instrument']} track {track_index}",
-    })
+    }
+    _add_level(result, proj, proj._instrument_track_element(track_index))
+    return json.dumps(result)
 
 
 def _tuning_track(proj, track_index) -> tuple[ET.Element | None, str | None]:
@@ -2622,6 +2742,11 @@ def load_zyn_preset(track_index: int, preset: str) -> str:
     compensated through the track's base note and reported as
     "preset_octave" when it is not 0.
 
+    Loudness: the response has "level_at_vol_100", the peak of a note and
+    of a chord and the RMS of this sound at track volume 100 in dBFS (see
+    add_instrument_track); the first time a preset is used it is measured
+    with a short render (about 1 s) and cached.
+
     Args:
         track_index: Index of the target track
         preset: "Category/Name", plain name, "0034-Name" or absolute path
@@ -2684,6 +2809,7 @@ def load_zyn_preset(track_index: int, preset: str) -> str:
         )
     if notes:
         response["note"] = " ".join(notes)
+    _add_level(response, proj, proj._instrument_track_element(track_index))
     return json.dumps(response)
 
 
@@ -2933,7 +3059,10 @@ def load_instrument_preset(
     "playable_keys" when the instrument cannot play all keys 0-108 at the
     right pitch, "other_matches" when a plain name matched several presets
     (pass "Folder/Name" to pick), "warnings" and "note". If nothing
-    matches, the error suggests close names.
+    matches, the error suggests close names. "level_at_vol_100" is how loud
+    the sound is at track volume 100 in dBFS (see add_instrument_track;
+    measured with a short render the first time, then cached; the preset's
+    own effects are not part of it).
 
     Args:
         track_index: Index of an instrument track, or null to create a
@@ -3107,6 +3236,7 @@ def load_instrument_preset(
         + (f"into a new track {track_index}" if created
            else f"into track {track_index}")
     )
+    _add_level(result, proj, new)
     return json.dumps(result)
 
 

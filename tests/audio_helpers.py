@@ -217,3 +217,99 @@ class FakeMixLmms:
                 (out / f"{number}_{_lmms_file_name(name)}.wav").write_bytes(
                     float_wav_bytes(samples, self.samplerate, self.channels))
         return subprocess.CompletedProcess(cmd, 0, "", "")
+
+
+def _sine_burst(amplitude, seconds, samplerate, channels=2, freq=250):
+    """A sine of the given amplitude: 250 Hz at 2 or 8 kHz has whole periods
+    and hits the peak exactly."""
+    return sine(freq, amplitude, seconds, samplerate, channels)
+
+
+class FakeLevelLmms:
+    """A stand-in for subprocess.run for the renders that measure the level
+    of a sound (lmms_mcp.levels): it "plays" the measuring project, a one
+    track project with single notes and chords at 60 bpm (4 s a bar), as a
+    sine burst of one second at the start of each bar that has notes: the
+    amplitude of a single note and of a chord (a bar with 2 or more notes)
+    come from `amplitudes`, scaled by the track's volume and the Master
+    volume like LMMS does, and by `repeat_scales` (one factor per bar of the
+    same kind, in order: a sound that is louder in some places than in
+    others).
+
+    `amplitudes` is {plugin name: (note, chord)} or a function of the
+    <instrumenttrack> element returning that pair; `default` is used for a
+    plugin that is not listed. `silent` writes digital silence, `fail`
+    exits with code 1, `write_nothing` exits 0 without a file, `timeout`
+    raises TimeoutExpired and `os_error` OSError. Every call is recorded:
+    `commands`, `projects` (the parsed project that was rendered) and
+    `calls` {"cmd", "config_text", "kwargs"}.
+    """
+
+    def __init__(self, amplitudes=None, default=(0.25, 0.5),
+                 samplerate=2000, silent=False, fail=False,
+                 write_nothing=False, timeout=False, os_error=False,
+                 repeat_scales=(), on_run=None):
+        self.amplitudes = amplitudes or {}
+        self.default = default
+        self.samplerate = samplerate
+        self.silent = silent
+        self.fail = fail
+        self.write_nothing = write_nothing
+        self.timeout = timeout
+        self.os_error = os_error
+        self.repeat_scales = repeat_scales
+        self.on_run = on_run
+        self.commands = []
+        self.projects = []
+        self.calls = []
+
+    def __call__(self, cmd, **kwargs):
+        project = Path(cmd[cmd.index("render") + 1])
+        out = Path(cmd[cmd.index("-o") + 1])
+        config = Path(cmd[cmd.index("--config") + 1])
+        root = xml_parser.load_project(project)
+        self.commands.append(cmd)
+        self.projects.append(root)
+        self.calls.append({
+            "cmd": cmd, "kwargs": kwargs,
+            "config_text": config.read_text("utf-8")})
+        if self.on_run is not None:
+            self.on_run(cmd)
+        if self.os_error:
+            raise OSError("no such file")
+        if self.timeout:
+            raise subprocess.TimeoutExpired(cmd, kwargs.get("timeout", 1))
+        if self.fail:
+            return subprocess.CompletedProcess(
+                cmd, 1, "", "Could not load project: broken")
+        if self.write_nothing:
+            return subprocess.CompletedProcess(cmd, 0, "", "")
+        track = xml_parser.find_tracks(root)[0]
+        inst = track.find("instrumenttrack")
+        plugin = inst.find("instrument").get("name")
+        pair = self.amplitudes(inst) if callable(self.amplitudes) \
+            else self.amplitudes.get(plugin, self.default)
+        scale = float(inst.get("vol", "100")) / 100 \
+            * xml_parser.master_volume(root)
+        if self.silent:
+            scale = 0.0
+        counts = {}
+        for note in track.findall("pattern/note"):
+            bar = int(note.get("pos")) // 192
+            counts[bar] = counts.get(bar, 0) + 1
+        rate = self.samplerate
+        frames = rate * 4                      # a bar
+        samples = array.array("f", [0.0]) * (frames * 2 * (max(counts) + 2))
+        seen = {"note": 0, "chord": 0}
+        for bar in sorted(counts):
+            kind = "chord" if counts[bar] > 1 else "note"
+            repeat = seen[kind]
+            seen[kind] += 1
+            factor = self.repeat_scales[repeat] \
+                if repeat < len(self.repeat_scales) else 1.0
+            amplitude = pair[kind == "chord"] * scale * factor
+            burst = _sine_burst(amplitude, 1.0, rate)
+            start = bar * frames * 2
+            samples[start:start + len(burst)] = burst
+        out.write_bytes(float_wav_bytes(samples, rate, 2))
+        return subprocess.CompletedProcess(cmd, 0, "", "")

@@ -4,6 +4,16 @@ import pytest
 
 
 @pytest.fixture(autouse=True)
+def no_level_measuring(monkeypatch, tmp_path):
+    """Keep the tests away from the real LMMS and the user's levels cache:
+    tools that report the level of a sound (see lmms_mcp.levels) never
+    render here, and the cache file is in tmp_path. test_levels.py turns
+    measuring on again, with a fake LMMS."""
+    monkeypatch.setenv("LMMS_MCP_MEASURE_LEVELS", "0")
+    monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path / "xdg_cache"))
+
+
+@pytest.fixture(autouse=True)
 def complete_lmms_install(monkeypatch, tmp_path):
     """Make server tests independent of the LMMS installed on this machine.
 

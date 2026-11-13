@@ -50,6 +50,12 @@ class LMMSProject:
         self._root: ET.Element | None = None
         self._path: str = ""
         self._modified: bool = False
+        # Levels of instrument sounds measured or looked up in this session
+        # ({levels.level_key: levels.Level}). Kept here, never in the XML:
+        # LMMS must not see attributes it does not know. A sound's key is
+        # made from the track's content, so the table stays right when
+        # tracks are removed, reordered or the project is loaded.
+        self.level_table: dict = {}
 
     @property
     def root(self) -> ET.Element:

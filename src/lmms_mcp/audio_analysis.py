@@ -360,6 +360,19 @@ def bar_stats(
     return stats
 
 
+def window_stats(audio: Audio, start: float, end: float) -> BarStats:
+    """The BarStats of the audio between `start` and `end` (seconds; cut to
+    the audio), e.g. the stretch a note sounds."""
+    channels = audio.channels
+    first = max(0, round(start * audio.samplerate)) * channels
+    last = min(len(audio.samples), round(end * audio.samplerate) * channels)
+    chunk = audio.samples[first:max(first, last)]
+    return BarStats(
+        peak_of(chunk),
+        _sum_squares(chunk) if len(chunk) else 0.0,
+        len(chunk))
+
+
 def peak_location(
     audio: Audio, bar_length: float, first_bar: int, last_bar: int,
     total_bars: int,
