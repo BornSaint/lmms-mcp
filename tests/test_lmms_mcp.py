@@ -20,6 +20,8 @@ from lmms_mcp.models import (
 from lmms_mcp.xml_parser import create_empty_project, load_project, save_project, find_tracks, add_instrument_track, add_note_to_track, add_pattern_track, add_sample_track, get_track_mixer_channel
 from lmms_mcp.project import LMMSProject
 
+from audio_helpers import FakeLmms, read_pcm, sine
+
 
 class TestModels:
     def test_key_to_note_name(self):
@@ -2660,22 +2662,18 @@ class TestRenderProjectQuality:
         proj.save(str(tmp_path / "song.mmp"))
         monkeypatch.setattr(
             lmms_app, "find_lmms_exe", lambda: Path("/fake/lmms"))
-        calls = []
-
-        def fake_run(cmd, **kwargs):
-            calls.append(cmd)
-            out = Path(cmd[cmd.index("-o") + 1])
-            out.write_bytes(b"RIFF")
-            return subprocess.CompletedProcess(cmd, 0, "", "")
-
-        monkeypatch.setattr("subprocess.run", fake_run)
-        return srv, calls
+        # A project that plays a clean sine at -10.5 dBFS.
+        fake = FakeLmms(sine(220, 0.3, 4))
+        monkeypatch.setattr("subprocess.run", fake)
+        return srv, fake.commands
 
     def test_defaults_are_1x_sincfastest(self, monkeypatch, tmp_path):
         srv, calls = self._setup(monkeypatch, tmp_path)
         out = tmp_path / "out.wav"
         result = json.loads(srv.render_project(output_path=str(out)))
         assert result["success"] is True
+        # A wav is made from one 32-bit float render (-a) into a temporary
+        # file, which is not the output.
         assert len(calls) == 1
         cmd = calls[0]
         assert cmd[cmd.index("-x") + 1] == "1"
@@ -2686,10 +2684,32 @@ class TestRenderProjectQuality:
         # Existing arguments are unchanged.
         assert cmd[cmd.index("render") - 2] == "--config"
         assert cmd[cmd.index("render") + 1] == str(tmp_path / "song.mmp")
-        assert cmd[cmd.index("-o") + 1] == str(out)
+        assert cmd[cmd.index("-o") + 1] != str(out)
+        assert "-a" in cmd
         assert cmd[cmd.index("-f") + 1] == "wav"
         assert cmd[cmd.index("-s") + 1] == "44100"
         assert cmd[cmd.index("-b") + 1] == "160"
+        assert result["output_file"] == str(out)
+        assert read_pcm(out)[2] == 16
+
+    def test_other_formats_render_the_output_with_lmms_after_the_float_one(
+            self, monkeypatch, tmp_path):
+        srv, calls = self._setup(monkeypatch, tmp_path)
+        out = tmp_path / "out.ogg"
+        result = json.loads(srv.render_project(
+            output_path=str(out), file_format="ogg", bitrate=192))
+        assert result["success"] is True
+        assert len(calls) == 2
+        first, second = calls
+        assert "-a" in first and first[first.index("-f") + 1] == "wav"
+        assert first[first.index("-o") + 1] != str(out)
+        assert "-a" not in second
+        assert second[second.index("-o") + 1] == str(out)
+        assert second[second.index("-f") + 1] == "ogg"
+        assert second[second.index("-b") + 1] == "192"
+        assert second[second.index("-x") + 1] == "1"
+        assert result["command"] == " ".join(second)
+        assert out.read_bytes() == b"ENCODED:ogg"
 
     def test_custom_values_are_passed_through(self, monkeypatch, tmp_path):
         srv, calls = self._setup(monkeypatch, tmp_path)
@@ -2776,6 +2796,8 @@ class TestRenderProjectIsolatedConfig:
             lmms_app, "find_lmms_exe", lambda: Path("/fake/lmms"))
         runs = []
 
+        fake = FakeLmms(sine(220, 0.3, 4))
+
         def fake_run(cmd, **kwargs):
             config = Path(cmd[cmd.index("--config") + 1])
             runs.append({
@@ -2784,9 +2806,7 @@ class TestRenderProjectIsolatedConfig:
             })
             if runner is not None:
                 runner(cmd)
-            out = Path(cmd[cmd.index("-o") + 1])
-            out.write_bytes(b"RIFF")
-            return subprocess.CompletedProcess(cmd, 0, "", "")
+            return fake(cmd, **kwargs)
 
         monkeypatch.setattr("subprocess.run", fake_run)
         return srv, runs, home
@@ -2871,25 +2891,47 @@ class TestRenderProjectIsolatedConfig:
         for run in runs:
             assert not run["dir"].exists()
 
-    def test_overlapping_renders_do_not_share_a_config(
+    def test_overlapping_renders_wait_for_each_other_and_do_not_share_a_config(
             self, monkeypatch, tmp_path):
-        inner = []
-        started = []
+        import threading
+        first_running = threading.Event()
+        release_first = threading.Event()
+        second_started = threading.Event()
+        order = []
 
-        def start_another(cmd):
-            # A second render starts while the first LMMS is still running.
-            if not started:
-                started.append(True)
-                inner.append(json.loads(srv.render_project(
-                    output_path=str(tmp_path / "out2.wav"))))
-                # The first render's config is still in place.
-                assert runs[0]["config"].exists()
+        def block_the_first(cmd):
+            # The first render is still running while a second one is asked
+            # for in another thread.
+            order.append(("start", cmd[cmd.index("-o") + 1]))
+            if len(order) == 1:
+                first_running.set()
+                assert release_first.wait(10)
+            order.append(("end", cmd[cmd.index("-o") + 1]))
 
         srv, runs, _ = self._setup(
-            monkeypatch, tmp_path, self.USER_CONFIG, runner=start_another)
-        outer = json.loads(srv.render_project(
-            output_path=str(tmp_path / "out.wav")))
-        assert outer["success"] and inner[0]["success"]
+            monkeypatch, tmp_path, self.USER_CONFIG, runner=block_the_first)
+        results = {}
+
+        def render(name):
+            if name == "second":
+                second_started.set()
+            results[name] = json.loads(srv.render_project(
+                output_path=str(tmp_path / f"{name}.wav")))
+
+        first = threading.Thread(target=render, args=("first",))
+        first.start()
+        assert first_running.wait(10)
+        second = threading.Thread(target=render, args=("second",))
+        second.start()
+        assert second_started.wait(10)
+        # Give the second render time to (wrongly) start next to the first.
+        second.join(0.3)
+        assert len(order) == 1
+        release_first.set()
+        first.join(10)
+        second.join(10)
+        assert results["first"]["success"] and results["second"]["success"]
+        assert [kind for kind, _ in order] == ["start", "end", "start", "end"]
         assert len(runs) == 2
         assert runs[0]["dir"] != runs[1]["dir"]
         assert not runs[0]["dir"].exists() and not runs[1]["dir"].exists()
@@ -3169,17 +3211,12 @@ class TestRenderProjectFolders:
 
     def test_missing_output_folders_are_created_before_lmms_runs(
             self, monkeypatch, tmp_path):
-        import subprocess
         srv, calls = self._setup(monkeypatch, tmp_path)
         out = tmp_path / "out" / "sub" / "x.wav"
         seen = []
-
-        def fake_run(cmd, **kwargs):
-            seen.append(out.parent.is_dir())
-            out.write_bytes(b"RIFF")
-            return subprocess.CompletedProcess(cmd, 0, "", "")
-
-        monkeypatch.setattr("subprocess.run", fake_run)
+        fake = FakeLmms(sine(220, 0.3, 4),
+                        on_run=lambda cmd: seen.append(out.parent.is_dir()))
+        monkeypatch.setattr("subprocess.run", fake)
         result = json.loads(srv.render_project(output_path=str(out)))
         assert seen == [True]
         assert result["success"] is True
@@ -3234,19 +3271,21 @@ class TestRenderProjectFolders:
             f"{tmp_path / 'plain.txt'} is a file, not a folder")
         assert calls == []
 
-    def test_lmms_cannot_write_the_output(self, monkeypatch, tmp_path):
+    def test_lmms_cannot_write_its_render(self, monkeypatch, tmp_path):
         import subprocess
         srv, _ = self._setup(monkeypatch, tmp_path)
         out = tmp_path / "new" / "x.wav"
 
         def fake_run(cmd, **kwargs):
-            # What LMMS 1.2.2 prints and returns when it cannot write.
+            # What LMMS 1.2.2 prints and returns when it cannot write (here
+            # the temporary file of the level measurement).
+            target = cmd[cmd.index("-o") + 1]
             return subprocess.CompletedProcess(
                 cmd, 1,
                 "Notice: could not set realtime priority.\n"
                 "Loading project...\nDone\n",
                 "VST sync support disabled in your configuration\n"
-                f"Could not open file {out} for writing.\n"
+                f"Could not open file {target} for writing.\n"
                 "Please make sure you have write permission to the file "
                 "and the directory containing the file and try again!\n")
 
@@ -3254,13 +3293,50 @@ class TestRenderProjectFolders:
         result = json.loads(srv.render_project(output_path=str(out)))
         assert result["success"] is False
         error = result["error"]
-        assert error.startswith(
-            f"Render failed: LMMS could not write the output file {out}")
-        assert f"Could not open file {out} for writing." in error
+        assert error.startswith("Render failed: LMMS could not write the "
+                                "output file ")
+        assert " for writing." in error
         assert "VST sync" not in error
         # The folder made for the failed render is removed again.
         assert "created_dirs" not in result
         assert not (tmp_path / "new").exists()
+
+    @pytest.mark.skipif(_running_as_root(), reason="root ignores permissions")
+    def test_output_folder_without_write_permission_fails_before_rendering(
+            self, monkeypatch, tmp_path):
+        srv, calls = self._setup(monkeypatch, tmp_path)
+        locked = tmp_path / "locked"
+        locked.mkdir()
+        locked.chmod(0o500)
+        try:
+            out = locked / "x.wav"
+            result = json.loads(srv.render_project(output_path=str(out)))
+        finally:
+            locked.chmod(0o700)
+        assert result["error"] == (
+            f"Could not render to {out}: "
+            f"no write permission for the folder {locked}")
+        assert result["output_file"] == str(out)
+        assert calls == []
+
+    def test_output_that_cannot_be_written_after_the_render(
+            self, monkeypatch, tmp_path):
+        import errno
+        from lmms_mcp import audio_analysis
+        srv, calls = self._setup(monkeypatch, tmp_path)
+        out = tmp_path / "made" / "x.wav"
+
+        def disk_full(path, *args, **kwargs):
+            Path(path).write_bytes(b"RIFF half a file")
+            raise OSError(errno.ENOSPC, "No space left on device")
+
+        monkeypatch.setattr(audio_analysis, "write_wav", disk_full)
+        result = json.loads(srv.render_project(output_path=str(out)))
+        assert result["success"] is False
+        assert result["error"] == (
+            f"Could not write {out}: No space left on device")
+        assert not out.exists()
+        assert not (tmp_path / "made").exists()
 
     def test_lmms_fails_without_a_message(self, monkeypatch, tmp_path):
         import subprocess
@@ -3274,9 +3350,10 @@ class TestRenderProjectFolders:
         out = tmp_path / "x.wav"
         result = json.loads(srv.render_project(output_path=str(out)))
         assert result["success"] is False
-        assert result["error"] == (
-            f"Render failed: LMMS exited with code 0 without creating {out} "
-            "and printed no error message.")
+        assert result["error"].startswith(
+            "Render failed: LMMS exited with code 0 without creating ")
+        assert result["error"].endswith(" and printed no error message.")
+        assert not out.exists()
 
     def test_other_lmms_errors_keep_their_text(self, monkeypatch, tmp_path):
         import subprocess
@@ -8834,9 +8911,7 @@ class TestRelativeProjectPaths:
         assert result["success"] is True
         assert result["output_file"] == str(target)
         assert result["created_dirs"] == [str(default / "out")]
-        cmd = calls[0]
-        assert cmd[cmd.index("-o") + 1] == str(target)
-        assert target.is_file()
+        assert read_pcm(target)[2] == 16
         assert not (cwd / "out").exists()
 
     def test_render_plain_file_name_goes_to_the_default_folder(
@@ -8877,14 +8952,9 @@ class TestRelativeProjectPaths:
         srv.load_project("song.mmp")
         monkeypatch.setattr(
             lmms_app, "find_lmms_exe", lambda: Path("/fake/lmms"))
-        calls = []
-
-        def fake_run(cmd, **kwargs):
-            calls.append(cmd)
-            Path(cmd[cmd.index("-o") + 1]).write_bytes(b"RIFF")
-            return subprocess.CompletedProcess(cmd, 0, "", "")
-
-        monkeypatch.setattr("subprocess.run", fake_run)
+        fake = FakeLmms(sine(220, 0.3, 4))
+        calls = fake.commands
+        monkeypatch.setattr("subprocess.run", fake)
         result = json.loads(srv.render_project())
         assert result["output_file"] == str(default / "song.wav")
         cmd = calls[0]
@@ -8980,9 +9050,7 @@ class TestTildeExpansion:
         assert result["success"] is True
         assert result["output_file"] == str(target)
         assert result["created_dirs"] == [str(home / "out")]
-        cmd = calls[0]
-        assert cmd[cmd.index("-o") + 1] == str(target)
-        assert target.is_file()
+        assert read_pcm(target)[2] == 16
         assert not (tmp_path / "elsewhere" / "~").exists()
 
     def test_set_audiofile_sample(self, home):

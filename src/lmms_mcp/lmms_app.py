@@ -17,6 +17,7 @@ import struct
 import subprocess
 import sys
 import tempfile
+import threading
 from collections.abc import Collection, Iterable, Iterator, Mapping
 from contextlib import contextmanager
 from dataclasses import dataclass, field
@@ -532,6 +533,20 @@ def get_installed_plugins() -> set[str]:
     return set(get_installed_stems())
 
 
+# Only one LMMS process started by this server runs at a time (a render may
+# need two, and an agent can call tools in parallel): two renders at once
+# compete for the CPU and make each other slow enough to time out.
+_LMMS_RUN_LOCK = threading.Lock()
+
+
+def run_lmms(cmd: list[str], **kwargs) -> subprocess.CompletedProcess:
+    """subprocess.run for every LMMS process the server starts: waits until
+    the LMMS process that is running (started by another thread) has ended,
+    then runs `cmd`. Arguments are those of subprocess.run."""
+    with _LMMS_RUN_LOCK:
+        return subprocess.run(cmd, **kwargs)
+
+
 def get_lmms_version() -> str | None:
     """Version string of the installed LMMS (e.g. '1.2.2'), or None.
 
@@ -543,7 +558,7 @@ def get_lmms_version() -> str | None:
     if exe is None:
         return None
     try:
-        out = subprocess.run(
+        out = run_lmms(
             [str(exe), "--version"],
             capture_output=True, text=True, timeout=10,
         )

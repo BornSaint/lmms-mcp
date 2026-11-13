@@ -14,6 +14,7 @@ import math
 import os
 import string
 import sys
+import tempfile
 import textwrap
 import traceback
 from pathlib import Path, PurePosixPath, PureWindowsPath
@@ -21,6 +22,7 @@ from xml.etree import ElementTree as ET
 
 from mcp.server import MCPServer
 
+from . import audio_analysis
 from . import effect_params
 from . import effects as effects_mod
 from . import instrument_presets as inst_presets
@@ -3235,6 +3237,114 @@ def get_lmms_info() -> str:
     }, indent=2)
 
 
+# What render_project does about the level of a render (dBFS).
+_RENDER_TARGET_PEAK_DB = -1.0   # the peak auto_fix_clipping brings a clip to
+_RENDER_QUIET_PEAK_DB = -12.0   # a render below this gets a "too quiet" note
+_MASTER_VOLUME_MAX = 2.0        # LMMS's mixer faders stop at +6 dB
+_RENDER_SILENCE_DB = 20 * math.log10(audio_analysis.SILENCE_PEAK)
+
+
+def _db_text(value: float | None) -> float | None:
+    """dB rounded to 0.1 for a response (never -0.0)."""
+    return None if value is None else round(value, 1) + 0.0
+
+
+def _block_json(block) -> dict:
+    return {
+        "bars": [block.first_bar, block.last_bar],
+        "peak_dbfs": _db_text(audio_analysis.to_db(block.peak)),
+        "rms_dbfs": _db_text(audio_analysis.to_db(block.rms)),
+    }
+
+
+def _levels_json(levels) -> dict:
+    """The "levels" of a render_project response (see its docstring)."""
+    blocks = levels.blocks
+    audible = [b for b in blocks if not b.silent]
+    return {
+        "duration_s": round(levels.duration, 2),
+        "peak_dbfs": _db_text(audio_analysis.to_db(levels.peak)),
+        "clipped_samples": levels.clipped,
+        "rms_dbfs": _db_text(audio_analysis.to_db(levels.rms)),
+        "blocks": [_block_json(b) for b in blocks],
+        "loudest": _block_json(max(blocks, key=lambda b: b.rms)),
+        "quietest_nonsilent": (
+            _block_json(min(audible, key=lambda b: b.rms)) if audible
+            else None),
+    }
+
+
+def _run_lmms_render(
+    exe, proj_path: Path, output: Path, fmt: str, samplerate: int,
+    bitrate: int, oversampling: int, interp: str, float_output: bool = False,
+):
+    """One LMMS render of the saved project with its own private config.
+    Returns (CompletedProcess, command line text); raises OSError and
+    subprocess.TimeoutExpired."""
+    import subprocess
+    with lmms_app.isolated_config(_availability.version) as config:
+        cmd = [
+            str(exe), "--config", str(config),
+            "render", str(proj_path),
+            "-o", str(output), "-f", fmt,
+            "-s", str(samplerate), "-b", str(bitrate),
+            "-x", str(oversampling), "-i", interp,
+        ]
+        if float_output:
+            cmd.append("-a")
+        proc = lmms_app.run_lmms(
+            cmd, capture_output=True, text=True, timeout=300,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        )
+    return proc, " ".join(cmd)
+
+
+def _level_advice(proj, levels) -> dict:
+    """Response fields that tell what gain would put the render's peak at
+    -1 dBFS: "suggested_gain_db" and "suggested_master_volume" for a
+    render that clips or is quiet, and a "note" saying so."""
+    peak_db = audio_analysis.to_db(levels.peak)
+    if peak_db is None or peak_db < _RENDER_SILENCE_DB:
+        return {"note": (
+            f"The render is silent (its peak is below {_RENDER_SILENCE_DB:.0f}"
+            " dBFS). Check that the tracks have notes or clips, are not "
+            "muted, and that file-based instruments have their file.")}
+    clips = levels.peak > 1.0
+    if not clips and peak_db >= _RENDER_QUIET_PEAK_DB:
+        return {}
+    gain_db = _RENDER_TARGET_PEAK_DB - peak_db
+    before = xml_parser.master_volume(proj.root)
+    volume = before * audio_analysis.from_db(gain_db)
+    out = {
+        "suggested_gain_db": round(gain_db, 1),
+        "suggested_master_volume": round(min(volume, _MASTER_VOLUME_MAX), 4),
+    }
+    set_it = (
+        f"set_mixer_channel_volume(0, {out['suggested_master_volume']:g})")
+    if clips:
+        out["note"] = (
+            f"The render clips (peak {peak_db:+.1f} dBFS, "
+            f"{levels.clipped} samples above 0 dBFS). Lowering the Master "
+            f"volume from {before:g} to {out['suggested_master_volume']:g} "
+            f"({gain_db:+.1f} dB) puts the peak at "
+            f"{_RENDER_TARGET_PEAK_DB:g} dBFS: {set_it}, or render again "
+            "with auto_fix_clipping=true.")
+    elif volume <= _MASTER_VOLUME_MAX:
+        out["note"] = (
+            f"The render is quiet (peak {peak_db:+.1f} dBFS). Raising the "
+            f"Master volume from {before:g} to "
+            f"{out['suggested_master_volume']:g} ({gain_db:+.1f} dB) puts "
+            f"the peak at {_RENDER_TARGET_PEAK_DB:g} dBFS: {set_it}.")
+    else:
+        out["note"] = (
+            f"The render is quiet (peak {peak_db:+.1f} dBFS): "
+            f"{gain_db:+.1f} dB would put the peak at "
+            f"{_RENDER_TARGET_PEAK_DB:g} dBFS, more than the Master volume "
+            f"can add (its maximum is {_MASTER_VOLUME_MAX:g}, +6 dB). Raise "
+            "the track volumes (set_track_volume) first.")
+    return out
+
+
 @_tool
 def render_project(
     output_path: str | None = None,
@@ -3243,6 +3353,7 @@ def render_project(
     bitrate: int = 160,
     oversampling: int = 1,
     interpolation: str = "sincfastest",
+    auto_fix_clipping: bool = True,
 ) -> str:
     """Export the current project to an audio file using the installed LMMS.
 
@@ -3255,10 +3366,47 @@ def render_project(
     not depend on the user's GUI options. Only the sample, soundfont and
     plugin folders are copied from the user's config, and effects keep
     running through silence (echoes and reverb tails are not cut off).
+    Only one LMMS process of this server runs at a time; a render called
+    while another runs waits for it.
 
     Folders of output_path that do not exist yet are created (the response
     lists them in "created_dirs"). If the output cannot be written, the
     response has an "error" saying why and which path.
+
+    The response measures the render, so no separate analysis is needed:
+    "levels" = {"duration_s", "peak_dbfs", "clipped_samples" (samples above
+    0 dBFS in what LMMS produced, before any fix), "rms_dbfs", "blocks": [{
+    "bars": [first, last] (1-based, inclusive), "peak_dbfs", "rms_dbfs"}]
+    for every 4 bars (8, 16, ... when that would be more than 32 blocks;
+    the bars follow the project's tempo and time signature), "loudest" and
+    "quietest_nonsilent" (the blocks with the highest and lowest RMS; a
+    block below -60 dBFS RMS, such as the tail after the last note, counts
+    as silence and is not offered as the quietest)}. dB values are rounded
+    to 0.1; null is digital silence. RMS covers all channels (a full-scale
+    sine is -3.0 dBFS). LMMS itself does not limit its output, so a mix with
+    a peak above 0 dBFS would be clipped (harsh distortion) in the file.
+
+    Clipping is fixed in the same call (auto_fix_clipping, default true):
+    when the peak is above 0 dBFS the Master mixer volume is lowered so the
+    peak becomes -1 dBFS and the project is saved with it, so the next
+    render is clean too. The response then has "auto_gain": {"applied_db",
+    "master_volume_before", "master_volume_after", "reason"} and
+    "levels_after": {"peak_dbfs", "clipped_samples": 0} (computed from the
+    measured render and the gain; the saved project plays this loud).
+    Automation of the Master volume is scaled with it. A "wav" is written
+    from a lossless 32-bit float render with the gain applied; flac/ogg/mp3
+    need one more LMMS render of the adjusted project, so they take about
+    twice as long. With auto_fix_clipping=false (or when the Master volume
+    cannot be adjusted) a clipping mix is rendered once more, as LMMS makes
+    it (clipped), and the response gives "suggested_gain_db" and
+    "suggested_master_volume" that fix it (apply with
+    set_mixer_channel_volume(0, ...)). A render whose peak is below -12 dBFS
+    is left alone but has a "note" with the gain that would bring it to
+    -1 dBFS (a silent render has a note too). A "note" also says when the
+    Master volume cannot be adjusted automatically.
+
+    A "wav" is 16-bit PCM, as LMMS writes it. "command" is the last LMMS
+    command that ran (for a wav, the float render into a temporary file).
 
     Args:
         output_path: Output file path (default: <project>.wav in the
@@ -3279,7 +3427,11 @@ def render_project(
             if the result should differ from the GUI.
         interpolation: "linear", "sincfastest", "sincmedium" or "sincbest"
             (default "sincfastest", the LMMS default)
+        auto_fix_clipping: Lower the Master volume (and save the project)
+            when the render clips, see above (default true). Pass false to
+            keep the mix as it is.
     """
+    import subprocess
     proj = get_project()
     if not proj.path:
         return json.dumps({
@@ -3318,8 +3470,9 @@ def render_project(
     # Save current state before rendering. Keep the compression format
     # consistent with the file extension - compressed bytes inside a
     # .mmp file cannot be read by LMMS and other tools.
+    compressed = str(proj_path).lower().endswith(".mmpz")
     try:
-        proj.save(proj.path, compressed=str(proj_path).lower().endswith(".mmpz"))
+        proj.save(proj.path, compressed=compressed)
     except (OSError, ValueError) as exc:
         return json.dumps({
             "error": f"Could not save the project to {proj.path} before "
@@ -3341,55 +3494,202 @@ def render_project(
                 "output_file": output_path,
             })
         created = _create_parent_folders(out_file)
+        # The audio is written after the (long) render: find out now if it
+        # cannot be.
+        _check_writable(out_file)
     except (OSError, ValueError) as exc:
+        _remove_folders(created)
         return json.dumps({
             "error": f"Could not render to {output_path}: "
                      f"{_os_error_reason(exc, output_path)}",
             "output_file": output_path,
         })
 
-    import subprocess
+    render_args = (samplerate, bitrate, oversampling, interp)
+    extras: dict = {}  # "levels", "auto_gain", "note", ... (see below)
+
+    def finish(success: bool, proc, command: str, error: str | None = None):
+        """The response of a render that ran LMMS last as `proc`."""
+        result = {
+            "command": command,
+            "returncode": proc.returncode,
+            "output_file": str(out_file),
+            "oversampling": oversampling,
+            "interpolation": interp,
+            "isolated_config": True,
+            "success": success,
+        }
+        if success:
+            size = out_file.stat().st_size
+            result["message"] = f"Rendered to {out_file} ({size} bytes)"
+            result["size_bytes"] = size
+            if created:
+                result["created_dirs"] = created
+        else:
+            _remove_folders(created)
+            result["error"] = error
+        result.update(extras)
+        return json.dumps(result)
+
     try:
-        with lmms_app.isolated_config(_availability.version) as config:
-            cmd = [
-                str(exe), "--config", str(config),
-                "render", str(proj_path),
-                "-o", output_path, "-f", fmt,
-                "-s", str(samplerate), "-b", str(bitrate),
-                "-x", str(oversampling), "-i", interp,
-            ]
-            proc = subprocess.run(
-                cmd, capture_output=True, text=True, timeout=300,
-                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
-            )
+        with tempfile.TemporaryDirectory(
+                prefix="lmms-mcp-render-",
+                ignore_cleanup_errors=True) as work:
+            # LMMS writes 16-bit files with its output clipped at 0 dBFS, so
+            # the level of the mix is only visible in a float render.
+            float_file = Path(work) / "levels.wav"
+            proc, command = _run_lmms_render(
+                exe, proj_path, float_file, "wav", *render_args,
+                float_output=True)
+            if proc.returncode != 0 or not float_file.is_file():
+                return finish(False, proc, command,
+                              _render_failure_message(proc, float_file))
+            try:
+                audio = audio_analysis.read_wav(float_file)
+            except (OSError, audio_analysis.AudioError) as exc:
+                audio = None
+                extras["levels_error"] = (
+                    f"Could not measure the render ({exc}); the file was "
+                    "rendered without level analysis.")
+            if audio is None:
+                proc, command = _run_lmms_render(
+                    exe, proj_path, out_file, fmt, *render_args)
+                return finish(
+                    proc.returncode == 0 and out_file.is_file(), proc,
+                    command, _render_failure_message(proc, out_file))
+
+            levels, gain, error = _measure_and_fix(
+                proj, audio, auto_fix_clipping, compressed, extras)
+            if error:  # the lowered Master volume could not be saved
+                return finish(False, proc, command, error)
+
+            # A clean (or fixed) wav is written from the float render. Any
+            # other file is made by LMMS: the formats LMMS encodes, and a
+            # wav that stays as clipped as LMMS makes it (nothing fixed).
+            if fmt == "wav" and not (levels.peak > 1.0 and gain == 1.0):
+                try:
+                    # LMMS makes its 16-bit samples by truncating
+                    # x * 32767 (measured with 1.2.2: the same samples as
+                    # this, but for float rounding at the boundary): do the
+                    # same, so a clean mix is the file it always was.
+                    audio_analysis.write_wav(
+                        out_file, audio, bits=16, gain=gain, peak=levels.peak,
+                        rounding="toward_zero")
+                except (OSError, audio_analysis.AudioError) as exc:
+                    _discard(out_file)
+                    return finish(
+                        False, proc, command,
+                        f"Could not write {out_file}: "
+                        f"{_os_error_reason(exc, str(out_file))}")
+                return finish(True, proc, command)
+            proc, command = _run_lmms_render(
+                exe, proj_path, out_file, fmt, *render_args)
+            return finish(
+                proc.returncode == 0 and out_file.is_file(), proc, command,
+                _render_failure_message(proc, out_file))
     except subprocess.TimeoutExpired:
         _remove_folders(created)
         return json.dumps({
-            "error": "Rendering timed out after 300s. The song may be too long."
+            "error": "Rendering timed out after 300s. The song may be too "
+                     "long.",
+            **extras,
         })
     except OSError as exc:
         _remove_folders(created)
-        return json.dumps({"error": f"Could not start the render: {exc}"})
+        return json.dumps({
+            "error": f"Could not start the render: {exc}", **extras})
 
-    success = proc.returncode == 0 and out_file.is_file()
-    result = {
-        "command": " ".join(cmd),
-        "returncode": proc.returncode,
-        "output_file": str(out_file),
-        "oversampling": oversampling,
-        "interpolation": interp,
-        "isolated_config": True,
-        "success": success,
+
+def _check_writable(path: Path) -> None:
+    """Raise PermissionError if a file cannot be written at `path`, as far
+    as the file system permissions say (os.access)."""
+    target = path if path.exists() else path.parent
+    if not os.access(target, os.W_OK):
+        what = "file" if path.exists() else "folder"
+        raise PermissionError(
+            errno.EACCES, f"no write permission for the {what} {target}")
+
+
+def _discard(path: Path) -> None:
+    """Delete a file that was written only in part."""
+    try:
+        path.unlink()
+    except OSError:
+        pass
+
+
+def _measure_and_fix(
+    proj, audio, auto_fix_clipping: bool, compressed: bool, result: dict,
+):
+    """Measure the float render `audio`, fix a clipping Master volume if
+    asked, and add "levels" and what follows from them to `result`.
+
+    Returns (levels, gain, error): the gain (a linear factor) to apply to
+    the render's samples to get what the project now plays. `error` is a
+    text when the lowered Master volume could not be saved (the project is
+    then as it was), else None.
+    """
+    info = proj.get_info()
+    bar_length = audio_analysis.bar_seconds(
+        info.bpm, info.time_sig_numerator, info.time_sig_denominator)
+    levels = audio_analysis.analyze(audio, bar_length)
+    result["levels"] = _levels_json(levels)
+    head = xml_parser.find_head(proj.root)
+    if head is not None and xml_parser.model_automation(
+            proj.root, head, "bpm"):
+        result["levels"]["bars_note"] = (
+            "The tempo is automated: the bar ranges use the static tempo "
+            "and are approximate.")
+
+    if levels.peak <= 1.0 or not auto_fix_clipping:
+        result.update(_level_advice(proj, levels))
+        return levels, 1.0, None
+
+    peak_db = audio_analysis.to_db(levels.peak)
+    gain_db = _RENDER_TARGET_PEAK_DB - peak_db
+    gain = audio_analysis.from_db(gain_db)
+    snapshot, was_modified = copy.deepcopy(proj.root), proj.modified
+    try:
+        change = xml_parser.scale_master_volume(proj.root, gain)
+    except xml_parser.MasterGainError as exc:
+        result.update(_level_advice(proj, levels))
+        result["note"] = f"Not fixed automatically: {exc}. {result['note']}"
+        return levels, 1.0, None
+    try:
+        proj.save(proj.path, compressed=compressed)
+    except (OSError, ValueError) as exc:
+        proj.restore(snapshot, was_modified)
+        return levels, 1.0, (
+            f"The render clips (peak {peak_db:+.1f} dBFS) and lowering the "
+            f"Master volume by {-gain_db:.1f} dB needs the project saved, "
+            f"but it could not be saved to {proj.path}: "
+            f"{_os_error_reason(exc, str(proj.path))}. The project was left "
+            "unchanged. Save it to a place that can be written, or render "
+            "with auto_fix_clipping=false.")
+    curves = change["curves_scaled"]
+    result["auto_gain"] = {
+        "applied_db": round(gain_db, 2),
+        "master_volume_before": round(change["before"], 4),
+        "master_volume_after": round(change["after"], 4),
+        "reason": (
+            f"The render peaked at {peak_db:+.1f} dBFS "
+            f"({levels.clipped} samples above 0 dBFS) and would clip. The "
+            f"Master mixer volume was lowered from "
+            f"{change['before']:.4g} to {change['after']:.4g} "
+            f"({gain_db:+.1f} dB) so the peak is at "
+            f"{_RENDER_TARGET_PEAK_DB:g} dBFS, and the project was saved "
+            "with it."
+            + (f" The automation of the Master volume ({curves} "
+               f"pattern{'s' if curves != 1 else ''}) was scaled by the same "
+               "factor." if curves else "")
+            + (" The project had no Master mixer channel; one was added."
+               if change["created"] else "")),
     }
-    if success:
-        result["message"] = f"Rendered to {out_file} ({out_file.stat().st_size} bytes)"
-        result["size_bytes"] = out_file.stat().st_size
-        if created:
-            result["created_dirs"] = created
-    else:
-        _remove_folders(created)
-        result["error"] = _render_failure_message(proc, out_file)
-    return json.dumps(result)
+    result["levels_after"] = {
+        "peak_dbfs": _db_text(peak_db + gain_db),
+        "clipped_samples": 0,
+    }
+    return levels, gain, None
 
 
 # Lines LMMS prints on every run that say nothing about a failure.

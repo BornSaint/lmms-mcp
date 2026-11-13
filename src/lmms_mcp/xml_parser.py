@@ -378,6 +378,24 @@ def set_model_value(parent: ET.Element, name: str, value: str) -> bool:
     return True
 
 
+def _model_patterns(
+    root: ET.Element, parent: ET.Element, name: str,
+) -> list[tuple[int, ET.Element, ET.Element]]:
+    """(track_index, automation track, <automationpattern>) of every
+    pattern of the song's tracks that has an <object id> of the model
+    `name` of `parent` (none when the model is not a child element)."""
+    child = model_element(parent, name)
+    model_id = None if child is None else child.get("id")
+    if not model_id:
+        return []
+    return [
+        (index, track, pattern)
+        for index, track in enumerate(find_tracks(root))
+        for pattern in track.findall("automationpattern")
+        if any(obj.get("id") == model_id for obj in pattern.findall("object"))
+    ]
+
+
 def model_automation(
     root: ET.Element, parent: ET.Element, name: str,
 ) -> list[dict]:
@@ -390,24 +408,16 @@ def model_automation(
     starts at), "last_point" (the tick of its last point)}. Empty when the
     model is not automated.
     """
-    child = model_element(parent, name)
-    model_id = None if child is None else child.get("id")
-    if not model_id:
-        return []
     found = []
-    for index, track in enumerate(find_tracks(root)):
-        for pattern in track.findall("automationpattern"):
-            if not any(obj.get("id") == model_id
-                       for obj in pattern.findall("object")):
-                continue
-            start = _to_int(pattern.get("pos"))
-            points = [_to_int(t.get("pos")) for t in pattern.findall("time")]
-            found.append({
-                "track_index": index,
-                "track": get_track_name(track),
-                "start": start,
-                "last_point": start + max(points, default=0),
-            })
+    for index, track, pattern in _model_patterns(root, parent, name):
+        start = _to_int(pattern.get("pos"))
+        points = [_to_int(t.get("pos")) for t in pattern.findall("time")]
+        found.append({
+            "track_index": index,
+            "track": get_track_name(track),
+            "start": start,
+            "last_point": start + max(points, default=0),
+        })
     return found
 
 
@@ -625,6 +635,112 @@ def find_mixer_channels(root: ET.Element) -> list[ET.Element]:
 
     tags = {names.channel for names in ALL_MIXER_NAMES}
     return [child for child in mixer if child.tag in tags]
+
+
+def find_master_channel(root: ET.Element) -> ET.Element | None:
+    """The Master mixer channel (number 0), or None."""
+    for channel in find_mixer_channels(root):
+        if _to_int(channel.get("num"), -1) == 0:
+            return channel
+    return None
+
+
+def ensure_master_channel(root: ET.Element) -> ET.Element:
+    """The Master mixer channel; a project without a mixer (LMMS plays it
+    with Master at volume 1) or without channel 0 gets one, written with
+    the mixer names the project uses.
+
+    Raises ValueError for a project without <song>.
+    """
+    channel = find_master_channel(root)
+    if channel is not None:
+        return channel
+    song = root.find("song")
+    if song is None:
+        raise ValueError("The project has no <song> element.")
+    names = mixer_names(root)
+    mixer = find_mixer(root)
+    if mixer is None:
+        mixer = _make_mixer(song, names)
+        return mixer[0]
+    channel = ET.Element(names.channel, {
+        "num": "0", "muted": "0", "volume": "1", "name": "Master",
+        "soloed": "0"})
+    channel.append(ET.Element("fxchain", {"numofeffects": "0", "enabled": "0"}))
+    mixer.insert(0, channel)
+    return channel
+
+
+def master_volume(root: ET.Element) -> float:
+    """The static volume of the Master channel (1.0 = 0 dB; LMMS's
+    maximum is 2.0), 1.0 for a project without one."""
+    channel = find_master_channel(root)
+    if channel is None:
+        return 1.0
+    try:
+        return float(model_value(channel, "volume", "1"))
+    except ValueError:
+        return 1.0
+
+
+class MasterGainError(ValueError):
+    """The Master volume cannot be scaled without leaving something out."""
+
+
+# Attributes of an automation <time> point that are volumes (or, for the
+# tangents, volume per tick): all scale with the curve.
+_CURVE_VALUE_ATTRIBUTES = ("value", "inValue", "outValue", "inTan", "outTan")
+
+
+def _format_number(value: float) -> str:
+    return format(value, ".8g")
+
+
+def scale_master_volume(root: ET.Element, factor: float) -> dict:
+    """Multiply the volume of the Master channel by `factor` (> 0).
+
+    The static value is scaled, and so are the points (values and
+    tangents) of the automation curves that play it, so the whole song
+    gets quieter or louder by exactly `factor` (the Master volume acts
+    after the Master effect chain). A project without a mixer or a Master
+    channel gets one first (ensure_master_channel).
+
+    Raises MasterGainError, with nothing changed, when an automation
+    pattern that plays the Master volume also controls other parameters
+    (scaling its curve would change those too).
+
+    Returns {"before", "after" (the static volume), "curves_scaled" (the
+    number of automation patterns scaled), "created" (a mixer or Master
+    channel had to be added)}.
+    """
+    if not factor > 0:
+        raise ValueError("factor must be positive")
+    channel = find_master_channel(root)
+    created = channel is None
+    patterns = [] if created else [
+        pattern for _, _, pattern in _model_patterns(root, channel, "volume")]
+    for pattern in patterns:
+        if len(pattern.findall("object")) > 1:
+            raise MasterGainError(
+                f"the automation '{pattern.get('name', '')}' that plays the "
+                "Master volume also controls other parameters, so its "
+                "curve cannot be scaled")
+    before = master_volume(root)
+    channel = ensure_master_channel(root)
+    after = before * factor
+    set_model_value(channel, "volume", _format_number(after))
+    for pattern in patterns:
+        for point in pattern.findall("time"):
+            for attribute in _CURVE_VALUE_ATTRIBUTES:
+                try:
+                    number = float(point.get(attribute))
+                except (TypeError, ValueError):
+                    continue
+                point.set(attribute, _format_number(number * factor))
+    return {
+        "before": before, "after": after,
+        "curves_scaled": len(patterns), "created": created,
+    }
 
 
 def get_track_type(elem: ET.Element) -> int:

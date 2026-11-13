@@ -189,7 +189,7 @@ Only offered when the installed LMMS has the `zynaddsubfx` plugin.
 | Tool | Description |
 |------|-------------|
 | `get_lmms_info` | Detect installed LMMS version + available plugins |
-| `render_project` | Export to WAV/FLAC/OGG/MP3 via headless LMMS render. `oversampling` (1/2/4/8, default 1 = what LMMS plays in its GUI; higher changes the sound of some instruments such as ZynAddSubFX) and `interpolation` (linear/sincfastest/sincmedium/sincbest, default sincfastest). A relative `output_path` is relative to the default projects folder (`LMMS_PROJECTS_DIR`). Missing folders of `output_path` are created (listed as `created_dirs`); a path LMMS cannot write gives an error naming the path |
+| `render_project` | Export to WAV/FLAC/OGG/MP3 via headless LMMS render. `oversampling` (1/2/4/8, default 1 = what LMMS plays in its GUI; higher changes the sound of some instruments such as ZynAddSubFX) and `interpolation` (linear/sincfastest/sincmedium/sincbest, default sincfastest). A relative `output_path` is relative to the default projects folder (`LMMS_PROJECTS_DIR`). Missing folders of `output_path` are created (listed as `created_dirs`); a path LMMS cannot write gives an error naming the path. The response measures the render (`levels`: peak, clipped samples, RMS, loudness per 4 bars) and, with `auto_fix_clipping` (default true), lowers the Master mixer volume of a clipping mix to a -1 dBFS peak and saves the project (`auto_gain`, `levels_after`) |
 
 The server reads and writes project files directly - it never launches
 the LMMS GUI. The installed LMMS is only used for: preset discovery,
@@ -202,7 +202,26 @@ renders never change your LMMS settings, cannot clash with an open LMMS or
 another render, and do not depend on your GUI options. It takes over only your
 sample, soundfont and plugin folders (so files resolve as they do in LMMS) and
 keeps effects running through silence, so echoes and reverb tails are not cut
-off. The temporary config is deleted after the render.
+off. The temporary config is deleted after the render. Only one LMMS process of
+the server runs at a time, so renders asked for together run one after the
+other.
+
+LMMS does not limit its output: a mix whose peak is above 0 dBFS is clipped
+in the file (LMMS's default instrument and kicker levels often are). So
+`render_project` first renders the project as a lossless 32-bit float file
+(into a temporary folder, removed afterwards) and measures it in pure Python
+(no numpy needed): `levels` has the peak and RMS in dBFS, the number of
+samples above 0 dBFS, and the peak/RMS of every 4 bars (8, 16, ... for long
+songs) with the loudest and quietest of them. A clipping mix is fixed by
+lowering the Master mixer volume (and its automation, if any) to a peak of
+-1 dBFS; the project is saved with the new volume, so later renders are clean
+too (`auto_gain` says what changed, `auto_fix_clipping=false` turns it off).
+A `wav` is then written from the float render with that gain, without
+another LMMS render; flac, ogg and mp3 (and a clipping mix that is not
+fixed) are rendered by LMMS once more, so they take about twice as long. A
+render whose peak is below -12 dBFS is not changed, but a `note` says what
+gain would bring it to -1 dBFS. Measuring and writing a 3-minute stereo song
+takes a few seconds on top of the LMMS render.
 
 ### Installed LMMS version
 

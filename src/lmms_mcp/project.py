@@ -133,6 +133,12 @@ class LMMSProject:
         self._modified = False
         return self._path
 
+    def restore(self, root: ET.Element, modified: bool) -> None:
+        """Put back a project tree copied earlier (copy.deepcopy of
+        `root`), e.g. when an edit could not be saved."""
+        self._root = root
+        self._modified = modified
+
     def get_info(self) -> SongInfo:
         """Extract song information from the project."""
         root = self.root
