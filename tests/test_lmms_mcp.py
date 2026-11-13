@@ -2684,7 +2684,8 @@ class TestRenderProjectQuality:
         assert result["oversampling"] == 1
         assert result["interpolation"] == "sincfastest"
         # Existing arguments are unchanged.
-        assert cmd[1] == "render"
+        assert cmd[cmd.index("render") - 2] == "--config"
+        assert cmd[cmd.index("render") + 1] == str(tmp_path / "song.mmp")
         assert cmd[cmd.index("-o") + 1] == str(out)
         assert cmd[cmd.index("-f") + 1] == "wav"
         assert cmd[cmd.index("-s") + 1] == "44100"
@@ -2736,6 +2737,246 @@ class TestRenderProjectQuality:
         assert "error" in result
         assert "interpolation" in result["error"]
         assert calls == []
+
+
+class TestRenderProjectIsolatedConfig:
+    """render_project runs LMMS with a private config, not ~/.lmmsrc.xml."""
+
+    USER_CONFIG = (
+        '<?xml version="1.0"?>\n<!DOCTYPE lmms-config-file>\n'
+        '<lmms version="1.2.2">'
+        '<audioalsa device="hw:1" channels="2"/>'
+        '<paths stkdir="/stk/" gigdir="/home/u/lmms/gig/" '
+        'laddir="/home/u/lmms/ladspa/" artwork="data:/themes/default/" '
+        'sf2dir="/home/u/lmms/sf2/" defaultsf2="/home/u/lmms/sf2/a.sf2" '
+        'backgroundartwork="" vstdir="/home/u/lmms/vst/" '
+        'workingdir="/home/u/lmms/"/>'
+        '<ui disableautoquit="0" saveinterval="2"/>'
+        '</lmms>\n')
+
+    @staticmethod
+    def _setup(monkeypatch, tmp_path, user_config=None, runner=None):
+        """A fake LMMS whose --config file is read while the run is in
+        progress (it is deleted afterwards). Returns (srv, runs, home) with
+        runs a list of {"cmd", "config", "text", "dir"} per LMMS call."""
+        import subprocess
+        from lmms_mcp import lmms_app
+        from lmms_mcp import server as srv
+
+        home = tmp_path / "home"
+        home.mkdir()
+        if user_config is not None:
+            (home / ".lmmsrc.xml").write_text(user_config)
+        monkeypatch.setattr(Path, "home", classmethod(lambda cls: home))
+        proj = LMMSProject()
+        proj.new()
+        srv.set_project(proj)
+        proj.save(str(tmp_path / "song.mmp"))
+        monkeypatch.setattr(
+            lmms_app, "find_lmms_exe", lambda: Path("/fake/lmms"))
+        runs = []
+
+        def fake_run(cmd, **kwargs):
+            config = Path(cmd[cmd.index("--config") + 1])
+            runs.append({
+                "cmd": cmd, "config": config, "dir": config.parent,
+                "text": config.read_text(encoding="utf-8"),
+            })
+            if runner is not None:
+                runner(cmd)
+            out = Path(cmd[cmd.index("-o") + 1])
+            out.write_bytes(b"RIFF")
+            return subprocess.CompletedProcess(cmd, 0, "", "")
+
+        monkeypatch.setattr("subprocess.run", fake_run)
+        return srv, runs, home
+
+    @staticmethod
+    def _parsed(text):
+        from xml.etree import ElementTree as ET
+        return ET.fromstring(text.split("\n", 2)[2])
+
+    def test_runs_lmms_with_a_config_that_is_not_the_users(
+            self, monkeypatch, tmp_path):
+        srv, runs, home = self._setup(
+            monkeypatch, tmp_path, self.USER_CONFIG)
+        result = json.loads(srv.render_project(
+            output_path=str(tmp_path / "out.wav")))
+        assert result["success"] is True
+        assert result["isolated_config"] is True
+        cmd = runs[0]["cmd"]
+        # A global option: it comes before the "render" action.
+        assert cmd.index("--config") < cmd.index("render")
+        assert runs[0]["config"] != home / ".lmmsrc.xml"
+        assert str(home) not in " ".join(cmd)
+        assert "--config" in result["command"]
+
+    def test_copies_only_the_render_paths_from_the_users_config(
+            self, monkeypatch, tmp_path):
+        srv, runs, _ = self._setup(monkeypatch, tmp_path, self.USER_CONFIG)
+        srv.render_project(output_path=str(tmp_path / "out.wav"))
+        root = self._parsed(runs[0]["text"])
+        assert root.find("paths").attrib == {
+            "stkdir": "/stk/", "gigdir": "/home/u/lmms/gig/",
+            "laddir": "/home/u/lmms/ladspa/", "sf2dir": "/home/u/lmms/sf2/",
+            "defaultsf2": "/home/u/lmms/sf2/a.sf2",
+            "vstdir": "/home/u/lmms/vst/", "workingdir": "/home/u/lmms/"}
+        # Nothing else of the user's config is carried over.
+        assert [c.tag for c in root] == ["app", "paths", "ui"]
+        assert root.find("ui").attrib == {"disableautoquit": "1"}
+        assert "hw:1" not in runs[0]["text"]
+        assert "saveinterval" not in runs[0]["text"]
+
+    def test_effects_keep_running_whatever_the_users_gui_setting(
+            self, monkeypatch, tmp_path):
+        # The user's config says disableautoquit="0"; renders always use 1
+        # so echoes and reverb tails survive silent gaps.
+        srv, runs, _ = self._setup(monkeypatch, tmp_path, self.USER_CONFIG)
+        srv.render_project(output_path=str(tmp_path / "out.wav"))
+        root = self._parsed(runs[0]["text"])
+        assert root.find("ui").get("disableautoquit") == "1"
+        assert root.find("app").get("nanhandler") == "1"
+        assert root.get("version") == "1.3.0"
+
+    def test_works_without_a_user_config(self, monkeypatch, tmp_path):
+        srv, runs, home = self._setup(monkeypatch, tmp_path)
+        result = json.loads(srv.render_project(
+            output_path=str(tmp_path / "out.wav")))
+        assert result["success"] is True
+        root = self._parsed(runs[0]["text"])
+        assert root.find("paths") is None
+        assert root.find("ui").get("disableautoquit") == "1"
+        assert not (home / ".lmmsrc.xml").exists()
+
+    def test_users_config_is_never_written(self, monkeypatch, tmp_path):
+        srv, runs, home = self._setup(monkeypatch, tmp_path, self.USER_CONFIG)
+        import os
+        user_rc = home / ".lmmsrc.xml"
+        os.utime(user_rc, ns=(10**18, 10**18))
+        before = user_rc.stat().st_mtime_ns
+        for _ in range(2):
+            srv.render_project(output_path=str(tmp_path / "out.wav"))
+        assert user_rc.read_text() == self.USER_CONFIG
+        assert user_rc.stat().st_mtime_ns == before
+        assert sorted(p.name for p in home.iterdir()) == [".lmmsrc.xml"]
+
+    def test_every_render_gets_its_own_config_and_cleans_it_up(
+            self, monkeypatch, tmp_path):
+        srv, runs, _ = self._setup(monkeypatch, tmp_path, self.USER_CONFIG)
+        for _ in range(2):
+            srv.render_project(output_path=str(tmp_path / "out.wav"))
+        assert len(runs) == 2
+        assert runs[0]["config"] != runs[1]["config"]
+        assert runs[0]["dir"] != runs[1]["dir"]
+        for run in runs:
+            assert not run["dir"].exists()
+
+    def test_overlapping_renders_do_not_share_a_config(
+            self, monkeypatch, tmp_path):
+        inner = []
+        started = []
+
+        def start_another(cmd):
+            # A second render starts while the first LMMS is still running.
+            if not started:
+                started.append(True)
+                inner.append(json.loads(srv.render_project(
+                    output_path=str(tmp_path / "out2.wav"))))
+                # The first render's config is still in place.
+                assert runs[0]["config"].exists()
+
+        srv, runs, _ = self._setup(
+            monkeypatch, tmp_path, self.USER_CONFIG, runner=start_another)
+        outer = json.loads(srv.render_project(
+            output_path=str(tmp_path / "out.wav")))
+        assert outer["success"] and inner[0]["success"]
+        assert len(runs) == 2
+        assert runs[0]["dir"] != runs[1]["dir"]
+        assert not runs[0]["dir"].exists() and not runs[1]["dir"].exists()
+
+    def test_config_is_removed_when_the_render_times_out(
+            self, monkeypatch, tmp_path):
+        import subprocess
+
+        def hang(cmd):
+            raise subprocess.TimeoutExpired(cmd, 300)
+
+        srv, runs, _ = self._setup(
+            monkeypatch, tmp_path, self.USER_CONFIG, runner=hang)
+        result = json.loads(srv.render_project(
+            output_path=str(tmp_path / "out.wav")))
+        assert "timed out" in result["error"]
+        assert not runs[0]["dir"].exists()
+
+    def test_config_is_removed_when_lmms_fails(self, monkeypatch, tmp_path):
+        import subprocess
+        srv, runs, _ = self._setup(monkeypatch, tmp_path, self.USER_CONFIG)
+
+        def failing(cmd, **kwargs):
+            runs.append({"dir": Path(cmd[cmd.index("--config") + 1]).parent})
+            return subprocess.CompletedProcess(cmd, 1, "", "boom")
+
+        monkeypatch.setattr("subprocess.run", failing)
+        result = json.loads(srv.render_project(
+            output_path=str(tmp_path / "gone.wav")))
+        assert result["success"] is False
+        assert result["isolated_config"] is True
+        assert "boom" in result["error"]
+        assert not runs[-1]["dir"].exists()
+
+    def test_render_config_xml_keeps_only_render_paths(self):
+        from lmms_mcp import lmms_app
+        text = lmms_app.render_config_xml(
+            {"workingdir": "/w & <x>/", "artwork": "data:/t/",
+             "laddir": 'a"b', "recent": "z"})
+        root = self._parsed(text)
+        assert root.get("version") is None
+        assert root.find("paths").attrib == {
+            "workingdir": "/w & <x>/", "laddir": 'a"b'}
+        assert text.startswith('<?xml version="1.0"?>\n<!DOCTYPE lmms-config-file>')
+
+    def test_isolated_config_reads_the_given_config_and_removes_its_folder(
+            self, tmp_path):
+        from lmms_mcp import lmms_app
+        user_rc = tmp_path / "user.xml"
+        user_rc.write_text(self.USER_CONFIG)
+        before = user_rc.stat().st_mtime_ns
+        with lmms_app.isolated_config("1.2.2", user_rc) as first:
+            with lmms_app.isolated_config("1.2.2", user_rc) as second:
+                assert first != second and first.parent != second.parent
+                assert first.is_file() and second.is_file()
+            assert not second.parent.exists() and first.is_file()
+            root = self._parsed(first.read_text(encoding="utf-8"))
+            assert root.get("version") == "1.2.2"
+            assert root.find("paths").get("sf2dir") == "/home/u/lmms/sf2/"
+        assert not first.parent.exists()
+        assert user_rc.stat().st_mtime_ns == before
+        assert user_rc.read_text() == self.USER_CONFIG
+
+    def test_isolated_config_is_removed_after_an_error(self):
+        from lmms_mcp import lmms_app
+        with pytest.raises(RuntimeError):
+            with lmms_app.isolated_config() as config:
+                folder = config.parent
+                raise RuntimeError("render failed")
+        assert not folder.exists()
+
+    def test_lmms_version_check_does_not_use_a_config(self, monkeypatch):
+        # `lmms --version` exits before LMMS loads or saves a config file
+        # (checked with LMMS 1.2.2), so it runs as is.
+        import subprocess
+        from lmms_mcp import lmms_app
+        seen = []
+
+        def fake_run(cmd, **kwargs):
+            seen.append(cmd)
+            return subprocess.CompletedProcess(cmd, 0, "LMMS 1.2.2\n", "")
+
+        monkeypatch.setattr(
+            lmms_app, "find_lmms_exe", lambda: Path("/fake/lmms"))
+        monkeypatch.setattr("subprocess.run", fake_run)
+        assert lmms_app.get_lmms_version() == "1.2.2"
+        assert seen == [["/fake/lmms", "--version"]]
 
 
 if __name__ == "__main__":

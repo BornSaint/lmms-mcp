@@ -2896,6 +2896,13 @@ def render_project(
     This launches LMMS in headless render mode (no GUI). Requires a
     working LMMS installation. The project is saved first, then rendered.
 
+    The render uses its own temporary LMMS config (response: "isolated_config":
+    true) instead of the user's ~/.lmmsrc.xml, so it never changes the user's
+    LMMS settings, is safe next to an open LMMS and other renders, and does
+    not depend on the user's GUI options. Only the sample, soundfont and
+    plugin folders are copied from the user's config, and effects keep
+    running through silence (echoes and reverb tails are not cut off).
+
     Args:
         output_path: Output file path (default: <project>.wav in the
             same directory)
@@ -2951,21 +2958,25 @@ def render_project(
     proj.save(proj.path, compressed=str(proj_path).lower().endswith(".mmpz"))
 
     import subprocess
-    cmd = [
-        str(exe), "render", str(proj_path),
-        "-o", output_path, "-f", fmt,
-        "-s", str(samplerate), "-b", str(bitrate),
-        "-x", str(oversampling), "-i", interp,
-    ]
     try:
-        proc = subprocess.run(
-            cmd, capture_output=True, text=True, timeout=300,
-            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
-        )
+        with lmms_app.isolated_config(_availability.version) as config:
+            cmd = [
+                str(exe), "--config", str(config),
+                "render", str(proj_path),
+                "-o", output_path, "-f", fmt,
+                "-s", str(samplerate), "-b", str(bitrate),
+                "-x", str(oversampling), "-i", interp,
+            ]
+            proc = subprocess.run(
+                cmd, capture_output=True, text=True, timeout=300,
+                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+            )
     except subprocess.TimeoutExpired:
         return json.dumps({
             "error": "Rendering timed out after 300s. The song may be too long."
         })
+    except OSError as exc:
+        return json.dumps({"error": f"Could not start the render: {exc}"})
 
     out_file = Path(output_path)
     success = proc.returncode == 0 and out_file.is_file()
@@ -2975,6 +2986,7 @@ def render_project(
         "output_file": str(out_file),
         "oversampling": oversampling,
         "interpolation": interp,
+        "isolated_config": True,
         "success": success,
     }
     if success:

@@ -196,6 +196,14 @@ the LMMS GUI. The installed LMMS is only used for: preset discovery,
 plugin availability checks (see [Installed LMMS version](#installed-lmms-version))
 and audio rendering.
 
+`render_project` runs LMMS with its own temporary config instead of your
+`~/.lmmsrc.xml` (every LMMS process rewrites the config it started with), so
+renders never change your LMMS settings, cannot clash with an open LMMS or
+another render, and do not depend on your GUI options. It takes over only your
+sample, soundfont and plugin folders (so files resolve as they do in LMMS) and
+keeps effects running through silence, so echoes and reverb tails are not cut
+off. The temporary config is deleted after the render.
+
 ### Installed LMMS version
 
 LMMS 1.2.x and 1.3+ ship different plugins, and LMMS silently ignores a

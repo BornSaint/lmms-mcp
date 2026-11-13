@@ -16,7 +16,9 @@ import shutil
 import struct
 import subprocess
 import sys
-from collections.abc import Collection, Iterable, Mapping
+import tempfile
+from collections.abc import Collection, Iterable, Iterator, Mapping
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
 from xml.etree import ElementTree as ET
@@ -208,6 +210,75 @@ def read_lmms_paths(config: str | Path | None = None) -> dict[str, str]:
     except (OSError, ET.ParseError):
         return {}
     return dict(node.attrib) if node is not None else {}
+
+
+# The <paths> settings of the user's LMMS config that a render needs: where
+# user samples (<workingdir>/samples), soundfonts, GIG libraries, STK raw
+# waves, LADSPA and VST plugins are, so they resolve as they do in the GUI.
+# Everything else in the user's config (audio devices, window and theme
+# settings, recent files, ...) has no effect on a render and is not copied.
+RENDER_PATH_KEYS = (
+    "workingdir", "sf2dir", "gigdir", "stkdir", "laddir", "vstdir",
+    "defaultsf2",
+)
+
+
+def render_config_xml(
+    user_paths: Mapping[str, str] | None = None,
+    version: str | None = None,
+) -> str:
+    """The text of the LMMS config file a render runs with.
+
+    Holds the RENDER_PATH_KEYS found in user_paths (the <paths> of the
+    user's own config, see read_lmms_paths) and fixed options:
+
+    - ui disableautoquit="1": effects keep running through silence, so the
+      echoes of a delay and the tail of a reverb are not cut off after a
+      gap, whatever each effect's own "decay" is. This is also the value
+      LMMS's settings dialog starts with (and the one a GUI user who has
+      opened it has), so a render sounds like the GUI. Without the key LMMS
+      renders as if it were 0, and then any effect with a short decay
+      (LMMS's default is 1 ms) drops its tail after the first silent gap.
+    - app nanhandler="1": NaN/infinite samples from a misbehaving plugin
+      are replaced by silence instead of ruining the whole file.
+
+    No audio or MIDI device is named: a render writes a file and uses none.
+    """
+    root = ET.Element("lmms")
+    if version:
+        root.set("version", version)
+    ET.SubElement(root, "app", nanhandler="1")
+    paths = {
+        k: v for k, v in (user_paths or {}).items() if k in RENDER_PATH_KEYS
+    }
+    if paths:
+        ET.SubElement(root, "paths", paths)
+    ET.SubElement(root, "ui", disableautoquit="1")
+    return ('<?xml version="1.0"?>\n<!DOCTYPE lmms-config-file>\n'
+            + ET.tostring(root, encoding="unicode") + "\n")
+
+
+@contextmanager
+def isolated_config(
+    version: str | None = None,
+    user_config: str | Path | None = None,
+) -> Iterator[Path]:
+    """A private LMMS config file for one LMMS run (pass it as --config).
+
+    Every LMMS process rewrites the config file it was started with when
+    it exits, so renders that use the user's ~/.lmmsrc.xml change the
+    user's settings, can overwrite each other's (or an open LMMS GUI's)
+    copy, and sound different depending on the user's GUI options. This
+    writes a new config (see render_config_xml, with the paths from the
+    user's config, which is only read) into a temporary folder that is
+    removed when the block ends, so concurrent runs never share a file.
+    """
+    paths = read_lmms_paths(user_config)
+    with tempfile.TemporaryDirectory(
+            prefix="lmms-mcp-", ignore_cleanup_errors=True) as folder:
+        config = Path(folder) / "lmmsrc.xml"
+        config.write_text(render_config_xml(paths, version), encoding="utf-8")
+        yield config
 
 
 @dataclass(frozen=True)
@@ -462,7 +533,12 @@ def get_installed_plugins() -> set[str]:
 
 
 def get_lmms_version() -> str | None:
-    """Version string of the installed LMMS (e.g. '1.2.2'), or None."""
+    """Version string of the installed LMMS (e.g. '1.2.2'), or None.
+
+    `lmms --version` prints and exits before LMMS loads or saves any config
+    file (checked with 1.2.2: an existing config keeps its content and
+    modification time), so unlike a render it needs no isolated config.
+    """
     exe = find_lmms_exe()
     if exe is None:
         return None
