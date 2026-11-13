@@ -5,6 +5,7 @@ manipulating LMMS projects programmatically via the Model Context Protocol.
 """
 
 import copy
+import errno
 import json
 import math
 import os
@@ -751,6 +752,60 @@ def _unroutable_warning(proj) -> str | None:
     )
 
 
+def _create_parent_folders(path: str | Path) -> list[str]:
+    """Create the folders above a file path that do not exist yet.
+
+    Returns the folders it created, outermost first ([] when they all
+    existed). If a folder cannot be created, the ones made so far are
+    removed again and an OSError that names the folder is raised.
+    """
+    missing: list[Path] = []
+    folder = Path(path).parent
+    while not folder.exists():
+        missing.append(folder)
+        if folder.parent == folder:
+            break
+        folder = folder.parent
+    missing.reverse()
+    if folder.exists() and not folder.is_dir():
+        # A file where a folder is needed (LMMS and mkdir would only say
+        # "could not open file" / "file exists").
+        raise OSError(errno.ENOTDIR, f"{folder} is a file, not a folder")
+    try:
+        if missing:
+            missing[-1].mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        _remove_folders(str(f) for f in missing)
+        raise OSError(
+            exc.errno,
+            f"could not create the folder {exc.filename or missing[-1]}: "
+            f"{exc.strerror or exc}") from exc
+    return [str(f) for f in missing]
+
+
+def _remove_folders(folders) -> None:
+    """Remove the given folders again (innermost first) when they are
+    empty; used to undo _create_parent_folders after a failure. Anything
+    that cannot be removed is left alone."""
+    for folder in reversed(list(folders)):
+        try:
+            os.rmdir(folder)
+        except OSError:
+            pass
+
+
+def _os_error_reason(exc: Exception, path: str) -> str:
+    """The reason of a file system error, as a short sentence part: the
+    system's text (e.g. "Permission denied"), plus the folder or file it
+    names when that is not the path itself."""
+    if not isinstance(exc, OSError):
+        return str(exc)
+    reason = exc.strerror or str(exc)
+    if exc.filename and str(exc.filename) != path:
+        reason += f" ({exc.filename})"
+    return reason
+
+
 @mcp.tool()
 def save_project(
     path: str = "",
@@ -758,9 +813,17 @@ def save_project(
 ) -> str:
     """Save the current LMMS project to a file.
 
+    Folders that do not exist yet are created (the response lists them in
+    "created_dirs"). If the file cannot be written (no permission, the path
+    is an existing folder, disk full, ...) the response is
+    {"error": ..., "path": ...} with the reason, and the project keeps its
+    previous path.
+
     Args:
         path: File path to save to. If empty, saves to the default projects directory.
             If only a filename is given (e.g. "song.mmpz"), it's saved in the default directory.
+            A relative path with folders (e.g. "songs/jazz/take1.mmp") is
+            created under the default directory.
         compressed: If True, saves as .mmpz (compressed). If False, saves as .mmp
             (plain XML). By default (None) the format follows the file extension:
             ".mmp" is always plain XML, everything else compressed. Writing
@@ -769,31 +832,48 @@ def save_project(
     proj = get_project()
 
     if not path and not proj.path:
-        projects_dir = Path(DEFAULT_PROJECTS_DIR)
-        projects_dir.mkdir(parents=True, exist_ok=True)
-        save_path = str(projects_dir / "untitled.mmpz")
+        save_path = str(Path(DEFAULT_PROJECTS_DIR) / "untitled.mmpz")
     elif path and not Path(path).is_absolute():
-        projects_dir = Path(DEFAULT_PROJECTS_DIR)
-        projects_dir.mkdir(parents=True, exist_ok=True)
-        save_path = str(projects_dir / path)
+        save_path = str(Path(DEFAULT_PROJECTS_DIR) / path)
     else:
-        save_path = path if path else None
+        # An absolute path, or no path: save again where the project is.
+        save_path = path or proj.path
 
     if compressed is None:
         # Follow the extension: plain XML for .mmp, compressed otherwise.
         # (LMMSProject.save does the same inference; resolve it here so
         # the response reports the actual format.)
-        compressed = not (
-            save_path and str(save_path).lower().endswith(".mmp")
-        ) if save_path else True
+        compressed = not save_path.lower().endswith(".mmp")
 
-    result_path = proj.save(save_path, compressed=compressed) if save_path else proj.save(compressed=compressed)
+    created: list[str] = []
+    try:
+        if Path(save_path).is_dir():
+            return json.dumps({
+                "error": f"Could not save the project to {save_path}: it is "
+                         f"an existing folder, not a file. Add a file name, "
+                         f"e.g. {os.path.join(save_path, 'song.mmpz')}.",
+                "path": save_path,
+            })
+        created = _create_parent_folders(save_path)
+        result_path = proj.save(save_path, compressed=compressed)
+    except (OSError, ValueError) as exc:
+        # LMMSProject.save sets the project's path only after writing, so
+        # the project is unchanged here.
+        _remove_folders(created)
+        return json.dumps({
+            "error": f"Could not save the project to {save_path}: "
+                     f"{_os_error_reason(exc, save_path)}",
+            "path": save_path,
+        })
 
-    return json.dumps({
+    result = {
         "message": f"Project saved to {result_path}",
         "path": result_path,
         "compressed": compressed,
-    })
+    }
+    if created:
+        result["created_dirs"] = created
+    return json.dumps(result)
 
 
 @mcp.tool()
@@ -2903,6 +2983,10 @@ def render_project(
     plugin folders are copied from the user's config, and effects keep
     running through silence (echoes and reverb tails are not cut off).
 
+    Folders of output_path that do not exist yet are created (the response
+    lists them in "created_dirs"). If the output cannot be written, the
+    response has an "error" saying why and which path.
+
     Args:
         output_path: Output file path (default: <project>.wav in the
             same directory)
@@ -2955,7 +3039,35 @@ def render_project(
     # Save current state before rendering. Keep the compression format
     # consistent with the file extension - compressed bytes inside a
     # .mmp file cannot be read by LMMS and other tools.
-    proj.save(proj.path, compressed=str(proj_path).lower().endswith(".mmpz"))
+    try:
+        proj.save(proj.path, compressed=str(proj_path).lower().endswith(".mmpz"))
+    except (OSError, ValueError) as exc:
+        return json.dumps({
+            "error": f"Could not save the project to {proj.path} before "
+                     f"rendering: {_os_error_reason(exc, str(proj.path))}. "
+                     "Call save_project with a path that can be written, "
+                     "then render again.",
+            "path": str(proj.path),
+        })
+
+    out_file = Path(output_path)
+    created: list[str] = []
+    try:
+        if out_file.is_dir():
+            # LMMS would exit without an error and write nothing.
+            return json.dumps({
+                "error": f"output_path {output_path} is an existing folder, "
+                         f"not a file. Add a file name, e.g. "
+                         f"{os.path.join(output_path, 'song.' + fmt)}.",
+                "output_file": output_path,
+            })
+        created = _create_parent_folders(out_file)
+    except (OSError, ValueError) as exc:
+        return json.dumps({
+            "error": f"Could not render to {output_path}: "
+                     f"{_os_error_reason(exc, output_path)}",
+            "output_file": output_path,
+        })
 
     import subprocess
     try:
@@ -2972,13 +3084,14 @@ def render_project(
                 creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
             )
     except subprocess.TimeoutExpired:
+        _remove_folders(created)
         return json.dumps({
             "error": "Rendering timed out after 300s. The song may be too long."
         })
     except OSError as exc:
+        _remove_folders(created)
         return json.dumps({"error": f"Could not start the render: {exc}"})
 
-    out_file = Path(output_path)
     success = proc.returncode == 0 and out_file.is_file()
     result = {
         "command": " ".join(cmd),
@@ -2992,9 +3105,43 @@ def render_project(
     if success:
         result["message"] = f"Rendered to {out_file} ({out_file.stat().st_size} bytes)"
         result["size_bytes"] = out_file.stat().st_size
+        if created:
+            result["created_dirs"] = created
     else:
-        result["error"] = f"Render failed: {proc.stderr.strip() or proc.stdout.strip()}"
+        _remove_folders(created)
+        result["error"] = _render_failure_message(proc, out_file)
     return json.dumps(result)
+
+
+# Lines LMMS prints on every run that say nothing about a failure.
+_LMMS_HARMLESS_OUTPUT = (
+    "VST sync support disabled in your configuration",
+    "Notice: could not set realtime priority.",
+)
+
+
+def _render_failure_message(proc, out_file: Path) -> str:
+    """Why a render did not produce its file, from what LMMS printed."""
+    detail = ""
+    for text in (proc.stderr, proc.stdout):
+        lines = [line.strip() for line in (text or "").splitlines()]
+        detail = "\n".join(
+            line for line in lines
+            if line and line not in _LMMS_HARMLESS_OUTPUT)
+        if detail:
+            break
+    if "for writing" in detail:
+        # "Could not open file <path> for writing. Please make sure you
+        # have write permission to the file and the directory ..."
+        return (
+            f"Render failed: LMMS could not write the output file "
+            f"{out_file} (no write permission for the file or its folder, "
+            f"disk full, or the path is too long). LMMS said: {detail}")
+    if detail:
+        return f"Render failed: {detail}"
+    return (
+        f"Render failed: LMMS exited with code {proc.returncode} without "
+        f"creating {out_file} and printed no error message.")
 
 
 # Most files per instrument that list_available_plugins shows.

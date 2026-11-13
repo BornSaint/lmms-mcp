@@ -2985,6 +2985,330 @@ if __name__ == "__main__":
     sys.exit(1)
 
 
+def _running_as_root():
+    import os
+    return hasattr(os, "geteuid") and os.geteuid() == 0
+
+
+class TestSaveProjectFolders:
+    """save_project creates missing folders and turns every file system
+    problem into a JSON error (an exception reaches the MCP client only as
+    "Error executing tool save_project")."""
+
+    @staticmethod
+    def _project(saved_at=None):
+        from lmms_mcp import server as srv
+        proj = LMMSProject()
+        proj.new()
+        srv.set_project(proj)
+        if saved_at is not None:
+            proj.save(str(saved_at))
+        return srv, proj
+
+    def test_absolute_path_in_missing_nested_folders(self, tmp_path):
+        srv, proj = self._project()
+        target = tmp_path / "new" / "nested" / "deep" / "test.mmp"
+        result = json.loads(srv.save_project(str(target)))
+        assert "error" not in result
+        assert result["path"] == str(target)
+        assert result["created_dirs"] == [
+            str(tmp_path / "new"),
+            str(tmp_path / "new" / "nested"),
+            str(tmp_path / "new" / "nested" / "deep"),
+        ]
+        assert target.read_bytes().startswith(b"<?xml")
+        assert proj.path == str(target)
+        assert load_project(target) is not None
+
+    def test_only_the_missing_folders_are_listed(self, tmp_path):
+        srv, _ = self._project()
+        (tmp_path / "have").mkdir()
+        result = json.loads(srv.save_project(
+            str(tmp_path / "have" / "sub" / "x.mmpz")))
+        assert result["created_dirs"] == [str(tmp_path / "have" / "sub")]
+
+    def test_relative_path_with_subfolders_goes_under_the_default_dir(
+            self, monkeypatch, tmp_path):
+        srv, proj = self._project()
+        default = tmp_path / "projects"
+        default.mkdir()
+        monkeypatch.setattr(srv, "DEFAULT_PROJECTS_DIR", str(default))
+        result = json.loads(srv.save_project("songs/x/y.mmp"))
+        target = default / "songs" / "x" / "y.mmp"
+        assert result["path"] == str(target)
+        assert result["created_dirs"] == [
+            str(default / "songs"), str(default / "songs" / "x")]
+        assert target.is_file()
+        assert proj.path == str(target)
+
+    def test_missing_default_dir_is_created_and_listed(
+            self, monkeypatch, tmp_path):
+        srv, _ = self._project()
+        default = tmp_path / "not" / "yet"
+        monkeypatch.setattr(srv, "DEFAULT_PROJECTS_DIR", str(default))
+        result = json.loads(srv.save_project("song.mmpz"))
+        assert (default / "song.mmpz").is_file()
+        assert result["created_dirs"] == [
+            str(tmp_path / "not"), str(default)]
+        # No path at all: untitled.mmpz in the same folder.
+        srv, _ = self._project()
+        result = json.loads(srv.save_project())
+        assert result["path"] == str(default / "untitled.mmpz")
+        assert "created_dirs" not in result
+
+    def test_existing_folder_has_no_created_dirs(self, tmp_path):
+        srv, _ = self._project()
+        result = json.loads(srv.save_project(str(tmp_path / "x.mmp")))
+        assert result["message"] == f"Project saved to {tmp_path / 'x.mmp'}"
+        assert "created_dirs" not in result
+        assert "error" not in result
+
+    def test_save_again_without_a_path_recreates_a_deleted_folder(
+            self, tmp_path):
+        import shutil
+        srv, proj = self._project(saved_at=None)
+        (tmp_path / "gone").mkdir()
+        proj.save(str(tmp_path / "gone" / "song.mmp"))
+        shutil.rmtree(tmp_path / "gone")
+        result = json.loads(srv.save_project())
+        assert result["created_dirs"] == [str(tmp_path / "gone")]
+        # The format follows the project's own .mmp extension.
+        assert result["compressed"] is False
+        assert (tmp_path / "gone" / "song.mmp").read_bytes().startswith(
+            b"<?xml")
+
+    @pytest.mark.skipif(_running_as_root(), reason="root ignores permissions")
+    def test_read_only_folder_gives_a_json_error(self, tmp_path):
+        srv, proj = self._project(saved_at=tmp_path / "first.mmp")
+        locked = tmp_path / "locked"
+        locked.mkdir()
+        locked.chmod(0o500)
+        try:
+            target = locked / "x.mmp"
+            result = json.loads(srv.save_project(str(target)))
+        finally:
+            locked.chmod(0o700)
+        assert result["path"] == str(target)
+        assert result["error"].startswith(
+            f"Could not save the project to {target}: ")
+        assert "Permission denied" in result["error"]
+        assert "created_dirs" not in result
+        assert not target.exists()
+        assert proj.path == str(tmp_path / "first.mmp")
+
+    @pytest.mark.skipif(_running_as_root(), reason="root ignores permissions")
+    def test_cannot_create_a_folder_in_a_read_only_folder(self, tmp_path):
+        srv, proj = self._project()
+        locked = tmp_path / "locked"
+        locked.mkdir()
+        locked.chmod(0o500)
+        try:
+            result = json.loads(srv.save_project(
+                str(locked / "a" / "b" / "x.mmp")))
+        finally:
+            locked.chmod(0o700)
+        assert "Permission denied" in result["error"]
+        assert f"could not create the folder {locked / 'a'}" in result["error"]
+        assert list(locked.iterdir()) == []
+        assert not proj.path
+
+    def test_path_that_is_an_existing_folder(self, tmp_path):
+        srv, proj = self._project(saved_at=tmp_path / "first.mmp")
+        folder = tmp_path / "songs.mmp"
+        folder.mkdir()
+        result = json.loads(srv.save_project(str(folder)))
+        assert result["path"] == str(folder)
+        assert "existing folder" in result["error"]
+        assert str(folder / "song.mmpz") in result["error"]
+        assert folder.is_dir() and list(folder.iterdir()) == []
+        assert proj.path == str(tmp_path / "first.mmp")
+
+    def test_a_file_in_the_folder_path_gives_a_json_error(self, tmp_path):
+        srv, proj = self._project()
+        (tmp_path / "plain.txt").write_text("x")
+        target = tmp_path / "plain.txt" / "sub" / "x.mmp"
+        result = json.loads(srv.save_project(str(target)))
+        assert result["error"] == (
+            f"Could not save the project to {target}: "
+            f"{tmp_path / 'plain.txt'} is a file, not a folder")
+        assert result["path"] == str(target)
+        assert (tmp_path / "plain.txt").read_text() == "x"
+        assert not proj.path
+
+    def test_a_failed_write_removes_the_folders_it_created(
+            self, monkeypatch, tmp_path):
+        srv, proj = self._project()
+
+        def disk_full(*args, **kwargs):
+            raise OSError(28, "No space left on device")
+
+        monkeypatch.setattr("lmms_mcp.project.save_project", disk_full)
+        target = tmp_path / "a" / "b" / "x.mmp"
+        result = json.loads(srv.save_project(str(target)))
+        assert "No space left on device" in result["error"]
+        assert str(target) in result["error"]
+        assert not (tmp_path / "a").exists()
+        assert not proj.path
+        assert proj.modified is True
+
+    def test_invalid_path_gives_a_json_error(self, tmp_path):
+        srv, proj = self._project()
+        result = json.loads(srv.save_project(str(tmp_path / "bad\0name.mmp")))
+        assert result["error"].startswith("Could not save the project to ")
+        assert "null" in result["error"]
+        assert not proj.path
+
+
+class TestRenderProjectFolders:
+    """render_project creates the folders of output_path and reports
+    problems with the output path as JSON errors that name the path."""
+
+    @staticmethod
+    def _setup(monkeypatch, tmp_path):
+        return TestRenderProjectQuality._setup(monkeypatch, tmp_path)
+
+    def test_missing_output_folders_are_created_before_lmms_runs(
+            self, monkeypatch, tmp_path):
+        import subprocess
+        srv, calls = self._setup(monkeypatch, tmp_path)
+        out = tmp_path / "out" / "sub" / "x.wav"
+        seen = []
+
+        def fake_run(cmd, **kwargs):
+            seen.append(out.parent.is_dir())
+            out.write_bytes(b"RIFF")
+            return subprocess.CompletedProcess(cmd, 0, "", "")
+
+        monkeypatch.setattr("subprocess.run", fake_run)
+        result = json.loads(srv.render_project(output_path=str(out)))
+        assert seen == [True]
+        assert result["success"] is True
+        assert result["created_dirs"] == [
+            str(tmp_path / "out"), str(tmp_path / "out" / "sub")]
+        assert out.is_file()
+
+    def test_existing_output_folder_has_no_created_dirs(
+            self, monkeypatch, tmp_path):
+        srv, calls = self._setup(monkeypatch, tmp_path)
+        result = json.loads(srv.render_project(
+            output_path=str(tmp_path / "x.wav")))
+        assert result["success"] is True
+        assert "created_dirs" not in result
+
+    def test_output_path_that_is_an_existing_folder(
+            self, monkeypatch, tmp_path):
+        srv, calls = self._setup(monkeypatch, tmp_path)
+        folder = tmp_path / "out.wav"
+        folder.mkdir()
+        result = json.loads(srv.render_project(output_path=str(folder)))
+        assert "existing folder" in result["error"]
+        assert str(folder / "song.wav") in result["error"]
+        assert result["output_file"] == str(folder)
+        assert calls == []
+
+    @pytest.mark.skipif(_running_as_root(), reason="root ignores permissions")
+    def test_cannot_create_the_output_folder(self, monkeypatch, tmp_path):
+        srv, calls = self._setup(monkeypatch, tmp_path)
+        locked = tmp_path / "locked"
+        locked.mkdir()
+        locked.chmod(0o500)
+        try:
+            out = locked / "sub" / "x.wav"
+            result = json.loads(srv.render_project(output_path=str(out)))
+        finally:
+            locked.chmod(0o700)
+        assert result["error"].startswith(
+            f"Could not render to {out}: ")
+        assert "Permission denied" in result["error"]
+        assert f"could not create the folder {locked / 'sub'}" in result["error"]
+        assert result["output_file"] == str(out)
+        assert calls == []
+
+    def test_a_file_in_the_output_folder_path(self, monkeypatch, tmp_path):
+        srv, calls = self._setup(monkeypatch, tmp_path)
+        (tmp_path / "plain.txt").write_text("x")
+        out = tmp_path / "plain.txt" / "x.wav"
+        result = json.loads(srv.render_project(output_path=str(out)))
+        assert result["error"] == (
+            f"Could not render to {out}: "
+            f"{tmp_path / 'plain.txt'} is a file, not a folder")
+        assert calls == []
+
+    def test_lmms_cannot_write_the_output(self, monkeypatch, tmp_path):
+        import subprocess
+        srv, _ = self._setup(monkeypatch, tmp_path)
+        out = tmp_path / "new" / "x.wav"
+
+        def fake_run(cmd, **kwargs):
+            # What LMMS 1.2.2 prints and returns when it cannot write.
+            return subprocess.CompletedProcess(
+                cmd, 1,
+                "Notice: could not set realtime priority.\n"
+                "Loading project...\nDone\n",
+                "VST sync support disabled in your configuration\n"
+                f"Could not open file {out} for writing.\n"
+                "Please make sure you have write permission to the file "
+                "and the directory containing the file and try again!\n")
+
+        monkeypatch.setattr("subprocess.run", fake_run)
+        result = json.loads(srv.render_project(output_path=str(out)))
+        assert result["success"] is False
+        error = result["error"]
+        assert error.startswith(
+            f"Render failed: LMMS could not write the output file {out}")
+        assert f"Could not open file {out} for writing." in error
+        assert "VST sync" not in error
+        # The folder made for the failed render is removed again.
+        assert "created_dirs" not in result
+        assert not (tmp_path / "new").exists()
+
+    def test_lmms_fails_without_a_message(self, monkeypatch, tmp_path):
+        import subprocess
+        srv, _ = self._setup(monkeypatch, tmp_path)
+
+        def fake_run(cmd, **kwargs):
+            return subprocess.CompletedProcess(
+                cmd, 0, "", "VST sync support disabled in your configuration\n")
+
+        monkeypatch.setattr("subprocess.run", fake_run)
+        out = tmp_path / "x.wav"
+        result = json.loads(srv.render_project(output_path=str(out)))
+        assert result["success"] is False
+        assert result["error"] == (
+            f"Render failed: LMMS exited with code 0 without creating {out} "
+            "and printed no error message.")
+
+    def test_other_lmms_errors_keep_their_text(self, monkeypatch, tmp_path):
+        import subprocess
+        srv, _ = self._setup(monkeypatch, tmp_path)
+
+        def fake_run(cmd, **kwargs):
+            return subprocess.CompletedProcess(
+                cmd, 1, "", "Could not load project\n")
+
+        monkeypatch.setattr("subprocess.run", fake_run)
+        result = json.loads(srv.render_project(
+            output_path=str(tmp_path / "x.wav")))
+        assert result["error"] == "Render failed: Could not load project"
+
+    def test_project_folder_gone_gives_a_json_error(
+            self, monkeypatch, tmp_path):
+        import shutil
+        srv, calls = self._setup(monkeypatch, tmp_path)
+        proj = LMMSProject()
+        proj.new()
+        (tmp_path / "gone").mkdir()
+        proj.save(str(tmp_path / "gone" / "song.mmp"))
+        srv.set_project(proj)
+        shutil.rmtree(tmp_path / "gone")
+        result = json.loads(srv.render_project(
+            output_path=str(tmp_path / "x.wav")))
+        assert "before rendering" in result["error"]
+        assert str(tmp_path / "gone" / "song.mmp") in result["error"]
+        assert "save_project" in result["error"]
+        assert calls == []
+
+
 class TestNoteValidation:
     """add_note / add_note_by_name / add_notes_batch must never silently
     swallow bad input: failures are reported clearly."""

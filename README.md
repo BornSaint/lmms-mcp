@@ -90,7 +90,7 @@ python -m lmms_mcp
 |------|-------------|
 | `create_project` | Create a new empty LMMS project |
 | `load_project` | Load an existing `.mmpz` or `.mmp` file |
-| `save_project` | Save the current project |
+| `save_project` | Save the current project. Missing folders in the path are created (listed as `created_dirs`); if the file cannot be written the response is a JSON error with the reason |
 | `get_project_info` | Get project overview (tempo, tracks, mixer) |
 | `get_project_xml` | Get raw XML of the project |
 
@@ -189,7 +189,7 @@ Only offered when the installed LMMS has the `zynaddsubfx` plugin.
 | Tool | Description |
 |------|-------------|
 | `get_lmms_info` | Detect installed LMMS version + available plugins |
-| `render_project` | Export to WAV/FLAC/OGG/MP3 via headless LMMS render. `oversampling` (1/2/4/8, default 1 = what LMMS plays in its GUI; higher changes the sound of some instruments such as ZynAddSubFX) and `interpolation` (linear/sincfastest/sincmedium/sincbest, default sincfastest) |
+| `render_project` | Export to WAV/FLAC/OGG/MP3 via headless LMMS render. `oversampling` (1/2/4/8, default 1 = what LMMS plays in its GUI; higher changes the sound of some instruments such as ZynAddSubFX) and `interpolation` (linear/sincfastest/sincmedium/sincbest, default sincfastest). Missing folders of `output_path` are created (listed as `created_dirs`); a path LMMS cannot write gives an error naming the path |
 
 The server reads and writes project files directly - it never launches
 the LMMS GUI. The installed LMMS is only used for: preset discovery,
