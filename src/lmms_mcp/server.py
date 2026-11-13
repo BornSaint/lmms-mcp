@@ -4,7 +4,9 @@ This server provides tools, resources, and prompts for creating and
 manipulating LMMS projects programmatically via the Model Context Protocol.
 """
 
+import copy
 import json
+import math
 import os
 import string
 import textwrap
@@ -14,6 +16,7 @@ from xml.etree import ElementTree as ET
 from mcp.server import MCPServer
 
 from . import effects as effects_mod
+from . import instrument_presets as inst_presets
 from . import lmms_app
 from . import pitch
 from . import presets as zyn_presets
@@ -510,6 +513,14 @@ list_zyn_presets). Fine-tune with set_zyn_params. Every preset plays key 57
 as A4 = 440 Hz: an octave shift built into a preset (many basses have one)
 is compensated for you."""
         )
+
+    blocks.append(
+        "Instrument presets: list_instrument_presets shows the ready-made "
+        "sounds (LMMS's factory presets and the user's own saved ones, "
+        "often tuned); load_instrument_preset(track_index, \"Folder/Name\") "
+        "loads one into an instrument track and keeps its notes, or "
+        "creates the track when track_index is null."
+    )
 
     chains = lmms_app.adapt_recommendations(
         {
@@ -2019,6 +2030,458 @@ def set_zyn_params(
         return json.dumps(result)
     except ValueError as exc:
         return json.dumps({"error": str(exc)})
+
+
+# ──────────────────────────────────────────────────────────────────
+# INSTRUMENT PRESETS (.xpf)
+# ──────────────────────────────────────────────────────────────────
+
+_MAX_PRESETS_LISTED = 200
+_PRESET_EXAMPLES = 5
+
+
+def _canonical_instrument(plugin: str) -> str:
+    """The offered instrument name for a plugin name as presets store it.
+
+    "OPL2" and "opl2" give opulenz, "papu" freeboy, "stk" malletsstk;
+    other names are lowercased (custom plugins).
+    """
+    low = plugin.strip().lower()
+    for known in KNOWN_INSTRUMENTS:
+        if low in lmms_app.plugin_candidates(known):
+            return known
+    return INSTRUMENT_ALIASES.get(low, low)
+
+
+def _preset_instrument_offered(instrument: str, av) -> bool:
+    """Whether presets of this (canonical) instrument can be loaded here."""
+    if instrument == "vestige":
+        return False
+    if instrument in KNOWN_INSTRUMENTS:
+        return instrument in av.instruments
+    return (instrument in av.installed
+            and instrument not in lmms_app.NON_TRACK_PLUGINS)
+
+
+def _preset_plugin_refusal(plugin: str, instrument: str, av) -> str:
+    """JSON error for a preset whose instrument the installed LMMS lacks."""
+    if instrument == "vestige":
+        message = ("The preset hosts a VST plugin, which a preset cannot "
+                   "carry over. Use add_vst_track for VST plugins.")
+        payload: dict = {}
+    elif instrument in av.needs_file:
+        message = _needs_file_reason(instrument, av) + "."
+        payload = {}
+    elif instrument in KNOWN_INSTRUMENTS:
+        message = lmms_app.unavailable_reason(instrument, av.version)
+        alternative = lmms_app.PLUGIN_SUBSTITUTES.get(instrument)
+        payload = {}
+        if alternative in av.instruments:
+            message += f" '{alternative}' could stand in for it."
+            payload["alternative"] = alternative
+    else:
+        message = (f"The preset's instrument '{plugin}' is not installed in "
+                   f"{_lmms_label(av)}.")
+        payload = {}
+    payload["error"] = (
+        f"{message} Choose a preset of an instrument that is available "
+        f"(list_instrument_presets shows those)."
+    )
+    payload["available_instruments"] = _instrument_choices(av)
+    return json.dumps(payload)
+
+
+def _install_preset(inst_track, preset, plugin: str, instrument: str):
+    """Build the <instrumenttrack> that results from loading a preset.
+
+    Works on a copy of `inst_track` (the caller swaps it in once it is
+    complete, so a failure changes nothing). The preset replaces the
+    instrument and its settings, envelopes/filter, chord and arpeggio
+    settings, the effect chain (only when the preset has effects) and the
+    tuning; the track keeps its notes (they live beside the instrument
+    track), volume, panning, mixer channel, MIDI port and name.
+
+    Returns (new element, replaced parts, kept parts, note or None).
+    """
+    new = copy.deepcopy(inst_track)
+    had_effects = new.find("fxchain/effect") is not None
+    stored = preset.plugin.replace(" ", "").lower()
+    preset.instrument.set("name", plugin)
+    for child in preset.instrument[:1]:
+        if child.tag.lower() == stored:
+            child.tag = plugin.replace(" ", "")
+
+    inst_presets.put_child(new, preset.instrument, first=True)
+    replaced = ["instrument"]
+    for tag, label in inst_presets.SOUND_PARTS.items():
+        if tag in preset.parts:
+            inst_presets.put_child(new, preset.parts[tag])
+            replaced.append(label)
+    kept = []
+    if preset.fxchain is not None:
+        inst_presets.put_child(new, preset.fxchain)
+        count = len(preset.fxchain.findall("effect"))
+        replaced.append(f"effects ({count})")
+    elif had_effects:
+        kept.append("effects")
+
+    # The tuning is what the preset's author heard in LMMS: stored as is.
+    cents = preset.pitch
+    pitchrange = max(preset.pitchrange, math.ceil(abs(cents) / 100), 1)
+    pitch.apply_tuning(new, pitch.Tuning(preset.basenote, cents, pitchrange))
+    replaced.append("tuning")
+    note = None
+    offset = pitch.track_pitch_offset(new)
+    if offset and preset.basenote == DEFAULT_BASE_NOTE:
+        # The default base note of a plugin LMMS plays off pitch: calibrate
+        # it like a new track so key 57 is A4 = 440 Hz.
+        try:
+            written = pitch.set_base_note(new, DEFAULT_BASE_NOTE)
+        except ValueError:
+            pass
+        else:
+            note = (
+                f"The preset has the default base note 57, at which LMMS "
+                f"plays {plugin} {abs(offset)} semitones "
+                f"{'below' if offset > 0 else 'above'} the key. The track's "
+                f"base note is written as {written} to compensate, so key "
+                f"57 = A4 = 440 Hz like on a new {instrument} track."
+            )
+    return new, replaced, kept, note
+
+
+def _preset_mix_note(index: int, preset, inst_track) -> str | None:
+    """Sentence saying the preset was saved with another volume / panning
+    than the track that keeps its own."""
+    parts = []
+    for label, stored, current, tool in (
+        ("volume", preset.volume,
+         int(inst_presets.number(inst_track.get("vol"), 100)),
+         "set_track_volume"),
+        ("panning", preset.panning,
+         int(inst_presets.number(inst_track.get("pan"), 0)),
+         "set_track_panning"),
+    ):
+        if stored != current:
+            parts.append(
+                f"{label} {stored} (the track keeps {current}; "
+                f"{tool}({index}, {stored}) to match)")
+    if not parts:
+        return None
+    return "The preset was saved with " + " and ".join(parts) + "."
+
+
+@mcp.tool()
+def load_instrument_preset(
+    track_index: int | None,
+    preset: str,
+    name: str | None = None,
+    rename: bool = False,
+) -> str:
+    """Load an LMMS instrument preset (.xpf) into an instrument track.
+
+    A preset is a finished, often tuned sound: the instrument with all its
+    settings, envelopes/filter, chords/arpeggio, effects and base note, as
+    LMMS's own "Save as preset" writes it. LMMS ships presets for most
+    instruments and the user may have saved their own, e.g. a piano
+    sample with its base note set so keys sound at their note names
+    (list_instrument_presets shows what is available). For ZynAddSubFX
+    (.xiz) use load_zyn_preset.
+
+    Pass an existing instrument track as track_index, or null to create a
+    new instrument track (named `name`, default the preset's name) from the
+    preset in one call.
+
+    What changes on an existing track (the response lists "replaced" and
+    "kept"): REPLACED are the instrument and its settings (so the track
+    changes instrument if the preset uses another), envelopes and filter,
+    chords, arpeggio, the effect chain (only when the preset has effects;
+    a preset without effects leaves the track's), and the tuning (base
+    note, fine tune). KEPT are the notes and patterns, the track name
+    (rename=True, or `name`, sets it; a preset with another volume or
+    panning than the track is reported, the track keeps its own), mute and
+    solo, mixer channel and MIDI port. A new track takes the preset's
+    volume and panning.
+
+    The preset's tuning is stored as the author heard it in LMMS and
+    returned as "tuning" with a "hint" saying which key sounds at the
+    natural pitch (for a sample preset the key the sample was recorded
+    at, for synths key 57 = A4 = 440 Hz). Where LMMS plays an instrument
+    off pitch (see add_instrument_track) a preset with the default base
+    note 57 is compensated like a new track, and the note says so (an
+    OPL2 patch only when it sounds an octave low; most presets do not).
+    Change the tuning afterwards with set_track_tuning.
+
+    Nothing is changed when the call is refused: the preset needs an
+    instrument the installed LMMS does not have, or a sample/soundfont file
+    that is missing (the track would be silent; the error names the file),
+    or the track is not an instrument track. A relative sample path is
+    found the way LMMS finds it (your LMMS samples folder, then the
+    factory samples); a sample lying beside the preset, which LMMS itself
+    would not find, is pointed to by its absolute path (the response says
+    so).
+
+    The response has "file" (the .xpf used), "preset" ("Folder/Name"),
+    "instrument" (and "lmms_plugin" when the project stores another name,
+    e.g. OPL2 for opulenz), "replaced", "kept", "tuning",
+    "playable_keys" when the instrument cannot play all keys 0-108 at the
+    right pitch, "other_matches" when a plain name matched several presets
+    (pass "Folder/Name" to pick), "warnings" and "note". If nothing
+    matches, the error suggests close names.
+
+    Args:
+        track_index: Index of an instrument track, or null to create a
+            new instrument track from the preset
+        preset: "Folder/Name" as list_instrument_presets shows it (e.g.
+            "TripleOscillator/AmazingBubbles"; the folder is the
+            instrument), a plain name ("Amazing Bubbles"; case, spaces and
+            "-" "_" do not matter), or an absolute path to an .xpf file
+        name: Name of the new track (track_index null), default the
+            preset's own name; on an existing track it renames the track
+        rename: Give an existing track the preset's own name
+    """
+    proj = get_project()
+    av = _availability
+
+    track = None
+    if track_index is not None:
+        error = _track_index_error(proj, track_index)
+        if error is None:
+            track = xml_parser.find_track_element(proj.root, track_index)
+            if track.find("instrumenttrack") is None:
+                kind = xml_parser.track_type_name(
+                    xml_parser.get_track_type(track)).lower()
+                error = (
+                    f"Track {track_index} is a {kind} track, not an "
+                    f"instrument track, so it cannot take an instrument "
+                    f"preset. Presets load into tracks made with "
+                    f"add_instrument_track (list_tracks shows the types), "
+                    f"or pass track_index=null to create a new instrument "
+                    f"track from the preset."
+                )
+        if error:
+            return json.dumps({"error": error})
+
+    try:
+        match = inst_presets.find_preset(preset, _canonical_instrument)
+        loaded = inst_presets.read_preset(match.path)
+    except inst_presets.PresetNotFoundError as exc:
+        return json.dumps({"error": str(exc), "suggestions": exc.suggestions})
+    except (inst_presets.PresetError, ValueError, OSError) as exc:
+        return json.dumps({"error": str(exc)})
+
+    instrument = _canonical_instrument(loaded.plugin)
+    if not _preset_instrument_offered(instrument, av):
+        return _preset_plugin_refusal(loaded.plugin, instrument, av)
+    plugin = av.plugin_name(instrument)
+
+    check = inst_presets.resolve_samples(loaded, lmms_app.sample_search_dirs())
+    if check.missing:
+        missing = check.missing[0]
+        looked = ""
+        if not inst_presets.is_absolute_path(missing):
+            folders = [str(loaded.path.parent)] + [
+                str(d) for d in lmms_app.sample_search_dirs()]
+            looked = f" (looked in {', '.join(folders)})"
+        return json.dumps({"error": (
+            f"Preset '{match.label}' plays the file '{missing}', which was "
+            f"not found{looked}. LMMS would load nothing and the track "
+            f"would be silent, so nothing was changed. Restore the file, "
+            f"or choose another preset (list_instrument_presets)."
+        )})
+
+    warnings = []
+    if loaded.fxchain is not None:
+        dropped = inst_presets.filter_effects(
+            loaded, lambda n: not av.verified or n.lower() in av.installed)
+        if dropped:
+            warnings.append(
+                f"Left out effect(s) the installed LMMS lacks: "
+                f"{', '.join(dropped)}."
+            )
+    for src in check.unverified:
+        warnings.append(
+            f"No LMMS installation was found, so the file '{src}' could "
+            f"not be checked; if LMMS cannot find it the track is silent."
+        )
+
+    created = track is None
+    if created:
+        track_name = name or loaded.name
+        volume = max(0, min(200, loaded.volume))
+        panning = max(-100, min(100, loaded.panning))
+        added = proj.add_track(
+            "instrument", track_name, instrument=plugin, mixer_channel=0,
+            volume=volume, panning=panning)
+        track_index = added["track_index"]
+        track = xml_parser.find_track_element(proj.root, track_index)
+    inst_track = track.find("instrumenttrack")
+
+    try:
+        new, replaced, kept, note = _install_preset(
+            inst_track, loaded, plugin, instrument)
+    except (ValueError, KeyError, IndexError) as exc:
+        if created:
+            proj.remove_track(track_index)
+        return json.dumps({"error": f"Preset not loaded: {exc}"})
+    track[list(track).index(inst_track)] = new
+    proj._modified = True
+
+    renamed = name if (name and not created) else (
+        loaded.name if rename and not created else None)
+    if renamed:
+        track.set("name", renamed)
+
+    report = pitch.tuning_report(new)
+    report.pop("instrument", None)
+    playable = report.pop("playable_keys", None)
+
+    notes = [note] if note else []
+    if not created:
+        mix = _preset_mix_note(track_index, loaded, inst_track)
+        if mix:
+            notes.append(mix)
+        kept = ["notes", "name" if not renamed else None,
+                "volume", "panning", "mixer channel", *kept]
+        kept = [k for k in kept if k]
+    else:
+        kept = []
+    if check.made_absolute:
+        notes.append(
+            "LMMS looks for a relative sample path in its samples folders, "
+            "not beside the preset, so the sample is set by its absolute "
+            "path: " + ", ".join(check.made_absolute.values()) + "."
+        )
+    if match.other_matches:
+        more = match.other_total - len(match.other_matches)
+        extra = f" (and {more} more)" if more > 0 else ""
+        notes.append(
+            f"'{preset}' matched several presets; loaded '{match.label}'. "
+            f"To pick another, pass \"Folder/Name\" from "
+            f"other_matches{extra}."
+        )
+
+    result: dict = {
+        "track_index": track_index,
+        "file": str(match.path),
+        "preset": match.label,
+        "instrument": instrument,
+    }
+    if created:
+        result["created"] = True
+    if plugin != instrument:
+        result["lmms_plugin"] = plugin
+    if created or renamed:
+        result["name"] = track.get("name")
+    result["replaced"] = replaced
+    if kept:
+        result["kept"] = kept
+    result["tuning"] = report
+    if playable:
+        result["playable_keys"] = list(playable)
+    if match.other_matches:
+        result["other_matches"] = match.other_matches
+    if warnings:
+        result["warnings"] = warnings
+    if notes:
+        result["note"] = " ".join(notes)
+    result["message"] = (
+        f"Loaded preset '{match.label}' ({instrument}) "
+        + (f"into a new track {track_index}" if created
+           else f"into track {track_index}")
+    )
+    return json.dumps(result)
+
+
+@mcp.tool()
+def list_instrument_presets(instrument: str | None = None) -> str:
+    """List the instrument presets (.xpf) load_instrument_preset can load.
+
+    Presets come from LMMS's factory presets, the user's own LMMS presets
+    folder (<LMMS working dir>/presets, where "Save as preset" puts them)
+    and the folders in the LMMS_PRESET_DIRS environment variable. Only
+    presets of instruments the installed LMMS offers are listed.
+
+    Without arguments this is a short overview: per instrument the number
+    of presets and a few example names. With `instrument` it lists every
+    preset of that instrument (up to 200); pass a name from there as
+    `preset` to load_instrument_preset.
+
+    Args:
+        instrument: Instrument to list, e.g. "tripleoscillator" or
+            "opulenz" (also "opl2"). Omit for the overview.
+    """
+    av = _availability
+    roots = inst_presets.preset_roots()
+    if not roots:
+        return json.dumps({
+            "error": "No instrument preset folder found.",
+            "hint": "LMMS keeps presets in <LMMS working dir>/presets and "
+                    "its factory presets folder (e.g. /usr/share/lmms/"
+                    "presets). Set the LMMS_PRESET_DIRS environment "
+                    "variable to folders holding .xpf files, or pass an "
+                    "absolute path to load_instrument_preset.",
+        })
+    files, truncated = inst_presets.scan_presets(roots)
+    groups: dict[str, list[str]] = {}
+    unreadable = not_offered = 0
+    for f in files:
+        plugin = inst_presets.peek_plugin(f.path)
+        if plugin is None:
+            unreadable += 1
+            continue
+        kind = _canonical_instrument(plugin)
+        if not _preset_instrument_offered(kind, av):
+            not_offered += 1
+            continue
+        groups.setdefault(kind, []).append(f.label)
+    order = {name: i for i, name in enumerate(KNOWN_INSTRUMENTS)}
+    names = sorted(groups, key=lambda n: (order.get(n, len(order)), n))
+
+    skipped = {}
+    if not_offered:
+        skipped["instrument_not_available"] = not_offered
+    if unreadable:
+        skipped["unreadable"] = unreadable
+    result: dict = {"preset_dirs": [str(r) for r in roots]}
+
+    if instrument is not None:
+        wanted = _canonical_instrument(
+            INSTRUMENT_ALIASES.get(instrument.strip().lower(), instrument))
+        if wanted not in groups:
+            return json.dumps({
+                "error": f"No presets found for instrument "
+                         f"'{instrument}'.",
+                "instruments_with_presets": names,
+                **result,
+            })
+        labels = sorted(groups[wanted], key=str.lower)
+        result.update({
+            "instrument": wanted,
+            "count": len(labels),
+            "presets": labels[:_MAX_PRESETS_LISTED],
+        })
+        if len(labels) > _MAX_PRESETS_LISTED:
+            result["truncated"] = True
+    else:
+        result["total"] = sum(len(v) for v in groups.values())
+        result["instruments"] = {
+            n: {"count": len(groups[n]),
+                "examples": sorted(groups[n], key=str.lower)[:_PRESET_EXAMPLES]}
+            for n in names
+        }
+        result["hint"] = (
+            "list_instrument_presets(instrument) lists all presets of one "
+            "instrument; load_instrument_preset(track_index, \"Folder/"
+            "Name\") loads one."
+        )
+    if skipped:
+        result["skipped"] = skipped
+    if truncated:
+        result["scan_truncated"] = (
+            f"only the first {inst_presets.MAX_SCANNED} preset files were "
+            f"scanned")
+    return json.dumps(result)
 
 
 # ──────────────────────────────────────────────────────────────────

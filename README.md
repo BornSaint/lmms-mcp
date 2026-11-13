@@ -11,6 +11,7 @@ An MCP (Model Context Protocol) server for [LMMS](https://lmms.io/) - the free, 
 - **Effects**: built-in effects on tracks and mixer channels (delay, reverb, EQ, dynamics...)
 - **Adapts to your LMMS**: only plugins your installed LMMS version really has are offered or accepted (see [Installed LMMS version](#installed-lmms-version))
 - **ZynAddSubFX presets**: Load any of ~950 factory instruments (.xiz), tune parameters
+- **Instrument presets**: Load LMMS's factory presets and your own saved ones (.xpf, e.g. a tuned piano sample) into an instrument track with `load_instrument_preset` (see [Instrument presets](#instrument-presets-xpf))
 - **Arrangement**: Place patterns, BB clips and audio clips on the song timeline
 - **Automation**: Tempo ramps, volume swells, panning curves - linked to real LMMS models
 - **Mixer control**: Create channels, set volume, name channels
@@ -155,6 +156,13 @@ Only offered when the installed LMMS has the `zynaddsubfx` plugin.
 | `list_zyn_presets` | Browse ~950 factory presets (.xiz) by category |
 | `load_zyn_preset` | Load a preset into a zynaddsubfx track |
 | `set_zyn_params` | Set portamento, filter, FM gain, resonance etc. |
+
+### Instrument Presets (.xpf)
+
+| Tool | Description |
+|------|-------------|
+| `list_instrument_presets` | Overview of the available presets per instrument (count and a few examples), or all presets of one instrument |
+| `load_instrument_preset` | Load a preset into an instrument track (or create the track from it with `track_index=null`) |
 
 ### Arrangement (Song Editor Timeline)
 
@@ -302,7 +310,7 @@ LMMS 1.2.2, rendering A3, A4 and A5 and estimating the fundamental) live in
 | Instrument | Without compensation | Fix |
 |------------|----------------------|-----|
 | `zynaddsubfx` | 12 semitones low (LMMS hands its key to ZynAddSubFX as the MIDI note, A4 = 69) | base note 45 |
-| `opulenz` (`OPL2` in LMMS 1.2.x) | fundamental 12 semitones low (the default patch's modulator runs at half the carrier frequency) | base note 45 |
+| `opulenz` (`OPL2` in LMMS 1.2.x) | fundamental 12 semitones low on the default patch (its modulator runs at half the carrier frequency); other patches differ, see [Instrument presets](#instrument-presets-xpf) | base note 45 (default patch) |
 | every other pitched instrument | within 1 % of the key | none |
 
 ZynAddSubFX presets also carry an octave transposition of their own (about
@@ -393,6 +401,57 @@ set_audiofile_sample(0, "instruments/cello01.ogg", base_note="D3", pitch_cents=1
 add_note_by_name(0, "A3")      # key 45: sounds at 220 Hz
 ```
 
+## Instrument presets (.xpf)
+
+An `.xpf` file is what LMMS writes for "Save as preset" on an instrument
+track: plain XML with the instrument, all its settings, envelopes/filter,
+chords/arpeggio, effects and the track's tuning. `list_instrument_presets`
+lists the ones available for the instruments your LMMS offers, and
+`load_instrument_preset(track_index, "Folder/Name")` loads one, for
+example `"TripleOscillator/AmazingBubbles"`, a plain `"Amazing Bubbles"`
+(case, spaces, `-` and `_` do not matter) or an absolute path. Pass
+`track_index=null` to create the instrument track from the preset in one
+call.
+
+Where presets are looked for, in this order: the folders in
+`LMMS_PRESET_DIRS`, your LMMS presets folder (`presets/` in the LMMS
+working directory from `~/.lmmsrc.xml`, where "Save as preset" puts them)
+and the factory presets (`/usr/share/lmms/presets` on Linux,
+`data/presets` on Windows). Every `.xpf` below those folders counts, so a
+folder of your own tuned sample presets works too.
+
+What loading into an existing track replaces and keeps:
+
+| Replaced by the preset | Kept on the track |
+|------------------------|-------------------|
+| the instrument and its settings (the track changes instrument if the preset uses another one) | notes and patterns |
+| envelopes and filter, chords, arpeggio | track name (`rename=True` or `name` sets it; a new track gets the preset's) |
+| the effect chain, only when the preset has effects | volume, panning (the response notes it when the preset was saved with other values), mute, solo |
+| the tuning: base note, fine tune and pitch range, stored as the preset's author heard them | mixer channel, MIDI port |
+
+A call is refused, and nothing changes, when the preset needs an instrument
+your LMMS does not have, when a sample or soundfont it plays is missing
+(the track would be silent), or when the track is not an instrument track.
+LMMS finds a relative sample path in your LMMS samples folder or its
+factory samples, never next to the preset or project (checked with LMMS
+1.2.2: such a sample renders silent): a sample lying beside the
+preset is set by its absolute path, and the response says so. Effects whose
+plugin is not installed are left out with a warning. Presets in LMMS's
+pre-1.0 channel format cannot be read.
+
+The tuning comes back in the response (`tuning` with a `hint`). A preset of
+a tuned sample keeps the base note it was saved with: key 48 plays a
+sample saved with base note 48 at its original pitch. Instruments LMMS
+plays off pitch (see [Pitch](#pitch-key-57--a4--440-hz-on-every-instrument) above) are compensated when the
+preset has the default base note 57, so key 57 is A4 = 440 Hz as on a new
+track. The OPL2 pitch depends on the patch: the fundamental is the greatest
+common divisor of the two operators' frequency multipliers (a quiet x0.5
+operator, op1 level below 50, does not count). Measured with LMMS 1.2.2
+at `-x 1` on all 15 factory OpulenZ presets: 13 sound at the key (key 57 =
+441 Hz) as stored, `Funky` and `Combo_organ` an octave low and are
+compensated (base note 45), and `Bubbly_days` has a ×0.5 modulator that is
+too quiet to be heard as the pitch.
+
 ## Available Instruments
 
 All built-in LMMS instruments (verified against LMMS source). LMMS has no
@@ -447,6 +506,7 @@ Typical chains:
 |----------|---------|-------------|
 | `LMMS_PROJECTS_DIR` | `~/Desktop/Media/lmms/AI-Projects` | Default directory for saving projects |
 | `LMMS_PRESETS_DIR` | auto-detected | Path to the ZynAddSubFX presets folder (`data/presets/ZynAddSubFX`) or its parent presets folder |
+| `LMMS_PRESET_DIRS` | none | Extra folders (separated by `:` on Linux, `;` on Windows) with instrument presets (`.xpf`), searched before your LMMS presets folder and the factory presets |
 | `LMMS_EXECUTABLE` | auto-detected | Path to the LMMS executable (`lmms.exe` / `lmms`) (for version/plugin checks and rendering) |
 | `LMMS_PLUGINS_DIR` | auto-detected | LMMS plugins folder (overrides detection; `*.dll` on Windows, `lib<name>.so` on Linux) |
 

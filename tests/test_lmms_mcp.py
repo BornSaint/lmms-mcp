@@ -4979,3 +4979,707 @@ class TestTrackTuning:
         assert "`set_track_tuning`" in readme
         flat = " ".join(readme.split())
         assert "base_note" in flat and "pitch_cents" in flat
+
+
+# ──────────────────────────────────────────────────────────────────
+# Instrument presets (.xpf)
+# ──────────────────────────────────────────────────────────────────
+
+
+def _xpf(name="Test Sound", plugin="tripleoscillator", settings='coarse0="-12"',
+         *, basenote=57, pitch=0, pitchrange=1, vol=100, pan=0, compat=False,
+         root="lmms-project", effects=(), ids=False, midiport=True,
+         sound_parts=True, settings_xml=None, kind="instrumenttracksettings"):
+    """An .xpf modelled on the files LMMS writes (see /usr/share/lmms/presets).
+
+    `compat` writes the pre-1.1 layout (settings directly in
+    <instrumenttrack>, no <instrument>); `effects` are (plugin name,
+    attributes) pairs for the <fxchain>. The sound parts carry marker
+    values: filter cutoff 484, chord 3, arpeggio 2.
+    """
+    model = ' id="5593744"' if ids else ""
+    body = settings_xml if settings_xml is not None else (
+        f"<{plugin} {settings}/>")
+    instrument = body if compat else (
+        f'<instrument name="{plugin}">{body}</instrument>')
+    parts = (
+        '<eldata fres="0.7" ftype="6" fcut="484" fwet="1">'
+        f'<elvol lspd_denominator="4" sustain="1" amt="1" lamt="0.18"/>'
+        f'<fcut value="12819"{model}/>'
+        '</eldata>'
+        '<chordcreator chord="3" chordrange="1" chord-enabled="1"/>'
+        '<arpeggiator arp="2" arprange="1" arp-enabled="1" arpgate="100"/>'
+    ) if sound_parts else ""
+    port = (
+        '<midiport inputcontroller="0" outputchannel="7" readable="1" '
+        'writable="1" basevelocity="63"/>'
+    ) if midiport else ""
+    fx = "".join(
+        f'<effect name="{n}" wet="1" on="1" {a}/>' for n, a in effects)
+    chain = (
+        f'<fxchain numofeffects="{len(effects)}" enabled="1">{fx}</fxchain>'
+        if effects else '<fxchain numofeffects="0" enabled="0"/>'
+    )
+    return (
+        '<?xml version="1.0"?>\n<!DOCTYPE lmms-project>\n'
+        f'<{root} version="1.0" creator="LMMS" creatorversion="1.0.2" '
+        f'type="{kind}">\n  <head/>\n'
+        f'  <instrumenttracksettings muted="0" type="0" name="{name}" solo="0">\n'
+        f'    <instrumenttrack pan="{pan}" fxch="9" pitchrange="{pitchrange}" '
+        f'pitch="{pitch}" basenote="{basenote}" vol="{vol}">\n'
+        f'      {instrument}{parts}{port}{chain}\n'
+        '    </instrumenttrack>\n  </instrumenttracksettings>\n'
+        f'</{root}>\n'
+    )
+
+
+class _PresetLab:
+    """A fake preset folder, samples folder and a one-track project."""
+
+    def __init__(self, tmp_path, monkeypatch):
+        from lmms_mcp import instrument_presets, lmms_app
+        from lmms_mcp import server as srv
+
+        self.srv = srv
+        self.root = tmp_path / "presets"
+        self.root.mkdir()
+        self.samples = tmp_path / "lmms_samples"
+        self.samples.mkdir()
+        monkeypatch.setenv("LMMS_PRESET_DIRS", str(self.root))
+        monkeypatch.setattr(instrument_presets, "_system_roots", lambda: [])
+        monkeypatch.setattr(
+            lmms_app, "sample_search_dirs", lambda: [self.samples])
+        self.proj = LMMSProject()
+        self.proj.new()
+        srv.set_project(self.proj)
+        srv.add_instrument_track(
+            "Lead", instrument="tripleoscillator", mixer_channel=2,
+            volume=80, panning=20)
+        srv.add_note(0, 60, 0, 48, 100)
+        srv.add_note(0, 64, 48, 48, 100)
+
+    def put(self, rel, text):
+        path = self.root / rel
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(text)
+        return path
+
+    def load(self, index, preset, **kwargs):
+        return json.loads(
+            self.srv.load_instrument_preset(index, preset, **kwargs))
+
+    def inst_track(self, index=0):
+        return find_tracks(self.proj.root)[index].find("instrumenttrack")
+
+    def xml(self):
+        return self.proj.get_xml_string()
+
+
+@pytest.fixture
+def lab(tmp_path, monkeypatch):
+    return _PresetLab(tmp_path, monkeypatch)
+
+
+class TestLoadInstrumentPreset:
+    """load_instrument_preset: an .xpf replaces the sound of a track."""
+
+    def test_replaces_the_sound_and_keeps_the_rest(self, lab):
+        lab.put("TripleOscillator/Amazing Bubbles.xpf", _xpf(
+            "Amazing Bubbles", vol=50, pan=-30, basenote=57))
+        result = lab.load(0, "TripleOscillator/Amazing Bubbles")
+        assert result["track_index"] == 0
+        assert result["preset"] == "TripleOscillator/Amazing Bubbles"
+        assert result["file"].endswith("Amazing Bubbles.xpf")
+        assert result["instrument"] == "tripleoscillator"
+        assert "lmms_plugin" not in result and "created" not in result
+        assert result["replaced"] == [
+            "instrument", "envelopes and filter", "chords", "arpeggio",
+            "tuning"]
+        assert result["kept"] == [
+            "notes", "name", "volume", "panning", "mixer channel"]
+
+        inst = lab.inst_track()
+        assert inst.find("instrument/tripleoscillator").get("coarse0") == "-12"
+        assert inst.find("eldata").get("fcut") == "484"
+        assert inst.find("chordcreator").get("chord") == "3"
+        assert inst.find("arpeggiator").get("arp") == "2"
+        # The track keeps its mix, mixer channel, MIDI port and notes/name
+        assert (inst.get("vol"), inst.get("pan"), inst.get("mixch")) == (
+            "80", "20", "2")
+        assert inst.find("midiport").get("outputchannel") == "1"
+        track = find_tracks(lab.proj.root)[0]
+        assert track.get("name") == "Lead"
+        assert len(track.findall("pattern/note")) == 2
+        # ... and says that the preset was saved with another mix
+        assert "volume 50 (the track keeps 80" in result["note"]
+        assert "set_track_volume(0, 50)" in result["note"]
+        assert "panning -30 (the track keeps 20" in result["note"]
+        assert lab.proj.modified
+
+    def test_tuning_is_reported_as_stored(self, lab):
+        lab.put("Pads/Tuned.xpf", _xpf(
+            plugin="audiofileprocessor", settings='src="x.ogg" amp="100"',
+            basenote=48, pitch=18, pitchrange=1,
+            settings_xml="<audiofileprocessor/>"))
+        result = lab.load(0, "Pads/Tuned")
+        assert "error" not in result, result
+        tuning = result["tuning"]
+        assert tuning["base_note"] == 48 and tuning["base_note_name"] == "C4"
+        assert tuning["pitch_cents"] == 18 and tuning["written_basenote"] == 48
+        assert "Key 48 (C4) plays the sample at its original pitch" in tuning["hint"]
+        assert "instrument" not in tuning and "playable_keys" not in tuning
+        inst = lab.inst_track()
+        assert (inst.get("basenote"), inst.get("pitch")) == ("48", "18")
+
+    def test_pitchrange_covers_the_fine_tune(self, lab):
+        lab.put("A/B.xpf", _xpf(pitch=-250, pitchrange=1))
+        lab.load(0, "A/B")
+        assert lab.inst_track().get("pitchrange") == "3"
+        assert lab.inst_track().get("pitch") == "-250"
+
+    def test_rename_and_name(self, lab):
+        lab.put("A/Warm.xpf", _xpf("Warm Pad"))
+        assert lab.load(0, "A/Warm")["kept"][1] == "name"
+        assert find_tracks(lab.proj.root)[0].get("name") == "Lead"
+        result = lab.load(0, "A/Warm", rename=True)
+        assert result["name"] == "Warm Pad"
+        assert "name" not in result["kept"]
+        assert find_tracks(lab.proj.root)[0].get("name") == "Warm Pad"
+        assert lab.load(0, "A/Warm", name="Pad 2")["name"] == "Pad 2"
+        assert find_tracks(lab.proj.root)[0].get("name") == "Pad 2"
+
+    def test_creates_a_track(self, lab):
+        lab.put("A/Warm.xpf", _xpf("Warm Pad", vol=60, pan=-10))
+        result = lab.load(None, "A/Warm")
+        assert result["track_index"] == 1 and result["created"] is True
+        assert result["name"] == "Warm Pad"
+        assert "kept" not in result
+        inst = lab.inst_track(1)
+        assert (inst.get("vol"), inst.get("pan")) == ("60", "-10")
+        assert inst.find("eldata").get("fcut") == "484"
+        assert find_tracks(lab.proj.root)[1].get("name") == "Warm Pad"
+        named = lab.load(None, "A/Warm", name="Pad two")
+        assert named["track_index"] == 2 and named["name"] == "Pad two"
+        # the first track is untouched
+        assert lab.inst_track(0).find("eldata").get("fcut") == "14000"
+
+    def test_effect_chain_replaced_only_when_the_preset_has_effects(self, lab):
+        lab.srv.add_effect("track", 0, "reverbsc")
+        lab.put("A/Dry.xpf", _xpf("Dry"))
+        dry = lab.load(0, "A/Dry")
+        assert "kept" in dry and dry["kept"][-1] == "effects"
+        assert [e.get("name") for e in lab.inst_track().findall(
+            "fxchain/effect")] == ["reverbsc"]
+        lab.put("A/Wet.xpf", _xpf("Wet", effects=[
+            ("delay", ""), ("amplifier", "")]))
+        wet = lab.load(0, "A/Wet")
+        assert "effects (2)" in wet["replaced"]
+        assert "effects" not in wet["kept"]
+        chain = lab.inst_track().find("fxchain")
+        assert [e.get("name") for e in chain.findall("effect")] == [
+            "delay", "amplifier"]
+        assert chain.get("numofeffects") == "2"
+
+    def test_effects_the_install_lacks_are_left_out(self, lab, monkeypatch):
+        from lmms_mcp import lmms_app
+        srv = lab.srv
+        installed = (set(srv.KNOWN_INSTRUMENTS)
+                     | set(srv.effects_mod.KNOWN_EFFECTS)) - {"delay"}
+        monkeypatch.setattr(srv, "_availability", lmms_app.build_availability(
+            srv.KNOWN_INSTRUMENTS, srv.effects_mod.KNOWN_EFFECTS, installed,
+            "1.2.2", windows=False))
+        lab.put("A/Wet.xpf", _xpf(effects=[("delay", ""), ("amplifier", "")]))
+        result = lab.load(0, "A/Wet")
+        assert result["warnings"] == [
+            "Left out effect(s) the installed LMMS lacks: delay."]
+        chain = lab.inst_track().find("fxchain")
+        assert [e.get("name") for e in chain.findall("effect")] == ["amplifier"]
+        assert chain.get("numofeffects") == "1"
+
+    def test_old_layout_without_instrument_element(self, lab):
+        lab.put("TripleOscillator/Old.xpf", _xpf(
+            "Old", compat=True, root="multimedia-project"))
+        result = lab.load(0, "TripleOscillator/Old")
+        assert "error" not in result, result
+        inst = lab.inst_track().find("instrument")
+        assert inst.get("name") == "tripleoscillator"
+        assert [c.tag for c in inst] == ["tripleoscillator"]
+        # LMMS-1.0-style roots read as well
+        lab.put("X/Y.xpf", _xpf(root="multimediaproject"))
+        assert "error" not in lab.load(0, "X/Y")
+
+    def test_model_ids_are_not_copied(self, lab):
+        lab.put("A/Ids.xpf", _xpf(ids=True))
+        lab.load(0, "A/Ids")
+        fcut = lab.inst_track().find("eldata/fcut")
+        assert fcut.get("value") == "12819" and fcut.get("id") is None
+
+    def test_result_saves_and_reloads(self, lab, tmp_path):
+        lab.put("A/B.xpf", _xpf(settings='coarse0="7"'))
+        lab.load(0, "A/B")
+        path = lab.proj.save(tmp_path / "out.mmp")
+        again = LMMSProject()
+        again.load(path)
+        inst = find_tracks(again.root)[0].find("instrumenttrack")
+        assert inst.find("instrument/tripleoscillator").get("coarse0") == "7"
+
+    # --- instrument availability and names --------------------------------
+
+    @pytest.fixture
+    def linux122(self, lab, monkeypatch):
+        monkeypatch.setattr(
+            lab.srv, "_availability",
+            TestInstrumentPluginNames._availability(
+                LINUX_122_LIBS + ("libwatsyn.so",)))
+        return lab
+
+    def test_opl2_preset_maps_to_opulenz(self, linux122):
+        lab = linux122
+        lab.put("OpulenZ/Bells.xpf", _xpf(
+            "Bells", plugin="OPL2", settings='op1_mul="1" op2_mul="1"'))
+        result = lab.load(None, "OpulenZ/Bells")
+        assert result["instrument"] == "opulenz"
+        assert result["lmms_plugin"] == "OPL2"
+        inst = lab.inst_track(1).find("instrument")
+        assert inst.get("name") == "OPL2" and inst[0].tag == "OPL2"
+
+    def test_preset_names_follow_the_installed_library(self, linux122):
+        lab = linux122
+        lab.put("A/Opulenz.xpf", _xpf(plugin="opulenz", settings='op2_mul="1"'))
+        lab.put("A/Gb.xpf", _xpf(plugin="freeboy", settings='sweep="0"'))
+        lab.put("A/Custom.xpf", _xpf(plugin="mycustomsynth", settings='a="1"'))
+        opl = lab.load(None, "A/Opulenz")
+        assert (opl["instrument"], opl["lmms_plugin"]) == ("opulenz", "OPL2")
+        gb = lab.load(None, "A/Gb")
+        assert (gb["instrument"], gb["lmms_plugin"]) == ("freeboy", "papu")
+        assert lab.inst_track(2).find("instrument").get("name") == "papu"
+        custom = lab.load(None, "A/Custom")
+        assert custom["instrument"] == "mycustomsynth"
+        assert custom["lmms_plugin"] == "MyCustomSynth"
+
+    def test_unavailable_instrument_is_refused(self, linux122):
+        lab = linux122
+        lab.put("A/Lead.xpf", _xpf(plugin="xpressive", settings='a="1"'))
+        before = lab.xml()
+        result = lab.load(0, "A/Lead")
+        assert "'xpressive' is not available" in result["error"]
+        assert result["alternative"] == "watsyn"
+        assert "list_instrument_presets" in result["error"]
+        assert "tripleoscillator" in result["available_instruments"]
+        assert lab.load(None, "A/Lead")["error"] == result["error"]
+        assert lab.xml() == before
+
+    def test_unknown_plugin_without_alternative(self, linux122):
+        lab = linux122
+        lab.put("A/Ghost.xpf", _xpf(plugin="ghostsynth", settings='a="1"'))
+        result = lab.load(0, "A/Ghost")
+        assert "'ghostsynth' is not installed" in result["error"]
+        assert "alternative" not in result
+
+    def test_vst_preset_is_refused(self, lab):
+        lab.put("A/Vst.xpf", _xpf(plugin="vestige", settings='plugin="x.dll"'))
+        assert "add_vst_track" in lab.load(0, "A/Vst")["error"]
+
+    # --- pitch calibration of plugins LMMS plays off pitch -----------------
+
+    def test_default_base_note_is_calibrated_for_an_octave_low_patch(self, linux122):
+        lab = linux122
+        lab.put("OpulenZ/Low.xpf", _xpf(
+            plugin="OPL2", settings='op1_mul="0" op2_mul="1" op1_lvl="62"'))
+        result = lab.load(None, "OpulenZ/Low")
+        assert lab.inst_track(1).get("basenote") == "45"
+        assert result["tuning"]["base_note"] == 57
+        assert result["tuning"]["written_basenote"] == 45
+        assert "key 57 = A4 = 440 Hz" in result["note"]
+        assert "12 semitones below" in result["note"]
+        assert result["playable_keys"] == [0, 90]
+
+    def test_default_base_note_is_kept_for_a_patch_at_pitch(self, linux122):
+        lab = linux122
+        lab.put("OpulenZ/Right.xpf", _xpf(
+            plugin="OPL2", settings='op1_mul="1" op2_mul="1"'))
+        result = lab.load(None, "OpulenZ/Right")
+        assert lab.inst_track(1).get("basenote") == "57"
+        assert result["tuning"]["base_note"] == 57
+        assert "note" not in result
+        assert result["playable_keys"] == [0, 102]
+
+    def test_other_base_notes_are_kept_exactly(self, linux122):
+        lab = linux122
+        lab.put("OpulenZ/Odd.xpf", _xpf(
+            plugin="OPL2", basenote=60, settings='op1_mul="0" op2_mul="1"'))
+        result = lab.load(None, "OpulenZ/Odd")
+        assert lab.inst_track(1).get("basenote") == "60"
+        assert result["tuning"]["written_basenote"] == 60
+        assert "note" not in result
+
+    def test_zynaddsubfx_preset_is_calibrated(self, linux122):
+        lab = linux122
+        zyn = ('<zynaddsubfx><ZynAddSubFX-data><MASTER><PART><INSTRUMENT/>'
+               '</PART></MASTER></ZynAddSubFX-data></zynaddsubfx>')
+        lab.put("Zyn/Pad.xpf", _xpf(plugin="zynaddsubfx", settings_xml=zyn))
+        result = lab.load(None, "Zyn/Pad")
+        assert lab.inst_track(1).get("basenote") == "45"
+        assert result["tuning"]["base_note"] == 57
+        assert "key 57 = A4 = 440 Hz" in result["note"]
+
+    # --- files the preset plays ----------------------------------------------
+
+    def _sample_preset(self, lab, src, **kwargs):
+        return lab.put("AudioFileProcessor/Piano.xpf", _xpf(
+            "Piano", plugin="audiofileprocessor",
+            settings=f'src="{src}" amp="100" looped="0"', basenote=48,
+            **kwargs))
+
+    def test_absolute_sample_that_exists(self, lab, tmp_path):
+        sample = tmp_path / "elsewhere" / "piano.ogg"
+        sample.parent.mkdir()
+        sample.write_bytes(b"x")
+        self._sample_preset(lab, sample)
+        result = lab.load(0, "Piano")
+        assert "error" not in result, result
+        afp = lab.inst_track().find("instrument/audiofileprocessor")
+        assert afp.get("src") == str(sample)
+        assert "warnings" not in result
+
+    def test_relative_sample_found_the_way_lmms_finds_it(self, lab):
+        (lab.samples / "drums").mkdir()
+        (lab.samples / "drums" / "kick.ogg").write_bytes(b"x")
+        self._sample_preset(lab, "drums/kick.ogg")
+        result = lab.load(0, "Piano")
+        assert "error" not in result, result
+        afp = lab.inst_track().find("instrument/audiofileprocessor")
+        assert afp.get("src") == "drums/kick.ogg"
+        assert "absolute path" not in result.get("note", "")
+
+    def test_relative_sample_beside_the_preset_gets_an_absolute_path(self, lab):
+        beside = lab.put("AudioFileProcessor/piano.ogg", "x")
+        self._sample_preset(lab, "piano.ogg")
+        result = lab.load(0, "Piano")
+        assert "error" not in result, result
+        afp = lab.inst_track().find("instrument/audiofileprocessor")
+        assert afp.get("src") == str(beside.resolve())
+        assert "absolute path" in result["note"]
+        assert str(beside.resolve()) in result["note"]
+
+    def test_missing_relative_sample_is_refused(self, lab):
+        self._sample_preset(lab, "gone/piano.ogg")
+        before = lab.xml()
+        result = lab.load(0, "Piano")
+        assert "'gone/piano.ogg'" in result["error"]
+        assert "silent" in result["error"] and "nothing was changed" in result["error"]
+        assert str(lab.samples) in result["error"]
+        assert lab.xml() == before
+        assert len(find_tracks(lab.proj.root)) == 1
+        # creating a track refuses just the same and leaves no track behind
+        assert "error" in lab.load(None, "Piano")
+        assert len(find_tracks(lab.proj.root)) == 1
+
+    def test_missing_absolute_sample_is_refused(self, lab, tmp_path):
+        self._sample_preset(lab, tmp_path / "nowhere" / "piano.ogg")
+        result = lab.load(0, "Piano")
+        assert str(tmp_path / "nowhere" / "piano.ogg") in result["error"]
+        assert "looked in" not in result["error"]
+
+    def test_unverifiable_relative_sample_only_warns(self, lab, monkeypatch):
+        from lmms_mcp import lmms_app
+        monkeypatch.setattr(lmms_app, "sample_search_dirs", lambda: [])
+        self._sample_preset(lab, "drums/kick.ogg")
+        result = lab.load(0, "Piano")
+        assert "error" not in result
+        assert "could not be checked" in result["warnings"][0]
+
+    # --- refusals that change nothing ---------------------------------------
+
+    def test_non_instrument_track_is_refused(self, lab):
+        lab.srv.add_sample_track("Vox")
+        lab.put("A/B.xpf", _xpf())
+        before = lab.xml()
+        result = lab.load(1, "A/B")
+        assert "Track 1 is a sample track, not an instrument track" in result["error"]
+        assert "track_index=null" in result["error"]
+        assert lab.xml() == before
+
+    @pytest.mark.parametrize("index", [5, -1, True, "0"])
+    def test_bad_track_index(self, lab, index):
+        lab.put("A/B.xpf", _xpf())
+        assert "error" in lab.load(index, "A/B")
+
+    def test_no_tracks_at_all(self, lab):
+        lab.srv.remove_track(0)
+        lab.put("A/B.xpf", _xpf())
+        assert "no tracks yet" in lab.load(0, "A/B")["error"]
+        assert lab.load(None, "A/B")["track_index"] == 0
+
+    @pytest.mark.parametrize("text,fragment", [
+        ("not xml at all", "not valid XML"),
+        ("<song/>", "not an LMMS file"),
+        (_xpf(kind="song"), "type 'song', not an instrument preset"),
+        (_xpf(kind="channelsettings"), "pre-1.0 channel format"),
+        ('<lmms-project type="instrumenttracksettings"><head/></lmms-project>',
+         "no <instrumenttrack>"),
+        (_xpf(plugin="", settings_xml=""), "contains no instrument"),
+    ])
+    def test_unusable_files_are_refused(self, lab, text, fragment):
+        lab.put("Bad/File.xpf", text)
+        before = lab.xml()
+        result = lab.load(0, "Bad/File")
+        assert fragment in result["error"]
+        assert lab.xml() == before
+
+
+class TestInstrumentPresetLookup:
+    """Finding the preset a request names."""
+
+    @pytest.fixture
+    def library(self, lab):
+        lab.put("TripleOscillator/AmazingBubbles.xpf", _xpf("Amazing Bubbles"))
+        lab.put("TripleOscillator/Wobble Bass.xpf", _xpf("Wobble"))
+        lab.put("Kicker/Wobble Bass.xpf", _xpf("Kick Wobble", plugin="kicker"))
+        lab.put("OpulenZ/Bells.xpf", _xpf(
+            plugin="OPL2", settings='op1_mul="1" op2_mul="1"'))
+        lab.put("Flat.xpf", _xpf("Flat"))
+        return lab
+
+    def test_label_forms(self, library):
+        for request in (
+            "TripleOscillator/AmazingBubbles",
+            "TripleOscillator/AmazingBubbles.xpf",
+            "tripleoscillator/amazing bubbles",
+            "Amazing Bubbles", "amazing_bubbles", "AMAZING-BUBBLES",
+        ):
+            result = library.load(0, request)
+            assert result["preset"] == "TripleOscillator/AmazingBubbles", request
+            assert "other_matches" not in result
+
+    def test_name_matching_the_end_of_a_name(self, library):
+        assert library.load(0, "Bubbles")["preset"] == (
+            "TripleOscillator/AmazingBubbles")
+
+    def test_instrument_name_may_replace_the_folder(self, library):
+        # the folder is OpulenZ, the instrument opulenz / OPL2
+        for request in ("OpulenZ/Bells", "opulenz/Bells", "opl2/Bells"):
+            assert library.load(None, request)["preset"] == "OpulenZ/Bells", request
+        assert library.load(None, "tripleoscillator/Bells").get("error")
+
+    def test_flat_file_and_absolute_path(self, library):
+        assert library.load(0, "Flat")["preset"] == "Flat"
+        path = library.root / "TripleOscillator" / "AmazingBubbles.xpf"
+        for given in (str(path), str(path)[:-4]):
+            result = library.load(0, given)
+            assert result["file"] == str(path)
+            assert result["preset"] == "TripleOscillator/AmazingBubbles"
+
+    def test_ambiguous_name_lists_other_matches(self, library):
+        result = library.load(0, "Wobble Bass")
+        assert result["preset"] == "Kicker/Wobble Bass" \
+            or result["preset"] == "TripleOscillator/Wobble Bass"
+        other = {"Kicker/Wobble Bass", "TripleOscillator/Wobble Bass"} \
+            - {result["preset"]}
+        assert set(result["other_matches"]) == other
+        assert "matched several presets" in result["note"]
+        # a folder picks one
+        picked = library.load(0, "Kicker/Wobble Bass")
+        assert picked["preset"] == "Kicker/Wobble Bass"
+        assert "other_matches" not in picked
+
+    def test_not_found_suggests_close_names(self, library):
+        before = library.xml()
+        result = library.load(0, "Amazin Bubles")
+        assert "not found" in result["error"]
+        assert "TripleOscillator/AmazingBubbles" in result["suggestions"]
+        assert "Did you mean" in result["error"]
+        assert "list_instrument_presets" in result["error"]
+        nothing = library.load(0, "qqqqzzzz")
+        assert nothing["suggestions"] == []
+        assert library.xml() == before
+
+    def test_wrong_folder_is_not_ignored(self, library):
+        result = library.load(0, "Kicker/Amazing Bubbles")
+        assert "not found" in result["error"]
+
+    def test_absolute_path_that_does_not_exist(self, library, tmp_path):
+        result = library.load(0, str(tmp_path / "nope.xpf"))
+        assert "does not exist" in result["error"]
+
+    def test_zyn_preset_points_to_load_zyn_preset(self, library):
+        assert "load_zyn_preset" in library.load(0, "Bass/0001-Deep.xiz")["error"]
+
+    def test_empty_request(self, library):
+        assert "must name a preset" in library.load(0, "  ")["error"]
+
+    def test_user_folder_comes_before_factory_folder(self, lab, tmp_path, monkeypatch):
+        from lmms_mcp import instrument_presets
+        factory = tmp_path / "factory"
+        monkeypatch.setattr(
+            instrument_presets, "_system_roots", lambda: [factory])
+        (factory / "TripleOscillator").mkdir(parents=True)
+        (factory / "TripleOscillator" / "Same.xpf").write_text(
+            _xpf(settings='coarse0="1"'))
+        lab.put("TripleOscillator/Same.xpf", _xpf(settings='coarse0="2"'))
+        result = lab.load(0, "Same")
+        assert result["file"] == str(lab.root / "TripleOscillator" / "Same.xpf")
+        assert "other_matches" not in result
+        assert lab.inst_track().find("instrument/tripleoscillator").get(
+            "coarse0") == "2"
+
+    def test_env_var_accepts_several_folders(self, lab, tmp_path, monkeypatch):
+        import os
+        second = tmp_path / "second"
+        (second / "Mine").mkdir(parents=True)
+        (second / "Mine" / "Tuned.xpf").write_text(_xpf("Tuned"))
+        monkeypatch.setenv(
+            "LMMS_PRESET_DIRS",
+            f"{lab.root}{os.pathsep}{second}{os.pathsep}{tmp_path / 'gone'}")
+        assert lab.load(0, "Mine/Tuned")["preset"] == "Mine/Tuned"
+
+
+class TestListInstrumentPresets:
+    def _list(self, lab, *args):
+        return json.loads(lab.srv.list_instrument_presets(*args))
+
+    @pytest.fixture
+    def library(self, lab, monkeypatch):
+        monkeypatch.setattr(
+            lab.srv, "_availability",
+            TestInstrumentPluginNames._availability())
+        for i in range(7):
+            lab.put(f"TripleOscillator/Tri {i}.xpf", _xpf(f"Tri {i}"))
+        lab.put("OpulenZ/Bells.xpf", _xpf(plugin="OPL2", settings='op2_mul="1"'))
+        lab.put("Mine/Own.xpf", _xpf(plugin="opulenz", settings='op2_mul="1"'))
+        lab.put("Slicer/Chop.xpf", _xpf(plugin="xpressive", settings='a="1"'))
+        lab.put("Broken/Bad.xpf", "garbage")
+        lab.put("Old/Chan.xpf", _xpf(kind="channelsettings"))
+        return lab
+
+    def test_overview_has_counts_and_a_few_examples(self, library):
+        result = self._list(library)
+        assert result["preset_dirs"] == [str(library.root)]
+        assert result["total"] == 9
+        tri = result["instruments"]["tripleoscillator"]
+        assert tri["count"] == 7 and len(tri["examples"]) == 5
+        # OPL2 and opulenz presets are the same instrument
+        assert result["instruments"]["opulenz"]["count"] == 2
+        assert "xpressive" not in result["instruments"]
+        assert list(result["instruments"]) == ["tripleoscillator", "opulenz"]
+        assert result["skipped"] == {
+            "instrument_not_available": 1, "unreadable": 2}
+        assert "list_instrument_presets(instrument)" in result["hint"]
+
+    def test_one_instrument_lists_all_its_presets(self, library):
+        for given in ("opulenz", "OPL2", "OpulenZ"):
+            result = self._list(library, given)
+            assert result["instrument"] == "opulenz"
+            assert result["count"] == 2
+            assert result["presets"] == ["Mine/Own", "OpulenZ/Bells"]
+        tri = self._list(library, "tripleoscillator")
+        assert tri["presets"][0] == "TripleOscillator/Tri 0"
+        assert "truncated" not in tri
+        # listed names load
+        assert library.load(None, "Mine/Own")["instrument"] == "opulenz"
+
+    def test_unknown_or_unavailable_instrument(self, library):
+        for given in ("xpressive", "nonsense"):
+            result = self._list(library, given)
+            assert "No presets found" in result["error"]
+            assert result["instruments_with_presets"] == [
+                "tripleoscillator", "opulenz"]
+
+    def test_listing_is_capped(self, lab):
+        for i in range(205):
+            lab.put(f"TripleOscillator/P{i:03d}.xpf", _xpf())
+        result = self._list(lab, "tripleoscillator")
+        assert result["count"] == 205 and len(result["presets"]) == 200
+        assert result["truncated"] is True
+
+    def test_no_preset_folder(self, lab, monkeypatch, tmp_path):
+        monkeypatch.setenv("LMMS_PRESET_DIRS", str(tmp_path / "missing"))
+        result = self._list(lab)
+        assert "No instrument preset folder" in result["error"]
+        assert "LMMS_PRESET_DIRS" in result["hint"]
+
+    def test_folder_without_presets(self, lab):
+        result = self._list(lab)
+        assert result["total"] == 0 and result["instruments"] == {}
+
+
+class TestInstrumentPresetTools:
+    def test_tools_are_registered_with_their_arguments(self, server_for):
+        import asyncio
+        srv = server_for(LMMS_122_PLUGINS)
+        tools = {t.name: t for t in asyncio.run(srv.mcp.list_tools())}
+        load = tools["load_instrument_preset"]
+        assert set(load.input_schema["properties"]) == {
+            "track_index", "preset", "name", "rename"}
+        assert set(load.input_schema["required"]) == {"track_index", "preset"}
+        assert "list_instrument_presets" in tools
+        assert "set_track_tuning" in load.description
+
+    def test_instructions_mention_presets(self):
+        from lmms_mcp import server as srv
+        text = " ".join(srv.build_instructions(
+            srv._availability, "/tmp/p").split())
+        assert "load_instrument_preset(track_index" in text
+        assert "list_instrument_presets" in text
+
+    def test_readme_documents_the_tools(self):
+        readme = (Path(__file__).resolve().parents[1] / "README.md").read_text()
+        assert "`load_instrument_preset`" in readme
+        assert "`list_instrument_presets`" in readme
+        assert "LMMS_PRESET_DIRS" in readme
+
+
+class TestOpl2PatchPitch:
+    """OPL2's pitch depends on the patch (operator multipliers)."""
+
+    @staticmethod
+    def _offset(**attrs):
+        from lmms_mcp import pitch
+        settings = ET.Element("OPL2", {k: str(v) for k, v in attrs.items()})
+        return pitch.opl2_patch_offset(settings)
+
+    def test_default_patch_is_an_octave_low(self):
+        from lmms_mcp import pitch
+        assert pitch.opl2_patch_offset(None) == 12
+        assert self._offset() == 12
+        assert pitch.PITCH_OFFSET_SEMITONES["opl2"] == 12
+
+    @pytest.mark.parametrize("attrs,offset", [
+        (dict(op1_mul=1, op2_mul=1), 0),       # measured 441 Hz at key 57
+        (dict(op1_mul=1, op2_mul=2), 0),       # Bagpipe
+        (dict(op1_mul=7, op2_mul=1), 0),       # Bells
+        (dict(op1_mul=0, op2_mul=1, op1_lvl=62), 12),   # Funky
+        (dict(op1_mul=0, op2_mul=0), 12),
+        (dict(op1_mul=2, op2_mul=2), -12),     # measured 882 Hz
+        (dict(op1_mul=2, op2_mul=4), -12),
+        (dict(op1_mul=3, op2_mul=3), -19),     # a twelfth up
+        (dict(op2_mul=1), 12),                 # op1 at its default x0.5
+        (dict(op1_mul=1), 0),                  # op2 at its default x1
+    ])
+    def test_offsets(self, attrs, offset):
+        assert self._offset(**attrs) == offset
+
+    def test_a_quiet_half_speed_operator_does_not_count(self):
+        # Bubbly_days: op1 x0.5 at level 46 sounds at the key's pitch
+        assert self._offset(op1_mul=0, op2_mul=1, op1_lvl=46) == 0
+        assert self._offset(op1_mul=0, op2_mul=1, op1_lvl=50) == 12
+        assert self._offset(op1_mul=0, op2_mul=2, op1_lvl=30) == -12
+
+    def test_bad_values_fall_back_to_the_defaults(self):
+        assert self._offset(op1_mul="x", op2_mul="y") == 12
+        # out-of-range multipliers are clamped to 0-15
+        assert self._offset(op1_mul=99, op2_mul=-4) == 12
+
+    def test_track_offset_follows_the_patch(self):
+        from lmms_mcp import pitch
+        root = create_empty_project()
+        add_instrument_track(root, "O", instrument="OPL2")
+        inst_track = find_tracks(root)[0].find("instrumenttrack")
+        assert pitch.track_pitch_offset(inst_track) == 12
+        assert inst_track.get("basenote") == "45"
+        settings = inst_track.find("instrument")[0]
+        settings.set("op1_mul", "1")
+        assert pitch.track_pitch_offset(inst_track) == 0
+        assert pitch.get_base_note(inst_track) == 45
+        pitch.set_base_note(inst_track, 57)
+        assert inst_track.get("basenote") == "57"

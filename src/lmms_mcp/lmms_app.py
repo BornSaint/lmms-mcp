@@ -128,6 +128,26 @@ def get_samples_dir() -> Path | None:
     return None
 
 
+def sample_search_dirs() -> list[Path]:
+    """The folders LMMS looks in for a sample given by a relative path.
+
+    LMMS (1.2.x) resolves a relative sample/soundfont path in a project or
+    preset against the user's samples folder (<working dir>/samples, the
+    working dir being the `workingdir` of ~/.lmmsrc.xml, ~/lmms by
+    default) first and then the factory samples folder (get_samples_dir).
+    Neither the project's nor the preset's own folder is searched. Only
+    folders that exist are returned.
+    """
+    working = read_lmms_paths().get("workingdir")
+    user = (Path(working).expanduser() if working
+            else Path.home() / "lmms") / "samples"
+    found = [user] if user.is_dir() else []
+    factory = get_samples_dir()
+    if factory is not None and factory not in found:
+        found.append(factory)
+    return found
+
+
 # ──────────────────────────────────────────────────────────────────
 # FILES THAT SAMPLER INSTRUMENTS PLAY
 # ──────────────────────────────────────────────────────────────────

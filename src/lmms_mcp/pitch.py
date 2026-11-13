@@ -51,7 +51,8 @@ BASE_NOTE_MAX = 127
 # opl2 (opulenz in LMMS 1.3, not measured there): the default patch
 #   frequency-modulates its carrier with an operator at half the carrier
 #   frequency, which makes the fundamental of the sound, and the pitch one
-#   hears, an octave below the key.
+#   hears, an octave below the key. This depends on the patch (a preset
+#   changes it): see opl2_patch_offset, which track_pitch_offset uses.
 PITCH_OFFSET_SEMITONES: dict[str, int] = {
     "zynaddsubfx": 12,
     "opl2": 12,
@@ -65,7 +66,8 @@ PITCH_OFFSET_SEMITONES: dict[str, int] = {
 #
 # zynaddsubfx: drops notes from MIDI note 108 up.
 # opl2: the compensated carrier (twice the key's frequency) tops out near
-#   6 kHz; above, the note is silent.
+#   6 kHz; above, the note is silent. Measured on the default patch only: a
+#   preset whose operators have higher multipliers falls silent earlier.
 # papu / freeboy: the Game Boy channel plays C2 to B7 only.
 # sid: the 16-bit frequency register wraps above about 3.8 kHz (wrong pitch).
 # nes: the waveform period is a whole number of samples, so the pitch is
@@ -200,6 +202,52 @@ def zyn_preset_octave(instrument: ET.Element | None) -> int:
     return 0
 
 
+# --- OPL2 patches ------------------------------------------------------------
+
+# The frequency multiplier of an OPL2 operator (the op1_mul / op2_mul
+# attribute, 0-15), in half units: 0 is x0.5, 1 is x1, 2 is x2 ...
+_OPL2_MULTIPLIER_HALVES = (1, 2, 4, 6, 8, 10, 12, 14, 16, 18, 20, 20, 24, 24, 30, 30)
+# LMMS's default patch: op1_mul, op2_mul, op1_lvl.
+_OPL2_DEFAULT_MUL = (0, 1)
+_OPL2_DEFAULT_LEVEL = 62
+# An operator at x0.5 is heard as the pitch (an octave below the key) when it
+# is loud enough: its sub-octave partial is within 3 dB of the key's at op1
+# level 62, 8 dB at 54, 10 dB at 50 and 12 dB at 46 (measured, FM mode). At
+# 46 and below (the factory preset Bubbly_days is 46) the key's pitch wins.
+_OPL2_SUBOCTAVE_MIN_LEVEL = 50
+
+
+def _opl2_attr(settings: ET.Element | None, name: str, default: int) -> int:
+    if settings is not None and settings.get(name) is not None:
+        try:
+            return int(float(settings.get(name)))
+        except ValueError:
+            pass
+    return default
+
+
+def opl2_patch_offset(settings: ET.Element | None) -> int:
+    """Semitones an OPL2 patch sounds below the key it is played at.
+
+    `settings` is the <OPL2> element of the instrument (None = LMMS's
+    default patch). LMMS plays the plugin's operators at the key's
+    frequency times their multiplier; the pitch one hears is the greatest
+    common divisor of the two multipliers, except that a quiet operator at
+    x0.5 (op1 level below 50) does not count. The default patch (op1 x0.5,
+    op2 x1) is an octave low (12), a patch with both operators at x1 or x2
+    sounds at the key (0), both at x2 an octave high (-12). Measured with
+    LMMS 1.2.2: all 15 factory OpulenZ presets and a range of operator
+    combinations, in FM and additive mode.
+    """
+    mul1 = max(0, min(15, _opl2_attr(settings, "op1_mul", _OPL2_DEFAULT_MUL[0])))
+    mul2 = max(0, min(15, _opl2_attr(settings, "op2_mul", _OPL2_DEFAULT_MUL[1])))
+    level1 = _opl2_attr(settings, "op1_lvl", _OPL2_DEFAULT_LEVEL)
+    halves = [_OPL2_MULTIPLIER_HALVES[mul2]]
+    if mul1 != 0 or level1 >= _OPL2_SUBOCTAVE_MIN_LEVEL:
+        halves.append(_OPL2_MULTIPLIER_HALVES[mul1])
+    return round(-12 * math.log2(math.gcd(*halves) / 2))
+
+
 # --- instrument tracks -------------------------------------------------------
 
 def _plugin_of(inst_track: ET.Element) -> str:
@@ -212,8 +260,9 @@ def track_pitch_offset(inst_track: ET.Element) -> int:
 
     The plugin's table entry, plus for a ZynAddSubFX track minus the octave
     its loaded preset transposes by (a preset with +1 octave is already
-    12 semitones higher, so it needs 12 less). `inst_track` is the
-    <instrumenttrack> element.
+    12 semitones higher, so it needs 12 less). For an OPL2 track it is the
+    offset of its patch (see opl2_patch_offset), which is the table entry
+    for the default patch. `inst_track` is the <instrumenttrack> element.
     """
     plugin = _plugin_of(inst_track)
     offset = plugin_pitch_offset(plugin)
@@ -222,6 +271,9 @@ def track_pitch_offset(inst_track: ET.Element) -> int:
             "instrument/zynaddsubfx/ZynAddSubFX-data/MASTER/PART/INSTRUMENT"
         )
         offset -= 12 * zyn_preset_octave(part)
+    elif plugin.strip().lower() == "opl2":
+        inst = inst_track.find("instrument")
+        offset = opl2_patch_offset(inst[0] if inst is not None and len(inst) else None)
     return offset
 
 
