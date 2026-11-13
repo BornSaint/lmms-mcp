@@ -12,10 +12,12 @@ import inspect
 import json
 import math
 import os
+import shutil
 import string
 import sys
 import tempfile
 import textwrap
+import time
 import traceback
 from pathlib import Path, PurePosixPath, PureWindowsPath
 from xml.etree import ElementTree as ET
@@ -27,6 +29,7 @@ from . import effect_params
 from . import effects as effects_mod
 from . import instrument_presets as inst_presets
 from . import lmms_app
+from . import mix_analysis
 from . import pitch
 from . import presets as zyn_presets
 from . import xml_parser
@@ -3277,15 +3280,17 @@ def _levels_json(levels) -> dict:
 def _run_lmms_render(
     exe, proj_path: Path, output: Path, fmt: str, samplerate: int,
     bitrate: int, oversampling: int, interp: str, float_output: bool = False,
+    command: str = "render", timeout: float = 300,
 ):
     """One LMMS render of the saved project with its own private config.
-    Returns (CompletedProcess, command line text); raises OSError and
-    subprocess.TimeoutExpired."""
+    `command` is "render" (output is a file) or "rendertracks" (output is a
+    folder that gets one file per track). Returns (CompletedProcess, command
+    line text); raises OSError and subprocess.TimeoutExpired."""
     import subprocess
     with lmms_app.isolated_config(_availability.version) as config:
         cmd = [
             str(exe), "--config", str(config),
-            "render", str(proj_path),
+            command, str(proj_path),
             "-o", str(output), "-f", fmt,
             "-s", str(samplerate), "-b", str(bitrate),
             "-x", str(oversampling), "-i", interp,
@@ -3293,10 +3298,29 @@ def _run_lmms_render(
         if float_output:
             cmd.append("-a")
         proc = lmms_app.run_lmms(
-            cmd, capture_output=True, text=True, timeout=300,
+            cmd, capture_output=True, text=True, timeout=timeout,
             creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
         )
     return proc, " ".join(cmd)
+
+
+def _save_for_render(proj) -> tuple[bool, str | None]:
+    """Save the project to its own path before LMMS renders it, in the
+    format its extension says (compressed bytes inside a .mmp file cannot
+    be read by LMMS and other tools). Returns (compressed, None), or
+    (compressed, the JSON of the error) when it could not be saved."""
+    compressed = str(proj.path).lower().endswith(".mmpz")
+    try:
+        proj.save(proj.path, compressed=compressed)
+    except (OSError, ValueError) as exc:
+        return compressed, json.dumps({
+            "error": f"Could not save the project to {proj.path} before "
+                     f"rendering: {_os_error_reason(exc, str(proj.path))}. "
+                     "Call save_project with a path that can be written, "
+                     "then render again.",
+            "path": str(proj.path),
+        })
+    return compressed, None
 
 
 def _level_advice(proj, levels) -> dict:
@@ -3467,20 +3491,10 @@ def render_project(
     if not Path(output_path).is_absolute():
         output_path = str(_in_projects_folder(output_path))
 
-    # Save current state before rendering. Keep the compression format
-    # consistent with the file extension - compressed bytes inside a
-    # .mmp file cannot be read by LMMS and other tools.
-    compressed = str(proj_path).lower().endswith(".mmpz")
-    try:
-        proj.save(proj.path, compressed=compressed)
-    except (OSError, ValueError) as exc:
-        return json.dumps({
-            "error": f"Could not save the project to {proj.path} before "
-                     f"rendering: {_os_error_reason(exc, str(proj.path))}. "
-                     "Call save_project with a path that can be written, "
-                     "then render again.",
-            "path": str(proj.path),
-        })
+    # Save current state before rendering.
+    compressed, save_error = _save_for_render(proj)
+    if save_error:
+        return save_error
 
     out_file = Path(output_path)
     created: list[str] = []
@@ -3721,6 +3735,321 @@ def _render_failure_message(proc, out_file: Path) -> str:
     return (
         f"Render failed: LMMS exited with code {proc.returncode} without "
         f"creating {out_file} and printed no error message.")
+
+
+# What analyze_mix renders at (the sample rate of a render_project default).
+_MIX_SAMPLERATE = 44100
+
+
+def _rendered_tracks(proj) -> tuple[list, list[dict], bool]:
+    """The tracks `lmms rendertracks` renders for the project (unmuted
+    instrument and sample tracks, in project order), the muted ones it
+    skips ([{"index", "name", "reason"}]), and whether the project has a
+    pattern (BB) track, whose instruments are rendered after the others."""
+    info = proj.get_info()
+    rendered = []
+    skipped = []
+    has_pattern_track = False
+    for index, track in enumerate(xml_parser.find_tracks(proj.root)):
+        kind = xml_parser.get_track_type(track)
+        if kind == 1:
+            has_pattern_track = True
+        if kind not in (0, 2):
+            continue
+        name = xml_parser.get_track_name(track)
+        if xml_parser.model_value(track, "muted", "0") == "1":
+            skipped.append({"index": index, "name": name, "reason": "muted"})
+            continue
+        settings = track.find("instrumenttrack" if kind == 0 else "sampletrack")
+        volume = None
+        automated = False
+        if settings is not None:
+            try:
+                volume = float(xml_parser.model_value(settings, "vol", "100"))
+            except ValueError:
+                volume = None
+            automated = bool(
+                xml_parser.model_automation(proj.root, settings, "vol"))
+        rendered.append(mix_analysis.RenderedTrack(
+            index, name,
+            (info.tracks[index].instrument or "instrument") if kind == 0
+            else "sample track",
+            volume, automated))
+    return rendered, skipped, has_pattern_track
+
+
+@_tool
+def analyze_mix(
+    sections: list[dict] | None = None,
+    oversampling: int = 1,
+) -> str:
+    """Find the balance problems of the mix, track by track, in one call.
+
+    Renders every track on its own (LMMS "rendertracks") and the whole mix,
+    both as lossless 32-bit float files in a temporary folder that is
+    deleted afterwards, with a private LMMS config like render_project, and
+    measures them in pure Python: how loud each track is in each section of
+    the song, its share of the mix, and which tracks are too loud, too quiet
+    or cause the peaks, with the call that fixes it. Use it instead of
+    writing scripts over the render. The project is saved first and is not
+    changed.
+
+    Cost: one LMMS render per unmuted instrument or sample track plus one for
+    the mix (about 9 seconds each for a 2-minute song: 13 tracks take about
+    2 minutes), and no tokens. Muted tracks and automation tracks are not
+    rendered (muted ones are listed in "skipped_tracks"). The mix and the
+    tracks are separate renders: where an instrument is not deterministic
+    (ZynAddSubFX) their numbers differ a little (RMS by a few hundredths of
+    a dB, peaks by up to about 0.7 dB).
+
+    Bars are 0-based and the end is exclusive, like the song positions of
+    add_automation: [12, 20] is bars 12 to 19 (the 13th to 20th bar of
+    LMMS's ruler). render_project's levels.blocks are 1-based and inclusive:
+    its [13, 20] is [12, 20] here.
+
+    The response:
+    - "mix": {"peak_dbfs", "rms_dbfs", "clipped_samples", "sections": [{
+      "name", "bars": [start, end], "peak_dbfs", "rms_dbfs"}]}
+    - "tracks": [{"index" (the track_index of set_track_volume; null for an
+      instrument inside a pattern track), "name", "instrument", "volume"
+      (0-200), "peak_dbfs", "rms_dbfs" (over the bars where the track is
+      active), "active_bars": [[start, end], ...], "sections": {name: {
+      "rms_dbfs", "peak_dbfs" (both over the track's active bars in the
+      section), "share_pct" (its share of the energy of all tracks in the
+      section), "active_bars" (how many, only when not all)}}, "silent_in":
+      [sections]}]. A track is active in a bar when its RMS there is above
+      -60 dBFS. dB values are rounded to 0.1; RMS covers all channels (a
+      full-scale sine is -3.0 dBFS).
+    - "flags": peak_contributors, then dominant, then buried (a dominant
+      track sets the mix level the others are measured against), the most
+      serious first in each kind; every flag has a "summary" and a
+      "suggestion" (a call in this server's units, track volume 0-200 =
+      linear percent). A track "plays" in a section when it is active in at
+      least half of its bars; only then is it judged there.
+      "dominant": more than 6 dB above the average RMS of the other tracks
+      that play in the section (at least 2 of them), suggestion lowers it to
+      3 dB above them. "buried": more than 15 dB below the RMS of the mix
+      over the same bars, suggestion raises it to 12 dB below the mix; when
+      volume 200 (+6 dB) cannot do all of it the suggestion says how much it
+      gives and to lower the louder tracks for the rest. Both list the
+      "sections" where they apply and the "worst" one, which the suggested
+      "gain_db" is sized for; a volume change applies to the whole song (to
+      change one section only, use add_automation with target_type "track"
+      and param "volume"). "peak_contributors": a section whose mix peak is
+      at or above -1 dBFS, with the "contributors" (up to 4 tracks whose own
+      peak within 25 ms of the mix's peak is within 12 dB of it), the "gain_db"
+      that lowers each one so the peak is at -2 dBFS, and a
+      "master_suggestion" that does it with the Master volume instead.
+      Suggestions are estimates (the volume of an instrument inside a
+      pattern track cannot be set with set_track_volume): apply one and run
+      this tool again to check.
+    - "skipped_tracks" (muted tracks) and "notes" (what was left out or
+      cut, e.g. a section past the end of the song).
+
+    Args:
+        sections: The parts of the song to report, e.g. [{"name": "verse1",
+            "bars": [4, 12]}, {"name": "hook1", "bars": [12, 20]}]: whole
+            bar numbers, 0-based, end exclusive; names must be different;
+            sections may overlap or leave gaps; an end past the song is cut
+            to it. Default: blocks of 4 bars ("bars 0-4", "bars 4-8", ...;
+            8, 16, ... bars when the song would have more than 16).
+        oversampling: 1, 2, 4 or 8 (default 1, what LMMS plays in its GUI),
+            as in render_project.
+    """
+    import subprocess
+    started = time.monotonic()
+    proj = get_project()
+    if not proj.path:
+        return json.dumps({
+            "error": "Project has never been saved. Call save_project first."
+        })
+    exe = lmms_app.find_lmms_exe()
+    if exe is None:
+        return json.dumps({
+            "error": "LMMS executable not found. Set LMMS_EXECUTABLE env var "
+                     "to the LMMS executable (lmms.exe / lmms).",
+        })
+    if isinstance(oversampling, bool) or oversampling not in (1, 2, 4, 8):
+        return json.dumps({
+            "error": f"Invalid oversampling '{oversampling}'. Use 1, 2, 4 or 8."
+        })
+    wanted = None
+    if sections is not None:
+        try:
+            wanted = mix_analysis.parse_sections(sections)
+        except mix_analysis.SectionError as exc:
+            return json.dumps({"error": str(exc)})
+    rendered, skipped, has_pattern_track = _rendered_tracks(proj)
+    if not rendered and not has_pattern_track:
+        return json.dumps({
+            "error": "There is no track to analyze: LMMS renders the "
+                     "unmuted instrument and sample tracks, and this "
+                     "project has none"
+                     + (" (every one is muted)." if skipped else "."),
+            "skipped_tracks": skipped,
+        })
+
+    info = proj.get_info()
+    bar_length = audio_analysis.bar_seconds(
+        info.bpm, info.time_sig_numerator, info.time_sig_denominator)
+    master_volume = xml_parser.master_volume(proj.root)
+    proj_path = Path(proj.path)
+    _, save_error = _save_for_render(proj)
+    if save_error:
+        return save_error
+
+    render_args = (_MIX_SAMPLERATE, 160, oversampling, "sincfastest")
+    notes: list[str] = []
+    try:
+        with tempfile.TemporaryDirectory(
+                prefix="lmms-mcp-mix-", ignore_cleanup_errors=True) as work:
+            work = Path(work)
+            # 1. The whole mix: what render_project measures.
+            mix_file = work / "mix.wav"
+            proc, command = _run_lmms_render(
+                exe, proj_path, mix_file, "wav", *render_args,
+                float_output=True)
+            if proc.returncode != 0 or not mix_file.is_file():
+                return json.dumps({
+                    "error": _render_failure_message(proc, mix_file),
+                    "command": command,
+                })
+            mix_size = mix_file.stat().st_size
+            try:
+                audio = audio_analysis.read_wav(mix_file)
+            except (OSError, audio_analysis.AudioError) as exc:
+                return json.dumps({
+                    "error": f"Could not measure the render ({exc}).",
+                    "command": command,
+                })
+            _discard(mix_file)
+            mix_bars = audio_analysis.bar_stats(audio, bar_length)
+            total_bars = len(mix_bars)
+            mix_peak = max(b.peak for b in mix_bars)
+            if mix_peak < audio_analysis.SILENCE_PEAK:
+                return json.dumps({
+                    "error": "The mix is silent (its peak is below "
+                             f"{_RENDER_SILENCE_DB:.0f} dBFS), so there is "
+                             "nothing to analyze. Check that the tracks "
+                             "have notes or clips, are not muted, and that "
+                             "file-based instruments have their file.",
+                    "command": command,
+                })
+            if wanted is None:
+                fitted = mix_analysis.default_sections(total_bars)
+            else:
+                fitted, section_notes = mix_analysis.fit_sections(
+                    wanted, total_bars)
+                notes.extend(section_notes)
+                if not fitted:
+                    return json.dumps({
+                        "error": "None of the sections is inside the song, "
+                                 f"which has {total_bars} bars (bars 0 to "
+                                 f"{total_bars - 1}).",
+                        "bars": total_bars,
+                        "notes": notes,
+                    })
+            probes = mix_analysis.find_probes(
+                audio, bar_length, fitted, mix_bars)
+            half_width = mix_analysis.probe_half_width(audio.samplerate)
+            mix_json = {
+                "peak_dbfs": mix_analysis.db_text(
+                    audio_analysis.to_db(mix_peak)),
+                "rms_dbfs": mix_analysis.db_text(audio_analysis.to_db(
+                    math.sqrt(sum(b.squares for b in mix_bars)
+                              / max(1, sum(b.count for b in mix_bars))))),
+                "clipped_samples": audio_analysis.count_over(audio.samples),
+            }
+            duration = audio.duration
+            del audio
+
+            # 2. Every track on its own. The files are as big as the mix.
+            stems_dir = work / "stems"
+            stems_dir.mkdir()
+            free = shutil.disk_usage(work).free
+            need = mix_size * max(1, len(rendered))
+            if free < need * 1.1:
+                return json.dumps({
+                    "error": f"Not enough free disk space for the track "
+                             f"renders: about {need // 2**20} MB are needed "
+                             f"in {work.parent} and {free // 2**20} MB are "
+                             "free. Free some space or set TMPDIR to "
+                             "another drive.",
+                })
+            proc, command = _run_lmms_render(
+                exe, proj_path, stems_dir, "wav", *render_args,
+                float_output=True, command="rendertracks",
+                timeout=300 + 60 * max(1, len(rendered)))
+            files = [
+                (int(m.group(1)), m.group(2), path)
+                for path in stems_dir.iterdir()
+                if (m := mix_analysis.STEM_NAME.match(path.name))]
+            if proc.returncode != 0 or not files:
+                detail = _render_failure_message(proc, stems_dir)
+                if proc.returncode == 0:
+                    detail = ("LMMS rendered no track files. "
+                              + detail.split(": ", 1)[-1])
+                return json.dumps({"error": detail, "command": command})
+
+            matched, match_notes = mix_analysis.match_stems(rendered, files)
+            notes.extend(match_notes)
+            tracks = []
+            for rendered_track, file_name, path in matched:
+                try:
+                    stem = audio_analysis.read_wav(path)
+                except (OSError, audio_analysis.AudioError) as exc:
+                    notes.append(
+                        f"Could not read the render of '{file_name}' "
+                        f"({exc}); it is not in the report.")
+                    continue
+                bars = audio_analysis.bar_stats(stem, bar_length, total_bars)
+                peaks = [
+                    audio_analysis.peak_near(stem, probe.frame, half_width)
+                    for probe in probes]
+                del stem
+                _discard(path)
+                if rendered_track is None:
+                    tracks.append(mix_analysis.TrackStem(
+                        file_name, bars, None, "pattern instrument",
+                        probe_peaks=peaks))
+                else:
+                    tracks.append(mix_analysis.TrackStem(
+                        rendered_track.name, bars, rendered_track.index,
+                        rendered_track.instrument, rendered_track.volume,
+                        rendered_track.volume_automated, peaks))
+    except subprocess.TimeoutExpired as exc:
+        return json.dumps({
+            "error": f"Rendering timed out after {exc.timeout:g} s. The song "
+                     "may be too long or have too many tracks; mute the "
+                     "tracks that do not matter.",
+        })
+    except OSError as exc:
+        return json.dumps({"error": f"Could not start the render: {exc}"})
+
+    report = mix_analysis.analyze_balance(
+        mix_bars, tracks, fitted, probes, master_volume)
+    mix_json["sections"] = report["mix"]["sections"]
+    notes.extend(report["notes"])
+    head = xml_parser.find_head(proj.root)
+    if head is not None and xml_parser.model_automation(
+            proj.root, head, "bpm"):
+        notes.append(
+            "The tempo is automated: the bar ranges use the static tempo "
+            "and are approximate.")
+    result = {
+        "duration_s": round(duration, 2),
+        "bars": total_bars,
+        "oversampling": oversampling,
+        "isolated_config": True,
+        "elapsed_s": round(time.monotonic() - started, 1),
+        "mix": mix_json,
+        "tracks": report["tracks"],
+        "flags": report["flags"],
+        "skipped_tracks": skipped,
+        "notes": notes,
+    }
+    # No spaces after , and : (the agent reads all of it as tokens).
+    return json.dumps(result, separators=(",", ":"))
 
 
 # Most files per instrument that list_available_plugins shows.

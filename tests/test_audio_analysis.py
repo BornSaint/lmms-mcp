@@ -317,6 +317,92 @@ class TestAnalyze:
             float(np.abs(first).max()))
 
 
+class TestBarStats:
+    """The per-bar statistics analyze_mix is built on."""
+
+    BAR = 2.0   # seconds at 120 bpm; 16000 frames at 8 kHz
+
+    def bars_of(self, *parts):
+        samples = array.array("f")
+        for amp, bars in parts:
+            samples.extend(sine(250, amp, bars * self.BAR))
+        return audio_of(samples)
+
+    def test_whole_bars_count_the_tail_like_analyze(self):
+        for seconds, bars in ((8.0, 4), (8.9, 4), (9.1, 5), (1.0, 1),
+                              (0.4, 1), (3.0, 2)):
+            audio = audio_of(sine(250, 0.1, seconds))
+            assert aa.whole_bars(audio, self.BAR) == bars, seconds
+        assert aa.whole_bars(audio_of([]), self.BAR) == 1
+
+    def test_peak_squares_and_count_of_every_bar(self):
+        audio = self.bars_of((0.5, 2), (0.1, 1), (0.0, 1))
+        stats = aa.bar_stats(audio, self.BAR)
+        assert len(stats) == 4
+        assert [round(b.peak, 4) for b in stats] == [0.5, 0.5, 0.1, 0.0]
+        per_bar = int(self.BAR * SAMPLERATE) * 2
+        assert [b.count for b in stats] == [per_bar] * 4
+        assert stats[0].rms == pytest.approx(0.5 / math.sqrt(2))
+        assert stats[2].rms == pytest.approx(0.1 / math.sqrt(2))
+        assert stats[3].rms == 0.0
+        assert stats[0].squares == pytest.approx(0.125 * per_bar)
+
+    def test_the_bars_agree_with_analyze(self):
+        audio = self.bars_of((0.5, 2), (0.2, 2))
+        stats = aa.bar_stats(audio, self.BAR)
+        levels = aa.analyze(audio, self.BAR, bars_per_block=2)
+        for block, bars in zip(levels.blocks, (stats[:2], stats[2:])):
+            assert max(b.peak for b in bars) == pytest.approx(block.peak)
+            assert math.sqrt(sum(b.squares for b in bars)
+                             / sum(b.count for b in bars)) == pytest.approx(
+                block.rms)
+        total = sum(b.squares for b in stats) / sum(b.count for b in stats)
+        assert math.sqrt(total) == pytest.approx(levels.rms)
+
+    def test_the_last_bar_runs_to_the_end_of_the_audio(self):
+        # 4 bars and a tail of a third of a bar: the tail is in bar 4
+        audio = audio_of(sine(250, 0.5, 4 * self.BAR + 0.6))
+        stats = aa.bar_stats(audio, self.BAR)
+        assert len(stats) == 4
+        assert sum(b.count for b in stats) == len(audio.samples)
+        assert stats[3].count > stats[0].count
+
+    def test_a_forced_number_of_bars_gives_empty_bars_past_the_end(self):
+        audio = self.bars_of((0.5, 2))
+        stats = aa.bar_stats(audio, self.BAR, total_bars=5)
+        assert len(stats) == 5
+        assert [b.count == 0 for b in stats] == [False, False, True, True, True]
+        assert stats[4].rms == 0.0 and stats[4].peak == 0.0
+
+    def test_peak_location_finds_the_largest_sample_of_the_bars(self):
+        samples = sine(250, 0.1, 6 * self.BAR)
+        loud = int(2.5 * self.BAR * SAMPLERATE)      # frame in bar 2
+        samples[loud * 2] = 0.9
+        samples[loud * 2 + 1] = 0.9
+        quieter = int(4.5 * self.BAR * SAMPLERATE)
+        samples[quieter * 2 + 1] = -0.7             # the right channel
+        audio = audio_of(samples)
+        assert aa.peak_location(audio, self.BAR, 0, 6, 6) == (
+            loud, pytest.approx(0.9))
+        assert aa.peak_location(audio, self.BAR, 3, 6, 6) == (
+            quieter, pytest.approx(0.7))     # a negative peak, absolute value
+        frame, peak = aa.peak_location(audio, self.BAR, 0, 2, 6)
+        assert peak == pytest.approx(0.1) and frame < 2 * self.BAR * SAMPLERATE
+
+    def test_peak_near_looks_at_a_window_in_every_channel(self):
+        samples = array.array("f", [0.0] * 2000)
+        samples[1001] = -0.8      # frame 500, right channel
+        samples[1800] = 0.4       # frame 900
+        samples[1980] = 0.3       # frame 990, 10 frames from the end
+        audio = audio_of(samples)
+        assert aa.peak_near(audio, 500, 10) == pytest.approx(0.8)
+        assert aa.peak_near(audio, 490, 10) == pytest.approx(0.8)
+        assert aa.peak_near(audio, 480, 10) == 0.0
+        assert aa.peak_near(audio, 900, 5) == pytest.approx(0.4)
+        assert aa.peak_near(audio, 0, 3) == 0.0       # window before the start
+        assert aa.peak_near(audio, 999, 50) == pytest.approx(0.3)  # past the end
+
+
 class TestDb:
     def test_round_trip(self):
         assert aa.to_db(1.0) == 0.0

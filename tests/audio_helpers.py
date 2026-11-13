@@ -112,3 +112,108 @@ class FakeLmms:
             fmt = cmd[cmd.index("-f") + 1]
             out.write_bytes(b"ENCODED:" + fmt.encode())
         return subprocess.CompletedProcess(cmd, 0, "", "")
+
+
+def silence(seconds, samplerate=SAMPLERATE, channels=2):
+    """Interleaved float samples of digital silence."""
+    return array.array("f", [0.0] * (int(seconds * samplerate) * channels))
+
+
+def _lmms_file_name(name):
+    """The track name as LMMS 1.2.2 puts it in a file name (it drops the
+    characters that cannot be in one)."""
+    return name.replace("/", "").replace("\\", "")
+
+
+class FakeMixLmms:
+    """A stand-in for subprocess.run for analyze_mix: it "renders" the
+    tracks of the saved project like LMMS 1.2.2 does.
+
+    `signals` maps a track name to what the track plays at volume 100
+    (interleaved floats, the same length for every track). `render` writes
+    the float mix: the sum of the stems (scaled by the Master volume) unless
+    `mix` is given. `rendertracks` writes "<n>_<name>.wav" for the project's
+    unmuted instrument and sample tracks in order (muted and automation
+    tracks get no file and no number, as in LMMS), each scaled by the
+    track's volume (vol / 100) and the Master volume, then the
+    `pattern_instruments` ({name: signal}) the way LMMS renders the
+    instruments of pattern tracks. Every call is recorded: `commands`,
+    `outputs` (the -o argument of each) and `calls` {"cmd", "float", ...}.
+    `fail` is the command ("render" or "rendertracks") that exits with code 1
+    and `write_nothing` the one that exits 0 without writing a file.
+    """
+
+    def __init__(self, signals, mix=None, pattern_instruments=None,
+                 samplerate=SAMPLERATE, channels=2, fail=None,
+                 write_nothing=None, on_run=None):
+        self.signals = {k: array.array("f", v) for k, v in signals.items()}
+        self.mix = None if mix is None else array.array("f", mix)
+        self.pattern_instruments = {
+            k: array.array("f", v)
+            for k, v in (pattern_instruments or {}).items()}
+        self.samplerate = samplerate
+        self.channels = channels
+        self.fail = fail
+        self.write_nothing = write_nothing
+        self.on_run = on_run
+        self.calls = []
+        self.commands = []
+        self.outputs = []
+
+    def _stems(self, project):
+        root = xml_parser.load_project(project)
+        master = xml_parser.master_volume(root)
+        length = max([len(v) for v in self.signals.values()]
+                     + [len(v) for v in self.pattern_instruments.values()]
+                     + [0])
+        stems = []
+        for track in xml_parser.find_tracks(root):
+            kind = xml_parser.get_track_type(track)
+            if kind not in (0, 2):
+                continue
+            if xml_parser.model_value(track, "muted", "0") == "1":
+                continue
+            name = xml_parser.get_track_name(track)
+            settings = track.find(
+                "instrumenttrack" if kind == 0 else "sampletrack")
+            vol = float(xml_parser.model_value(settings, "vol", "100")) / 100
+            signal = self.signals.get(name, array.array("f", [0.0] * length))
+            stems.append((name, [v * vol * master for v in signal]))
+        for name, signal in self.pattern_instruments.items():
+            stems.append((name, [v * master for v in signal]))
+        return stems, master
+
+    def __call__(self, cmd, **kwargs):
+        command = "rendertracks" if "rendertracks" in cmd else "render"
+        project = Path(cmd[cmd.index(command) + 1])
+        out = Path(cmd[cmd.index("-o") + 1])
+        config = Path(cmd[cmd.index("--config") + 1])
+        self.commands.append(cmd)
+        self.outputs.append(out)
+        self.calls.append({
+            "cmd": cmd, "command": command, "float": "-a" in cmd,
+            "config": config, "config_text": config.read_text("utf-8"),
+            "kwargs": kwargs,
+        })
+        if self.on_run is not None:
+            self.on_run(cmd)
+        if self.fail == command:
+            return subprocess.CompletedProcess(
+                cmd, 1, "", "Could not load project: broken")
+        if self.write_nothing == command:
+            return subprocess.CompletedProcess(cmd, 0, "", "")
+        stems, master = self._stems(project)
+        if command == "render":
+            if self.mix is not None:
+                mixed = [v * master for v in self.mix]
+            else:
+                length = max((len(s) for _, s in stems), default=0)
+                mixed = [sum(s[i] for _, s in stems if i < len(s))
+                         for i in range(length)]
+            out.write_bytes(float_wav_bytes(
+                mixed, self.samplerate, self.channels))
+        else:
+            for number, (name, samples) in enumerate(stems, start=1):
+                (out / f"{number}_{_lmms_file_name(name)}.wav").write_bytes(
+                    float_wav_bytes(samples, self.samplerate, self.channels))
+        return subprocess.CompletedProcess(cmd, 0, "", "")

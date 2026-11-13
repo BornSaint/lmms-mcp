@@ -77,6 +77,22 @@ class BlockLevels:
 
 
 @dataclass
+class BarStats:
+    """Peak and energy of one bar (0-based position in a list of them).
+    `squares` is the sum of the squared samples of every channel and
+    `count` the number of samples, so the RMS of any run of bars is
+    sqrt(sum of squares / sum of counts)."""
+
+    peak: float
+    squares: float
+    count: int
+
+    @property
+    def rms(self) -> float:
+        return math.sqrt(self.squares / self.count) if self.count else 0.0
+
+
+@dataclass
 class Levels:
     """What analyze() measured. peak and rms are linear (1.0 = 0 dBFS)."""
 
@@ -309,6 +325,73 @@ def count_over(
             + sum(map(operator.lt, samples, repeat(-limit))))
 
 
+def whole_bars(audio: Audio, bar_length: float) -> int:
+    """How many bars the audio is cut into (at least 1): whole bars, where
+    audio after the last whole bar counts for the last bar when it is
+    shorter than half a bar, else it is a bar of its own."""
+    frames = audio.frames
+    bar_frames = bar_length * audio.samplerate
+    return max(1, int(frames / bar_frames + 0.5)) if frames else 1
+
+
+def bar_stats(
+    audio: Audio, bar_length: float, total_bars: int | None = None,
+) -> list[BarStats]:
+    """The BarStats of each of total_bars bars (default whole_bars), cut as
+    analyze() cuts them; the last bar runs to the end of the audio, so the
+    audio is covered once. A stem shorter than the song has empty bars (no
+    samples, RMS 0.0) at its end."""
+    channels = audio.channels
+    samples = audio.samples
+    bar_frames = bar_length * audio.samplerate
+    if total_bars is None:
+        total_bars = whole_bars(audio, bar_length)
+    stats = []
+    for bar in range(total_bars):
+        start = round(bar * bar_frames) * channels
+        stop = (len(samples) if bar == total_bars - 1
+                else round((bar + 1) * bar_frames) * channels)
+        chunk = samples[start:min(stop, len(samples))]
+        lowest, highest = extremes(chunk)
+        stats.append(BarStats(
+            max(highest, -lowest, 0.0),
+            _sum_squares(chunk) if len(chunk) else 0.0,
+            len(chunk)))
+    return stats
+
+
+def peak_location(
+    audio: Audio, bar_length: float, first_bar: int, last_bar: int,
+    total_bars: int,
+) -> tuple[int, float]:
+    """(frame, absolute value) of the largest sample of bars
+    first_bar..last_bar-1 (cut as bar_stats cuts them)."""
+    channels = audio.channels
+    samples = audio.samples
+    bar_frames = bar_length * audio.samplerate
+    start = round(first_bar * bar_frames) * channels
+    stop = (len(samples) if last_bar >= total_bars
+            else round(last_bar * bar_frames) * channels)
+    start = min(start, len(samples))
+    chunk = samples[start:min(stop, len(samples))]
+    if not len(chunk):
+        return start // channels, 0.0
+    lowest, highest = extremes(chunk)
+    if highest >= -lowest:
+        offset = chunk.index(highest)
+        return (start + offset) // channels, highest
+    return (start + chunk.index(lowest)) // channels, -lowest
+
+
+def peak_near(audio: Audio, frame: int, half_width: int) -> float:
+    """The largest absolute sample (any channel) within half_width frames
+    of `frame`."""
+    channels = audio.channels
+    start = max(0, frame - half_width) * channels
+    stop = (frame + half_width + 1) * channels
+    return peak_of(audio.samples[start:stop])
+
+
 def analyze(
     audio: Audio,
     bar_length: float,
@@ -327,9 +410,8 @@ def analyze(
     """
     channels = audio.channels
     samples = audio.samples
-    frames = audio.frames
     bar_frames = bar_length * audio.samplerate
-    total_bars = max(1, int(frames / bar_frames + 0.5)) if frames else 1
+    total_bars = whole_bars(audio, bar_length)
     if bars_per_block is None:
         bars_per_block = 4
         while math.ceil(total_bars / bars_per_block) > max_blocks:
