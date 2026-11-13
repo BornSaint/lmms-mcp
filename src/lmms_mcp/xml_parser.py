@@ -1,5 +1,7 @@
 """XML parser for LMMS .mmpz and .mmp project files."""
 
+import base64
+import math
 import re
 import struct
 import zlib
@@ -825,15 +827,58 @@ MIDIPORT_DEFAULTS: dict[str, str] = {
     "readable": "0", "writable": "0",
 }
 
+def _sine_wave(length: int) -> str:
+    """One period of a sine, `length` samples, written the way LMMS writes a
+    wave graph into a project: the float32 samples (little-endian, -1..1),
+    base64-encoded. These are the samples of LMMS's own sine (checked against
+    its factory presets: BitInvader "bell" is this wave at length 8, the b1
+    wave of Watsyn "Epic lead" at length 220, each equal to within 1e-6)."""
+    samples = [math.sin(2.0 * math.pi * i / length) for i in range(length)]
+    return base64.b64encode(
+        struct.pack(f"<{length}f", *samples)).decode("ascii")
+
+
+# Samples of a BitInvader wave (its default length; presets use 8 to 128) and
+# of each Watsyn oscillator wave (220 in every preset).
+BITINVADER_WAVE_LENGTH = 128
+WATSYN_WAVE_LENGTH = 220
+WATSYN_WAVES = ("a1_wave", "a2_wave", "b1_wave", "b2_wave")
+
 # Attributes a fresh instrument's settings element needs for the track to be
 # audible. LMMS fills in its own default for every attribute that is missing,
-# but a few plugins have a default state that makes no sound at all. Keyed by
-# the plugin name LMMS loads; add a plugin here to give it a playable start.
+# but a few plugins have a default state that makes no sound at all, or that
+# is garbage. Keyed by the plugin name LMMS loads; add a plugin here to give
+# it a playable start.
+#
+# vibedstrings: a fresh Vibed has nine strings and none is active: without
+#   active0 the track renders silence. The other string 0 values (volume,
+#   length, pickup, sine graph ...) fall back to LMMS's defaults.
+# bitinvader, watsyn: the waves are read from the file, and a missing wave
+#   is not replaced by a default: LMMS 1.2.2 seems to read memory it never
+#   set, so an empty <bitinvader/> or <watsyn/> renders a different garbage
+#   every time (peaks of +186 to +705 dBFS, or -60 dBFS: measured in three
+#   renders of each). So every wave is written, as a sine (a plain tone, and the
+#   waveform some of LMMS's own presets use as they are, see _sine_wave), and
+#   the rest falls back to LMMS's defaults.
+#   - bitinvader: the five attributes LMMS writes. The wave is 128 samples
+#     (sampleLength must match the data, or LMMS reads past it), interpolated
+#     (LMMS's own default is off, a stair-stepped sine that has a -42 dB
+#     component and plays 0.8 cent flat; interpolated it is -84 dB and at
+#     440.00 Hz for key 57), not normalized. Peak 0 dBFS at track volume 100.
+#   - watsyn: the four oscillator waves (220 samples each), the rest at
+#     LMMS's defaults (every oscillator at volume 100, multiplier 8 = x1, no
+#     detune, A and B mixed equally with no modulation): a sine at 440.00 Hz
+#     for key 57 whose peak is exactly 0 dBFS at track volume 100.
 INSTRUMENT_DEFAULTS: dict[str, dict[str, str]] = {
-    # Vibed has nine strings and a fresh one has none active: without
-    # active0 the track renders silence. The other string 0 values (volume,
-    # length, pickup, sine graph ...) fall back to LMMS's defaults.
     "vibedstrings": {"active0": "1"},
+    "bitinvader": {
+        "version": "0.1",
+        "sampleLength": str(BITINVADER_WAVE_LENGTH),
+        "sampleShape": _sine_wave(BITINVADER_WAVE_LENGTH),
+        "interpolation": "1",
+        "normalize": "0",
+    },
+    "watsyn": {name: _sine_wave(WATSYN_WAVE_LENGTH) for name in WATSYN_WAVES},
 }
 
 

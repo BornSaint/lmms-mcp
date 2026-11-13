@@ -391,9 +391,11 @@ original pitch at the track's base note (key 57 until `set_track_tuning` or
 [Tuning a track](#tuning-a-track-base-note-and-fine-tune)). The default patches of `tripleoscillator` (its
 second and third oscillator are one and two octaves down) and `organic` (a
 partial one octave down) layer sub-octave partials on purpose: their main
-oscillator is on the key. `bitinvader` and `watsyn` start with a random
-waveform (two renders of the same project differ), so their timbre changes
-from render to render and their pitch cannot be measured reliably.
+oscillator is on the key. `add_instrument_track` writes a playable default
+for `bitinvader` (a 128-sample sine wave, interpolation on) and `watsyn` (a
+sine on all four oscillators A1/A2/B1/B2, 220 samples each). Both play in tune:
+key 57 is 440.00 Hz and every key 0-108 is within 1%, so no pitch offset is
+needed.
 
 Some instruments do not play all of keys 0-108 at the right pitch.
 `add_instrument_track` reports `playable_keys` for them and `add_note` /
@@ -550,9 +552,11 @@ settings and the LMMS version; the cache is
 rebuilt. Nothing is written into the project. If a level cannot be measured
 (no LMMS, a timeout) the field is left out and a `note` says so; the tool does
 not fail. `LMMS_MCP_MEASURE_LEVELS=0` forbids the measuring renders (seed and
-cache are still used). `bitinvader` and `watsyn` tracks without settings
-(what `add_instrument_track` writes) play garbage in LMMS 1.2.2, so they have
-no level.
+cache are still used). `bitinvader` and `watsyn` tracks get a seed level
+(at volume 100: note peak 0.0 dBFS, chord peak 11.5 dBFS, RMS -3.0 dBFS, the
+same for both). Only a track with an empty `<bitinvader/>` or `<watsyn/>`
+element from an older project (not rewritten on load) still plays garbage in
+LMMS 1.2.2; such a track has no level ("unknown level").
 
 `get_project_info` adds the levels up for the project, bar by bar: each track
 with notes in the bar counts with its single-note peak (its chord peak when 2

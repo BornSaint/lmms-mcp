@@ -522,7 +522,7 @@ class TestSeed:
         assert levels.seed_level(lab12.inst(), "1.2.2") is None     # patch
 
     @pytest.mark.parametrize("instrument", [
-        "audiofileprocessor", "bitinvader", "watsyn", "gigplayer", "patman"])
+        "audiofileprocessor", "gigplayer", "patman"])
     def test_unseeded_instruments_have_no_level_and_no_render(
             self, lab12, instrument):
         result = lab12.add(instrument)
@@ -534,10 +534,67 @@ class TestSeed:
         from lmms_mcp import server as srv
         unseeded = set(srv.KNOWN_INSTRUMENTS) - set(levels.SEED_LEVELS) \
             - {"sf2player"}
-        for name in ("audiofileprocessor", "bitinvader", "watsyn",
-                     "gigplayer", "patman"):
+        # silent until they have a file: no level to seed
+        for name in ("audiofileprocessor", "gigplayer", "patman"):
             assert name in unseeded
-        assert levels.UNSET_IS_BROKEN == ("bitinvader", "watsyn")
+        # a plain track of these plays a sine: seeded
+        for name in ("bitinvader", "watsyn"):
+            assert name not in unseeded
+
+    @pytest.mark.parametrize("instrument", ["bitinvader", "watsyn"])
+    def test_wave_synths_have_a_seed_and_a_plain_track_needs_no_render(
+            self, lab12, instrument):
+        # their default track plays a sine (xml_parser.INSTRUMENT_DEFAULTS),
+        # not the garbage an empty settings element makes LMMS render
+        assert instrument in levels.SEED_LEVELS
+        note, chord, rms = levels.SEED_LEVELS[instrument]
+        assert all(math.isfinite(v) for v in (note, chord, rms))
+        # a full-scale sine: a peak of 0 dBFS and an RMS 3 dB lower
+        assert note == pytest.approx(0.0, abs=0.5)
+        assert rms == pytest.approx(note - 3.0, abs=0.5)
+        result = lab12.add(instrument)
+        assert result["level_at_vol_100"] == {
+            "note_peak_dbfs": note, "chord_peak_dbfs": chord,
+            "rms_dbfs": rms, "source": "seed"}
+        assert lab12.renders == 0
+        # the seed is for the default settings only: a changed wave is
+        # another sound
+        settings = levels._settings(lab12.inst())
+        key = "sampleShape" if instrument == "bitinvader" else "a1_wave"
+        settings.set(key, "PPPP" + settings.get(key)[4:])
+        assert levels.seed_level(lab12.inst(), "1.2.2") is None
+
+    def test_no_instrument_is_excluded_from_measuring(self):
+        # the exclusion of the two wave synths (garbage levels) is gone
+        assert not hasattr(levels, "UNSET_IS_BROKEN")
+
+    @pytest.mark.parametrize("instrument", ["bitinvader", "watsyn"])
+    def test_a_default_wave_synth_track_can_be_measured(
+            self, lab, instrument):
+        # no seed for LMMS 1.3: the level is measured by a render of the
+        # track as add_instrument_track wrote it (with its waves)
+        lab.fake.amplitudes = {instrument: (0.5, 0.75)}
+        result = lab.add(instrument)
+        assert result["level_at_vol_100"]["source"] == "measured"
+        assert result["level_at_vol_100"]["note_peak_dbfs"] \
+            == pytest.approx(db(0.5), abs=0.1)
+        sent = xml_parser.find_tracks(lab.fake.projects[-1])[0].find(
+            "instrumenttrack/instrument")[0]
+        assert sent.attrib == levels._settings(lab.inst()).attrib
+        assert any(k in sent.attrib for k in ("sampleShape", "a1_wave"))
+
+    @pytest.mark.parametrize("instrument", ["bitinvader", "watsyn"])
+    def test_an_empty_wave_synth_from_an_old_project_has_no_level(
+            self, lab12, instrument):
+        # a project saved before the sine default has <bitinvader/>: LMMS
+        # plays garbage from it, so nothing is measured, cached or reported
+        lab12.add(instrument)
+        levels._settings(lab12.inst()).attrib.clear()
+        assert levels.seed_level(lab12.inst(), "1.2.2") is None
+        assert levels.resolve_level(
+            lab12.inst(), "1.2.2", {}, render=lab12.srv._render_for_levels,
+            cache=levels.LevelCache(lab12.tmp / "levels.json")) is None
+        assert lab12.renders == 0
 
 
 # ──────────────────────────────────────────────────────────────────
@@ -1106,14 +1163,14 @@ class TestEstimate:
     def test_the_tool_uses_measured_levels_and_lists_unknown_ones(self, lab):
         lab.fake.amplitudes = {"tripleoscillator": (0.1, 0.2)}
         lab.add(volume=100)
-        lab.add("watsyn")
+        lab.add("audiofileprocessor")       # silent until it has a sample
         for index in (0, 1):
             lab.srv.add_note(index, 57, 0, 48, 100)
         info = json.loads(lab.srv.get_project_info())
         assert info["estimated_mix_peak_dbfs"] == pytest.approx(
             db(0.1), abs=0.06)
         assert [t["name"] for t in info["unknown_level_tracks"]] \
-            == ["Watsyn"]
+            == ["Audiofileprocessor"]
         assert "estimate" in info["estimate_basis"]
 
     def test_an_empty_project_has_no_estimate_fields(self, lab12):
@@ -1506,7 +1563,8 @@ class TestPrintSeed:
         assert '"kicker": (0.0, 0.0,' in out
         assert '"tripleoscillator": (-12.0, -6.0,' in out
         assert "SEED_SOUNDFONT = {'file': 'default-GM.sf2'" in out
-        assert "bitinvader: nothing to measure" in out
+        assert '"bitinvader": (' in out and '"watsyn": (' in out
+        assert "bitinvader: nothing to measure" not in out
         assert "audiofileprocessor: nothing to measure" in out
         assert os.environ["LMMS_MCP_MEASURE_LEVELS"] == "1"
 

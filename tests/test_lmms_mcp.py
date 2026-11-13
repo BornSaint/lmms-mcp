@@ -203,6 +203,112 @@ class TestXMLParser:
         first = self._settings(root, "vibedstrings")
         first.set("active0", "0")
         assert self._settings(root, "vibedstrings").get("active0") == "1"
+        for name in ("bitinvader", "watsyn"):
+            first = self._settings(root, name)
+            before = dict(first.attrib)
+            first.set("extra", "1")
+            for key in before:
+                first.set(key, "")
+            assert self._settings(root, name).attrib == before
+
+    @staticmethod
+    def _wave(text):
+        """The float32 samples of a base64 wave attribute, as LMMS reads them."""
+        import base64
+        import struct
+
+        raw = base64.b64decode(text, validate=True)
+        assert len(raw) % 4 == 0
+        return struct.unpack(f"<{len(raw) // 4}f", raw)
+
+    @staticmethod
+    def _is_one_sine_period(samples):
+        import math
+
+        n = len(samples)
+        return all(
+            abs(v - math.sin(2 * math.pi * i / n)) < 1e-6
+            for i, v in enumerate(samples))
+
+    # A fresh BitInvader or Watsyn with an empty settings element makes LMMS
+    # 1.2.2 render garbage (peaks of +186 to +705 dBFS, different at every
+    # run: measured), because it reads the waves from the file and has none.
+
+    def test_bitinvader_track_starts_with_a_sine(self):
+        settings = self._settings(create_empty_project(), "bitinvader")
+        assert settings.tag == "bitinvader"
+        # the attributes LMMS 1.2.2 writes for it (see its factory presets)
+        assert set(settings.attrib) == {
+            "version", "sampleLength", "sampleShape", "interpolation",
+            "normalize"}
+        assert settings.get("version") == "0.1"
+        assert settings.get("interpolation") == "1"
+        assert settings.get("normalize") == "0"
+        length = int(settings.get("sampleLength"))
+        wave = self._wave(settings.get("sampleShape"))
+        # the declared length is the data's: LMMS reads that many floats
+        assert length == len(wave) == 128
+        assert self._is_one_sine_period(wave)
+        assert max(wave) == pytest.approx(1.0)
+        assert min(wave) == pytest.approx(-1.0)
+
+    def test_watsyn_track_starts_with_a_sine_in_every_oscillator(self):
+        settings = self._settings(create_empty_project(), "watsyn")
+        assert settings.tag == "watsyn"
+        # only the waves: LMMS's own defaults (volume, tuning, mix ...) for
+        # the rest play a sine at the key's pitch, peaking at 0 dBFS
+        assert set(settings.attrib) == {
+            "a1_wave", "a2_wave", "b1_wave", "b2_wave"}
+        for name, text in settings.attrib.items():
+            wave = self._wave(text)
+            assert len(wave) == 220, name
+            assert self._is_one_sine_period(wave), name
+
+    @pytest.mark.parametrize("name", ["bitinvader", "watsyn"])
+    def test_wave_defaults_are_finite_and_in_range(self, name):
+        import math
+
+        settings = self._settings(create_empty_project(), name)
+        for key, text in settings.attrib.items():
+            if key.endswith("_wave") or key == "sampleShape":
+                wave = self._wave(text)
+                assert all(math.isfinite(v) and abs(v) <= 1.0 for v in wave)
+
+    def test_wave_defaults_are_those_of_lmms_factory_presets(self):
+        # LMMS's own sine, as the factory presets store it: BitInvader
+        # "bell" is a sine of length 8 and Watsyn "Epic lead" has one in b1
+        from lmms_mcp.xml_parser import _sine_wave
+
+        presets = Path("/usr/share/lmms/presets")
+        bell = presets / "BitInvader" / "bell.xpf"
+        epic = presets / "Watsyn" / "Epic_lead.xpf"
+        if not (bell.is_file() and epic.is_file()):
+            pytest.skip("LMMS factory presets not installed")
+        stored = ET.parse(bell).getroot().find(".//bitinvader")
+        ours = self._wave(_sine_wave(8))
+        theirs = self._wave(stored.get("sampleShape"))
+        assert len(ours) == len(theirs) == 8
+        assert max(abs(a - b) for a, b in zip(ours, theirs)) < 1e-6
+        stored = ET.parse(epic).getroot().find(".//watsyn")
+        ours = self._wave(_sine_wave(220))
+        theirs = self._wave(stored.get("b1_wave"))
+        assert len(ours) == len(theirs) == 220
+        assert max(abs(a - b) for a, b in zip(ours, theirs)) < 1e-6
+
+    def test_loaded_empty_elements_are_not_rewritten(self, tmp_path):
+        # a project saved by an older version has <bitinvader/>: loading,
+        # editing and saving it leaves the element as it is
+        root = create_empty_project()
+        for name in ("bitinvader", "watsyn"):
+            add_instrument_track(root, name, instrument=name)
+        for track in find_tracks(root):
+            settings = track.find("instrumenttrack/instrument")[0]
+            settings.attrib.clear()
+        path = tmp_path / "old.mmp"
+        save_project(path, root, compressed=False)
+        loaded = load_project(path)
+        for track in find_tracks(loaded):
+            assert track.find("instrumenttrack/instrument")[0].attrib == {}
 
     def test_add_note(self):
         root = create_empty_project()

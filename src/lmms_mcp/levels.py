@@ -275,14 +275,15 @@ def auto_volume(level: Level) -> AutoVolume:
 # the render is 32-bit float, and LMMS's own 16-bit file would clip them.
 # Keyed by the offered instrument name (OPL2 is opulenz, papu is freeboy).
 #
-# Not listed:
-# - audiofileprocessor, gigplayer, patman: silent until they have a file
-#   (their level comes with the sample / file);
-# - bitinvader, watsyn: a track without settings, which is what
-#   add_instrument_track writes for them, renders garbage in LMMS 1.2.2 (their
-#   wave data is missing, so the level changes from run to run, from -60 to
-#   +530 dBFS), so there is no level to seed; see UNSET_IS_BROKEN.
+# Not listed: audiofileprocessor, gigplayer, patman: silent until they have a
+# file (their level comes with the sample / file).
+#
+# bitinvader and watsyn start as a full-scale sine (xml_parser.INSTRUMENT_
+# DEFAULTS): a note peaks at 0 dBFS with an RMS of -3 dBFS, identical in all
+# five runs (an empty settings element, which older versions of this server
+# wrote, renders garbage instead and has no level: see EMPTY_IS_GARBAGE).
 SEED_LEVELS: dict[str, tuple[float, float, float]] = {
+    "bitinvader": (0.0, 11.5, -3.0),
     "freeboy": (-5.8, 4.1, -18.5),
     "kicker": (0.0, 12.0, -9.4),
     "lb302": (-6.5, -6.5, -15.0),
@@ -295,6 +296,7 @@ SEED_LEVELS: dict[str, tuple[float, float, float]] = {
     "sid": (-6.6, 4.9, -11.1),
     "tripleoscillator": (-2.7, 8.8, -7.9),
     "vibedstrings": (-10.8, -0.1, -16.9),
+    "watsyn": (0.0, 11.5, -3.0),
     "zynaddsubfx": (-28.4, -17.3, -32.0),
 }
 
@@ -666,24 +668,26 @@ def measure_level(
 
 
 # Plugins that play garbage (a different level at every run) when their
-# settings element is empty, which is how add_instrument_track writes them:
-# their wave data is missing. A level measured from such a track means
-# nothing.
-UNSET_IS_BROKEN = ("bitinvader", "watsyn")
+# settings element is empty: their waves are missing (see
+# xml_parser.INSTRUMENT_DEFAULTS). add_instrument_track no longer writes them
+# empty, but a project saved by an older version of this server has such
+# tracks, and a level measured from one means nothing (and would be cached).
+EMPTY_IS_GARBAGE = ("bitinvader", "watsyn")
 
 
-def _plugin_is_unset(plugin: str, settings: ET.Element | None) -> bool:
-    return plugin.lower() in UNSET_IS_BROKEN and (
+def _is_empty_wave_plugin(plugin: str, settings: ET.Element | None) -> bool:
+    return plugin.lower() in EMPTY_IS_GARBAGE and (
         settings is None or not (settings.attrib or len(settings)))
 
 
 def _can_sound(inst_track: ET.Element) -> bool:
     """False when there is nothing to measure: a sampler without its file
     (silent until set_audiofile_sample / set_instrument_file gives one) or
-    an instrument that has no settings and plays garbage then."""
+    a synth with an empty settings element, which plays garbage (see
+    EMPTY_IS_GARBAGE)."""
     plugin = plugin_of(inst_track)
     settings = _settings(inst_track)
-    if _plugin_is_unset(plugin, settings):
+    if _is_empty_wave_plugin(plugin, settings):
         return False
     needs_file = plugin.lower() == "audiofileprocessor" \
         or lmms_app.file_instrument_for(plugin) is not None
