@@ -403,13 +403,15 @@ The response of `set_track_tuning` has `base_note` and `base_note_name`, the
 and a `hint` saying what the keys play now. A tuned sample keeps its tuning
 when you set another sample on the track; `set_audiofile_sample` says so
 in a `note` when it happens. Example (LMMS factory samples, pitch measured
-at `-x 1`): `instruments/piano01.ogg` is a C4, `instruments/cello01.ogg` a D3
-that is about 18 cents flat (17.4 measured) and
+at `-x 1`): `instruments/piano01.ogg` is a C4, `instruments/cello01.ogg` a D2
+(fundamental 72.65 Hz) that is about 17-18 cents flat and
 `instruments/violin_pizzicato01.ogg` a G4. With the call below, key 45 (A3)
-plays the cello at 219.9 Hz and key 57 (A4) at 440.0 Hz:
+plays the cello at 220.05 Hz and key 57 (A4) at 440.0 Hz. Measure a sample's
+pitch with autocorrelation or by checking the harmonic series; the strongest
+spectral peak is often a harmonic (as with this cello).
 
 ```
-set_audiofile_sample(0, "instruments/cello01.ogg", base_note="D3", pitch_cents=18)
+set_audiofile_sample(0, "instruments/cello01.ogg", base_note="D2", pitch_cents=18)
 add_note_by_name(0, "A3")      # key 45: sounds at 220 Hz
 ```
 
