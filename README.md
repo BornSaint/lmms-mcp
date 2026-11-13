@@ -142,10 +142,11 @@ python -m lmms_mcp
 
 | Tool | Description |
 |------|-------------|
-| `add_effect` | Add a built-in effect to a track or mixer channel |
+| `add_effect` | Add a built-in effect to a track or mixer channel. Without `wet` and `params` it starts with audible, musical settings (a delay synced to the tempo that keeps the dry sound), see [Available Effects](#available-effects) |
+| `set_effect_params` | Set parameters of an effect already in a chain (delay time, feedback, reverb size, EQ bands, bit depth...), validated against each parameter's range |
 | `remove_effect` | Remove an effect by name or chain position |
 | `toggle_effect` | Enable/bypass an effect without removing it |
-| `get_effect_chain` | List all effects on a track or mixer channel |
+| `get_effect_chain` | List all effects on a track or mixer channel with their wet mix and the parameters that differ from the plugin defaults |
 
 ### ZynAddSubFX Presets & Parameters
 
@@ -513,6 +514,318 @@ Typical chains:
 - Lead synth: `delay` -> `reverbsc`
 - Vocals: `eq` -> `compressor` -> `reverbsc`
 - Master bus: `eq` -> `compressor` -> `stereoenhancer`
+
+### What `add_effect` does by default
+
+The bare plugin defaults of several LMMS effects do nothing audible, or do
+the wrong thing: LMMS's delay at its defaults plays *only* an echo half a
+second late (the original note disappears and there is no repeat), and a
+bitcrusher at its defaults is practically transparent. So a plain
+`add_effect("track", 0, "delay")` starts the effect with the settings below
+and the response lists the `params` used, the `wet` mix and a `note` where the
+effect needs your input. Pass `wet` and/or `params` to choose yourself; the
+parameters you give win over the starting ones.
+
+Three effects (`delay`, `reverbsc`, `flanger`) output **only** the processed
+signal (verified by rendering with LMMS 1.2.2): at `wet=1.0` the original sound
+is gone, so they start below 1.0. Every other effect starts at `wet=1.0`
+(they process the sound itself, or mix the original in on their own, like the
+multi-tap echo's `dry_gain_db`). `wet` goes from 0.0 (original sound only) to
+1.0 (effect only); `set_effect_params` accepts `"wet"` and `"decay_ms"` (and `add_effect` "params" accepts `"decay_ms"`).
+
+Four effects with echoes or tails (`delay`, `reverbsc`, `multitapecho`,
+`flanger`) also start with `decay_ms` 8000 (LMMS's "Decay", 1 to 8000). LMMS
+stops an effect once its output has been silent for that long: at its default
+of 1 ms the delay's echo is lost whenever there is a gap before it (a short
+note, or `time_s` longer than the note) and short reverb tails are cut. This
+depends on the LMMS setting "disable auto-quit" (off by default), so the
+server does not rely on it. `decay_ms` can be changed with `set_effect_params`
+like `wet`.
+
+| Effect | `wet` | Starting settings |
+|--------|-------|-------------------|
+| `delay` | 0.4 | `time_s` = a 1/8 note at the project tempo (`30 / bpm` s), `feedback` 0.3 (repeats fading to 30 % each), `decay_ms` 8000 |
+| `reverbsc` | 0.3 | plugin defaults (`size` 0.89), `decay_ms` 8000 |
+| `flanger` | 0.5 | `delay_s` 0.002, `lfo_period_s` 3, `lfo_amount_s` 0.0015, `feedback` 0.3, `decay_ms` 8000 |
+| `multitapecho` | 1.0 | `steps` 8, `step_length_ms` = a 1/16 note at the project tempo, `tap_levels_db` `"decay"` (-9 dB, falling 4 dB per tap), `decay_ms` 8000 |
+| `bitcrush` | 1.0 | `sample_rate_hz` 8000, `bit_levels` 16 |
+| `dualfilter` | 1.0 | both filters low-pass at 1200 Hz |
+| `dynamicsprocessor` | 1.0 | `threshold_db` -12, `ratio` 4 |
+| `waveshaper` | 1.0 | `shape` `soft_clip`, `input_gain` 1.5, `output_gain` 0.6 |
+| `stereoenhancer` | 1.0 | `width` 60 |
+| `bassbooster` | 1.0 | plugin defaults (audible) |
+| `amplifier`, `crossovereq`, `eq`, `stereomatrix` | 1.0 | neutral at the plugin defaults; the response says so and which parameters to set |
+
+### Setting effect parameters
+
+```
+add_effect("track", 0, "delay", params={"time_s": 0.375, "feedback": 0.5})
+set_effect_params("track", 0, "delay", {"feedback": 0.2, "wet": 0.3, "decay_ms": 4000})
+set_effect_params("mixer", 2, "eq", {"lp_on": True, "lp_freq_hz": 8000, "lp_slope_db": 24})
+get_effect_chain("track", 0)   # shows the parameters that are not at the plugin default
+```
+
+Every parameter has a friendly name (the tables below); the real LMMS
+attribute name works too. Names and values are checked first: an unknown name,
+a wrong type or a value outside the range changes nothing and the error lists
+the valid names or the valid range (values are never silently clamped).
+`lmms://reference/effects` returns the same tables as JSON. Things worth
+knowing:
+
+- Delay and flanger `lfo_period_s` is the *period* of the wobble in seconds,
+  although LMMS calls the attribute `LfoFrequency`; the delay's `time_s` is in
+  seconds although the attribute is `DelayTimeSamples`.
+- `crossovereq` `bandN_on` is LMMS's `muteN` switch: on = the band is heard.
+  The three crossover frequencies must ascend.
+- `eq` slopes: `hp_slope_db` / `lp_slope_db` take 12, 24 or 48; the server
+  writes the three flags LMMS actually reads.
+- Curves: `waveshaper` `shape` is a name or a list of 200 numbers (0 to 1);
+  `dynamicsprocessor` builds its curve from `threshold_db` and `ratio`
+  (set both together; ratio 1 or threshold 0 dB reduces nothing);
+  `multitapecho` `tap_levels_db` / `tap_cutoff_hz` take a number (all taps) or
+  a list with one number per step (`tap_levels_db` also `"decay"`).
+  LMMS reads these curves unconditionally, so the server always writes them;
+  an effect created by an older version of this server (no curve) is repaired
+  by the next `set_effect_params`.
+- `multitapecho`'s "low-pass stages" knob is not offered: LMMS 1.2 ignores it
+  (every stage re-filters the unfiltered input).
+- `compressor`, `dispersion`, `frequencyshifter` and `slewdistortion`
+  (LMMS 1.3+) have no parameter tables yet: they are added with the plugin
+  defaults, and `params` for them is refused.
+
+
+### Parameter tables
+
+One table per effect (click to open): friendly name, the LMMS attribute, range,
+unit, plugin default and meaning. The heading shows what `add_effect` starts
+the effect with.
+
+<details>
+<summary><code>amplifier</code> &mdash; starts with: neutral at the plugin defaults: set parameters</summary>
+
+| Parameter | XML attribute | Range | Unit | Default | Meaning |
+|-----------|---------------|-------|------|---------|---------|
+| `volume` | `volume` | 0 to 200 | % | 100 | Overall gain; 100 = unchanged |
+| `pan` | `pan` | -100 to 100 |  | 0 | Balance: -100 = left only, 0 = centre, 100 = right only |
+| `left_gain` | `left` | 0 to 200 | % | 100 | Left channel gain |
+| `right_gain` | `right` | 0 to 200 | % | 100 | Right channel gain |
+
+</details>
+
+<details>
+<summary><code>bassbooster</code> &mdash; starts with: plugin defaults</summary>
+
+| Parameter | XML attribute | Range | Unit | Default | Meaning |
+|-----------|---------------|-------|------|---------|---------|
+| `freq_hz` | `freq` | 50 to 200 | Hz | 100 | Frequency below which bass is boosted |
+| `gain` | `gain` | 0.1 to 5 |  | 1 | Input gain of the booster (more = more bass) |
+| `ratio` | `ratio` | 0.1 to 10 |  | 2 | Strength of the boost curve (more = more bass) |
+
+</details>
+
+<details>
+<summary><code>bitcrush</code> &mdash; starts with: sample_rate_hz 8000, bit_levels 16</summary>
+
+| Parameter | XML attribute | Range | Unit | Default | Meaning |
+|-----------|---------------|-------|------|---------|---------|
+| `input_gain_db` | `ingain` | -20 to 20 | dB | 0 | Gain before crushing (drives the bit reduction) |
+| `input_noise_pct` | `innoise` | 0 to 100 | % | 0 | Noise added before crushing |
+| `output_gain_db` | `outgain` | -20 to 20 | dB | 0 | Gain after crushing |
+| `output_clip_db` | `outclip` | -20 to 20 | dB | 0 | Hard-clip level of the output |
+| `sample_rate_hz` | `rate` | 20 to 44100 | Hz | 44100 | Sample-rate reduction: lower = more aliasing, 44100 = off |
+| `stereo_diff_pct` | `stereodiff` | 0 to 50 | % | 0 | Different rate on left and right |
+| `bit_levels` | `levels` | 1 to 256 |  | 256 | Quantisation levels: 256 is clean, 16 is 4-bit, 2 is harsh |
+| `rate_on` | `rateon` | on/off |  | on | Sample-rate reduction on |
+| `depth_on` | `depthon` | on/off |  | on | Bit-depth reduction on |
+
+</details>
+
+<details>
+<summary><code>crossovereq</code> &mdash; starts with: neutral at the plugin defaults: set parameters</summary>
+
+| Parameter | XML attribute | Range | Unit | Default | Meaning |
+|-----------|---------------|-------|------|---------|---------|
+| `xover_1_2_hz` | `xover12` | 50 to 10000 | Hz | 125 | Crossover between bands 1 and 2 |
+| `xover_2_3_hz` | `xover23` | 50 to 20000 | Hz | 1250 | Crossover between bands 2 and 3 |
+| `xover_3_4_hz` | `xover34` | 50 to 20000 | Hz | 5000 | Crossover between bands 3 and 4 |
+| `band1_gain_db` | `gain1` | -60 to 30 | dB | 0 | Band 1 (lows) gain |
+| `band2_gain_db` | `gain2` | -60 to 30 | dB | 0 | Band 2 gain |
+| `band3_gain_db` | `gain3` | -60 to 30 | dB | 0 | Band 3 gain |
+| `band4_gain_db` | `gain4` | -60 to 30 | dB | 0 | Band 4 (highs) gain |
+| `band1_on` | `mute1` | on/off |  | on | Band 1 passes (False silences it; LMMS names the switch 'mute') |
+| `band2_on` | `mute2` | on/off |  | on | Band 2 passes |
+| `band3_on` | `mute3` | on/off |  | on | Band 3 passes |
+| `band4_on` | `mute4` | on/off |  | on | Band 4 passes |
+
+</details>
+
+<details>
+<summary><code>delay</code> &mdash; starts with: wet 0.4, feedback 0.3, time_s = a 1/8 note at the project tempo (30/bpm s)</summary>
+
+| Parameter | XML attribute | Range | Unit | Default | Meaning |
+|-----------|---------------|-------|------|---------|---------|
+| `time_s` | `DelayTimeSamples` | 0.01 to 5 | s | 0.5 | Delay time (the XML name says samples, the value is seconds) |
+| `feedback` | `FeebackAmount` | 0 to 1 |  | 0 | Share of the echo fed back in: 0 = one echo, 0.5 = repeats halving |
+| `lfo_period_s` | `LfoFrequency` | 0.01 to 5 | s | 2 | Period of the delay-time wobble (the XML name says frequency) |
+| `lfo_amount_s` | `LfoAmount` | 0 to 0.5 | s | 0 | Depth of the delay-time wobble; 0 = steady |
+| `out_gain_db` | `OutGain` | -60 to 20 | dB | 0 | Gain of the echoes |
+
+</details>
+
+<details>
+<summary><code>dualfilter</code> &mdash; starts with: cutoff1_hz 1200, cutoff2_hz 1200</summary>
+
+| Parameter | XML attribute | Range | Unit | Default | Meaning |
+|-----------|---------------|-------|------|---------|---------|
+| `filter1_on` | `enabled1` | on/off |  | on | Filter 1 on (an off filter outputs silence into the mix) |
+| `filter1_type` | `filter1` | 22 choices (below) |  | lowpass | Filter 1 type |
+| `cutoff1_hz` | `cut1` | 1 to 20000 | Hz | 7000 | Filter 1 cutoff |
+| `resonance1` | `res1` | 0.01 to 10 |  | 0.5 | Filter 1 resonance (Q) |
+| `gain1_pct` | `gain1` | 0 to 200 | % | 100 | Filter 1 output gain |
+| `mix` | `mix` | -1 to 1 |  | 0 | Blend of the two filters in parallel: -1 = filter 1 only, 0 = half of each, 1 = filter 2 only |
+| `filter2_on` | `enabled2` | on/off |  | on | Filter 2 on (an off filter outputs silence into the mix) |
+| `filter2_type` | `filter2` | 22 choices (below) |  | lowpass | Filter 2 type |
+| `cutoff2_hz` | `cut2` | 1 to 20000 | Hz | 7000 | Filter 2 cutoff |
+| `resonance2` | `res2` | 0.01 to 10 |  | 0.5 | Filter 2 resonance (Q) |
+| `gain2_pct` | `gain2` | 0 to 200 | % | 100 | Filter 2 output gain |
+
+Filter types: `lowpass`, `highpass`, `bandpass_csg`, `bandpass_czpg`, `notch`, `allpass`, `moog`, `2x_lowpass`, `rc_lowpass_12`, `rc_bandpass_12`, `rc_highpass_12`, `rc_lowpass_24`, `rc_bandpass_24`, `rc_highpass_24`, `vocal_formant`, `2x_moog`, `sv_lowpass`, `sv_bandpass`, `sv_highpass`, `sv_notch`, `fast_formant`, `tripole`.
+
+</details>
+
+<details>
+<summary><code>dynamicsprocessor</code> &mdash; starts with: threshold_db -12, ratio 4</summary>
+
+| Parameter | XML attribute | Range | Unit | Default | Meaning |
+|-----------|---------------|-------|------|---------|---------|
+| `input_gain` | `inputGain` | 0 to 5 |  | 1 | Gain before the curve (1 = unchanged) |
+| `output_gain` | `outputGain` | 0 to 5 |  | 1 | Gain after the curve (make-up gain) |
+| `attack_ms` | `attack` | 1 to 500 | ms | 10 | How fast the level follows a rise |
+| `release_ms` | `release` | 1 to 500 | ms | 100 | How fast the level follows a fall |
+| `stereo_mode` | `stereoMode` | maximum / average / unlinked |  | maximum | How the two channels share one level: the louder one, the mean, or each alone |
+| `threshold_db` | `waveShape (curve)` | -60 to 0 | dB | 0 | RMS level above which the level is reduced (0 = never) |
+| `ratio` | `waveShape (curve)` | 1 to 100 |  | 1 | Reduction above the threshold, N:1 (1 = off, 100 = limiter) |
+
+</details>
+
+<details>
+<summary><code>eq</code> &mdash; starts with: neutral at the plugin defaults: set parameters</summary>
+
+| Parameter | XML attribute | Range | Unit | Default | Meaning |
+|-----------|---------------|-------|------|---------|---------|
+| `input_gain_db` | `Inputgain` | -60 to 20 | dB | 0 | Gain before the bands |
+| `output_gain_db` | `Outputgain` | -60 to 20 | dB | 0 | Gain after the bands |
+| `hp_on` | `HPactive` | on/off |  | off | High-pass filter on |
+| `hp_freq_hz` | `HPfreq` | 20 to 20000 | Hz | 31 | High-pass cutoff |
+| `hp_res` | `HPres` | 0.003 to 10 |  | 0.707 | High-pass resonance (Q) |
+| `hp_slope_db` | `HP` | 12 / 24 / 48 |  | 12 | High-pass slope in dB per octave |
+| `lowshelf_on` | `Lowshelfactive` | on/off |  | off | Low shelf on |
+| `lowshelf_gain_db` | `Lowshelfgain` | -18 to 18 | dB | 0 | Low shelf boost/cut |
+| `lowshelf_freq_hz` | `LowShelffreq` | 20 to 20000 | Hz | 80 | Low shelf corner |
+| `lowshelf_res` | `LowShelfres` | 0.55 to 10 |  | 1.4 | Low shelf resonance |
+| `peak1_on` | `Peak1active` | on/off |  | off | Peak band 1 on |
+| `peak1_gain_db` | `Peak1gain` | -18 to 18 | dB | 0 | Peak band 1 boost/cut |
+| `peak1_freq_hz` | `Peak1freq` | 20 to 20000 | Hz | 120 | Peak band 1 centre |
+| `peak1_bw` | `Peak1bw` | 0.1 to 4 | octaves | 0.3 | Peak band 1 bandwidth |
+| `peak2_on` | `Peak2active` | on/off |  | off | Peak band 2 on |
+| `peak2_gain_db` | `Peak2gain` | -18 to 18 | dB | 0 | Peak band 2 boost/cut |
+| `peak2_freq_hz` | `Peak2freq` | 20 to 20000 | Hz | 250 | Peak band 2 centre |
+| `peak2_bw` | `Peak2bw` | 0.1 to 4 | octaves | 0.3 | Peak band 2 bandwidth |
+| `peak3_on` | `Peak3active` | on/off |  | off | Peak band 3 on |
+| `peak3_gain_db` | `Peak3gain` | -18 to 18 | dB | 0 | Peak band 3 boost/cut |
+| `peak3_freq_hz` | `Peak3freq` | 20 to 20000 | Hz | 2000 | Peak band 3 centre |
+| `peak3_bw` | `Peak3bw` | 0.1 to 4 | octaves | 0.3 | Peak band 3 bandwidth |
+| `peak4_on` | `Peak4active` | on/off |  | off | Peak band 4 on |
+| `peak4_gain_db` | `Peak4gain` | -18 to 18 | dB | 0 | Peak band 4 boost/cut |
+| `peak4_freq_hz` | `Peak4freq` | 20 to 20000 | Hz | 4000 | Peak band 4 centre |
+| `peak4_bw` | `Peak4bw` | 0.1 to 4 | octaves | 0.3 | Peak band 4 bandwidth |
+| `highshelf_on` | `Highshelfactive` | on/off |  | off | High shelf on |
+| `highshelf_gain_db` | `HighShelfgain` | -18 to 18 | dB | 0 | High shelf boost/cut |
+| `highshelf_freq_hz` | `Highshelffreq` | 20 to 20000 | Hz | 12000 | High shelf corner |
+| `highshelf_res` | `HighShelfres` | 0.55 to 10 |  | 1.4 | High shelf resonance |
+| `lp_on` | `LPactive` | on/off |  | off | Low-pass filter on |
+| `lp_freq_hz` | `LPfreq` | 20 to 20000 | Hz | 18000 | Low-pass cutoff |
+| `lp_res` | `LPres` | 0.003 to 10 |  | 0.707 | Low-pass resonance (Q) |
+| `lp_slope_db` | `LP` | 12 / 24 / 48 |  | 12 | Low-pass slope in dB per octave |
+
+</details>
+
+<details>
+<summary><code>flanger</code> &mdash; starts with: wet 0.5, delay_s 0.002, lfo_period_s 3, lfo_amount_s 0.0015, feedback 0.3</summary>
+
+| Parameter | XML attribute | Range | Unit | Default | Meaning |
+|-----------|---------------|-------|------|---------|---------|
+| `delay_s` | `DelayTimeSamples` | 0.0001 to 0.05 | s | 0.001 | Base delay time |
+| `lfo_period_s` | `LfoFrequency` | 0.01 to 60 | s | 0.25 | Period of the sweep (the XML name says frequency): 4 = slow |
+| `lfo_amount_s` | `LfoAmount` | 0 to 0.0025 | s | 0 | Sweep depth; 0 = a static comb filter, no flanging |
+| `feedback` | `Feedback` | 0 to 1 |  | 0 | Regeneration: more = more metallic ring |
+| `noise` | `WhiteNoise` | 0 to 0.05 |  | 0 | White noise added to the input |
+| `invert_feedback` | `Invert` | on/off |  | off | Cross the feedback between the channels |
+
+</details>
+
+<details>
+<summary><code>multitapecho</code> &mdash; starts with: steps 8, tap_levels_db decay, step_length_ms = a 1/16 note at the project tempo</summary>
+
+| Parameter | XML attribute | Range | Unit | Default | Meaning |
+|-----------|---------------|-------|------|---------|---------|
+| `steps` | `steps` | 4 to 32 |  | 16 | Number of echo taps |
+| `step_length_ms` | `steplength` | 1 to 500 | ms | 100 | Time between taps |
+| `dry_gain_db` | `drygain` | -80 to 20 | dB | 0 | Level of the direct sound inside the effect (-80 = echoes only) |
+| `swap_inputs` | `swapinputs` | on/off |  | off | Echoes swap left and right |
+| `tap_levels_db` | `ampsteps (curve)` | -60 to 0 | dB | 0 | Level of each tap: a number (all taps), a list of `steps` numbers, or "decay" |
+| `tap_cutoff_hz` | `lpsteps (curve)` | 20 to 20000 | Hz | 20000 | Low-pass cutoff of each tap: a number or a list of `steps` numbers |
+
+</details>
+
+<details>
+<summary><code>reverbsc</code> &mdash; starts with: wet 0.3</summary>
+
+| Parameter | XML attribute | Range | Unit | Default | Meaning |
+|-----------|---------------|-------|------|---------|---------|
+| `input_gain_db` | `input_gain` | -60 to 15 | dB | 0 | Gain into the reverb |
+| `size` | `size` | 0 to 1 |  | 0.89 | Reverb length; 1 never decays |
+| `color_hz` | `color` | 100 to 15000 | Hz | 10000 | Low-pass of the tail (lower = darker) |
+| `output_gain_db` | `output_gain` | -60 to 15 | dB | 0 | Gain of the reverb |
+
+</details>
+
+<details>
+<summary><code>stereoenhancer</code> &mdash; starts with: width 60</summary>
+
+| Parameter | XML attribute | Range | Unit | Default | Meaning |
+|-----------|---------------|-------|------|---------|---------|
+| `width` | `width` | 0 to 180 | samples | 0 | Right channel delayed against the left by this many samples (1 ms is about 44); 0 = off |
+
+</details>
+
+<details>
+<summary><code>stereomatrix</code> &mdash; starts with: neutral at the plugin defaults: set parameters</summary>
+
+| Parameter | XML attribute | Range | Unit | Default | Meaning |
+|-----------|---------------|-------|------|---------|---------|
+| `left_to_left` | `l-l` | -1 to 1 |  | 1 | How much of the left input goes to the left output |
+| `left_to_right` | `l-r` | -1 to 1 |  | 0 | Left input to the right output |
+| `right_to_left` | `r-l` | -1 to 1 |  | 0 | Right input to the left output |
+| `right_to_right` | `r-r` | -1 to 1 |  | 1 | Right input to the right output |
+
+</details>
+
+<details>
+<summary><code>waveshaper</code> &mdash; starts with: shape soft_clip, input_gain 1.5, output_gain 0.6</summary>
+
+| Parameter | XML attribute | Range | Unit | Default | Meaning |
+|-----------|---------------|-------|------|---------|---------|
+| `input_gain` | `inputGain` | 0 to 5 |  | 1 | Gain before the shaper (drive) |
+| `output_gain` | `outputGain` | 0 to 5 |  | 1 | Gain after the shaper |
+| `clip_input` | `clipInput` | on/off |  | off | Clip the input at full scale before shaping |
+| `shape` | `waveShape (curve)` | name or list |  | linear | Transfer curve: a name (see WAVESHAPES) or a list of 200 numbers from 0 to 1 (output for input 1/200 ... 200/200) |
+
+Shapes: `linear` (no change (the LMMS default)); `soft_clip` (tanh saturation, adds odd harmonics, quiet parts get louder); `hard_clip` (clips at one third of full scale); `fuzz` (almost a square wave); `fold` (wavefolder, loud parts fold back); `crush` (8-step staircase).
+
+</details>
+
+
 
 ## Environment Variables
 

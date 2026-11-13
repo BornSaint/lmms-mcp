@@ -15,6 +15,7 @@ from xml.etree import ElementTree as ET
 
 from mcp.server import MCPServer
 
+from . import effect_params
 from . import effects as effects_mod
 from . import instrument_presets as inst_presets
 from . import lmms_app
@@ -296,9 +297,32 @@ def _doc_bullets(lines: list[str], indent: str = " " * 4) -> str:
     ).lstrip()
 
 
+def _effect_start_lines(av) -> list[str]:
+    """What add_effect starts each offered effect with."""
+    return [f"{n}: {effect_params.describe_start(n)}"
+            for n in _effect_choices(av) if effect_params.has_params(n)]
+
+
+def _effect_param_lines(av) -> list[str]:
+    """Every offered effect's parameters (name, range unit, default), the
+    choices of the long choice lists, and the effects without a table."""
+    names = [n for n in _effect_choices(av) if effect_params.has_params(n)]
+    lines = [f"{n}: {effect_params.describe_params(n)}" for n in names]
+    lines += effect_params.describe_choices(names)
+    other = [n for n in _effect_choices(av) if not effect_params.has_params(n)]
+    if other:
+        lines.append(
+            f"{', '.join(other)}: no parameters can be set yet (plugin "
+            f"defaults)")
+    return lines
+
+
 def render_plugin_doc(template: str, av) -> str:
-    """Fill $INSTRUMENTS / $EFFECTS / $FILE_* / $TUNING_LIMITS in a tool
-    docstring template.
+    """Fill $INSTRUMENTS / $EFFECTS / $EFFECT_* / $FILE_* / $TUNING_LIMITS in
+    a tool docstring template.
+
+    $EFFECT_STARTS lists what add_effect starts each offered effect with and
+    $EFFECT_PARAMS the parameters of each (bullets).
 
     $FILE_INSTRUMENTS names the offered instruments that play a file,
     $FILE_DETAILS describes them (bullets) and $FILE_NOTE is a pointer to
@@ -310,6 +334,8 @@ def render_plugin_doc(template: str, av) -> str:
     return string.Template(template).safe_substitute(
         INSTRUMENTS=_wrap_names(_instrument_choices(av)),
         EFFECTS=_wrap_names(_effect_choices(av)),
+        EFFECT_STARTS=_doc_bullets(_effect_start_lines(av)),
+        EFFECT_PARAMS=_doc_bullets(_effect_param_lines(av)),
         FILE_INSTRUMENTS=" / ".join(files),
         FILE_DETAILS=_doc_bullets(_file_instrument_details(av)),
         TUNING_LIMITS=textwrap.fill(
@@ -539,8 +565,12 @@ is compensated for you."""
     )
     blocks.append(
         "Effects: Add built-in effects to tracks or mixer channels with "
-        "add_effect (see lmms://reference/effects for the full list). "
-        "Typical chains:\n"
+        "add_effect (see lmms://reference/effects for the full list and "
+        "every parameter). A plain add_effect starts the effect with "
+        "audible, musical settings (a delay is synced to the project tempo; "
+        "effects that output only the processed signal keep the dry "
+        "sound); tune it with set_effect_params and check it with "
+        "get_effect_chain. Typical chains:\n"
         + "\n".join(f"- {use}: {_chain_text(c)}" for use, c in chains.items())
     )
 
@@ -1767,25 +1797,52 @@ def _resolve_fxchain_target(target_type: str, target_index: int) -> ET.Element:
     raise ValueError("target_type must be 'track' or 'mixer'")
 
 
+def _param_error(exc: effect_params.ParamError) -> str:
+    out = {"error": str(exc)}
+    if exc.valid:
+        out["valid_parameters"] = exc.valid
+    return json.dumps(out)
+
+
 @_plugin_tool
 def add_effect(
     target_type: str,
     target_index: int,
     effect: str,
-    wet: float = 1.0,
+    wet: float | None = None,
     enabled: bool = True,
     position: int | None = None,
+    params: dict | None = None,
 ) -> str:
     """Add an effect to a track's or mixer channel's effect chain.
+
+    Called with just the effect, it starts with settings that make it audible
+    and musical, not the bare plugin defaults (which can be silent, subtle or
+    drop the original sound). The response lists the "params" used, the "wet"
+    mix, "decay_ms" and a "note" where the start needs your input. Change
+    anything later with set_effect_params; see it with get_effect_chain.
+    "decay_ms" is how long LMMS keeps an effect running through silence: at
+    LMMS's default of 1 it cuts echoes that come after a gap and reverb
+    tails, so effects with echoes or tails start at 8000.
+
+    Starting settings:
+    $EFFECT_STARTS
 
     Args:
         target_type: "track" or "mixer"
         target_index: Track index or mixer channel number (0=Master)
         effect: Built-in LMMS effect name. Valid in the installed LMMS:
             $EFFECTS
-        wet: Wet/dry mix 0.0-1.0 (1.0=full effect)
+        wet: Wet/dry mix 0.0-1.0 (0=original sound only, 1=effect only).
+            Default: the effect's own start value above. Effects that output
+            only the processed signal start below 1.0 so the original
+            sound stays; pass 1.0 explicitly to get the effect alone.
         enabled: Whether the effect is active
         position: Chain position to insert at (None=end of chain)
+        params: Optional {name: value} settings on top of the starting
+            settings, e.g. {"time_s": 0.375, "feedback": 0.5} ("decay_ms"
+            too). Names, ranges and units: see set_effect_params. A bad name
+            or value adds nothing and the error says what is valid.
     """
     av = _availability
     normalized = effect.strip().lower()
@@ -1797,12 +1854,15 @@ def add_effect(
         parent = _resolve_fxchain_target(target_type, target_index)
         result = effects_mod.add_effect(
             parent, effect, wet, enabled, position,
-            available=_effect_choices(av),
+            available=_effect_choices(av), params=params,
+            bpm=get_project().get_info().bpm,
         )
         warning = _verification_warning(av, normalized)
         if warning:
             result["warning"] = warning
         return json.dumps(result)
+    except effect_params.ParamError as exc:
+        return _param_error(exc)
     except ValueError as exc:
         return json.dumps({
             "error": str(exc),
@@ -1811,6 +1871,46 @@ def add_effect(
                 effects_mod.EFFECT_RECOMMENDATIONS, av.effects
             ),
         })
+
+
+@_plugin_tool
+def set_effect_params(
+    target_type: str,
+    target_index: int,
+    effect: str | int,
+    params: dict,
+) -> str:
+    """Change the parameters of an effect already in a chain.
+
+    Only the parameters you pass change; the others keep their values.
+    Names are checked and values must be in range: an unknown name or an
+    out-of-range value changes nothing and the error lists the valid names
+    or the valid range. Each parameter has a friendly name (below); its
+    real LMMS attribute name is accepted too, and lmms://reference/effects
+    shows both with descriptions. Every effect also has "wet" (0.0-1.0, the
+    wet/dry mix) and "decay_ms" (1-8000, how long LMMS keeps it running
+    through silence; raise it when echoes or a tail are cut off). The
+    response lists the values as stored.
+
+    Parameters (name, range unit, plugin default):
+    $EFFECT_PARAMS
+
+    Args:
+        target_type: "track" or "mixer"
+        target_index: Track index or mixer channel number
+        effect: Effect name (e.g. "delay") or chain position (e.g. 0)
+        params: {name: value}, e.g. {"time_s": 0.375, "feedback": 0.5}.
+            Numbers for knobs, true/false for switches, text for choices
+            (a list for the curve parameters: shape, tap_levels_db,
+            tap_cutoff_hz).
+    """
+    try:
+        parent = _resolve_fxchain_target(target_type, target_index)
+        return json.dumps(effects_mod.set_effect_params(parent, effect, params))
+    except effect_params.ParamError as exc:
+        return _param_error(exc)
+    except ValueError as exc:
+        return json.dumps({"error": str(exc)})
 
 
 @mcp.tool()
@@ -1853,6 +1953,10 @@ def toggle_effect(
 @mcp.tool()
 def get_effect_chain(target_type: str, target_index: int) -> str:
     """List all effects on a track's or mixer channel's effect chain.
+
+    Each effect shows its position, whether it is enabled, its wet mix,
+    decay_ms and "params": the parameters that differ from the plugin
+    defaults (friendly names, see set_effect_params).
 
     Args:
         target_type: "track" or "mixer"
@@ -3341,22 +3445,43 @@ def resource_instruments() -> str:
     }, indent=2)
 
 
+def _effect_reference(name: str) -> dict:
+    """One effect for lmms://reference/effects: description, controls node
+    and, where known, wet default, starting settings and all parameters."""
+    entry = {
+        "name": name,
+        "description": effects_mod.KNOWN_EFFECTS[name][0],
+        "controls_node": effects_mod.KNOWN_EFFECTS[name][1],
+    }
+    if not effect_params.has_params(name):
+        entry["parameters"] = "none can be set yet (plugin defaults)"
+        return entry
+    start = effect_params.EFFECT_START[name]
+    entry["outputs_dry_signal"] = not start.why_wet
+    entry["wet_default"] = start.wet
+    entry["decay_ms_default"] = start.decay_ms
+    entry["starting_settings"] = effect_params.describe_start(name)
+    if start.note:
+        entry["note"] = start.note
+    entry["parameters"] = [
+        effect_params.param_dict(p) for p in effect_params.params_of(name)]
+    if name == "waveshaper":
+        entry["shapes"] = effect_params.WAVESHAPE_DOC
+    return entry
+
+
 @mcp.resource("lmms://reference/effects")
 def resource_effects() -> str:
-    """Effects available in the installed LMMS (verified)."""
+    """Effects available in the installed LMMS (verified), with the starting
+    settings of add_effect and every parameter set_effect_params accepts."""
     av = _availability
     return json.dumps({
         "note": _reference_note(av, "effects")
                 + " Effects that host external plugins (LADSPA, LV2, VST) "
                   "cannot be added with add_effect.",
-        "effects": [
-            {
-                "name": name,
-                "description": effects_mod.KNOWN_EFFECTS[name][0],
-                "controls_node": effects_mod.KNOWN_EFFECTS[name][1],
-            }
-            for name in sorted(av.effects)
-        ],
+        "settings_of_every_effect": [
+            effect_params.param_dict(p) for p in effect_params.EFFECT_LEVEL],
+        "effects": [_effect_reference(name) for name in sorted(av.effects)],
         "recommendations_by_use_case": lmms_app.adapt_recommendations(
             effects_mod.EFFECT_RECOMMENDATIONS, av.effects
         ),

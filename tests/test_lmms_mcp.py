@@ -394,6 +394,723 @@ class TestEffects:
         Path(path).unlink()
 
 
+def _floats(text):
+    from lmms_mcp.effect_params import unpack_floats
+    return unpack_floats(text)
+
+
+class TestEffectParamTable:
+    """The per-effect parameter table (names, ranges, defaults)."""
+
+    def test_every_offered_effect_has_a_table_and_a_start(self):
+        from lmms_mcp import effect_params as ep
+        from lmms_mcp.effects import KNOWN_EFFECTS
+        # the 1.3-only plugins have no table yet; everything else does
+        without = set(KNOWN_EFFECTS) - set(ep.EFFECT_PARAMS)
+        assert without == {"compressor", "dispersion", "frequencyshifter",
+                           "slewdistortion"}
+        assert set(ep.EFFECT_START) == set(ep.EFFECT_PARAMS)
+
+    def test_names_and_attributes_are_unique_per_effect(self):
+        from lmms_mcp import effect_params as ep
+        for effect, params in ep.EFFECT_PARAMS.items():
+            names = [p.name.lower() for p in params]
+            attrs = [p.attr.lower() for p in params if p.kind != "curve"]
+            assert len(set(names)) == len(names), effect
+            assert len(set(attrs)) == len(attrs), effect
+            # a name never means a different parameter's attribute
+            for p in params:
+                other = [q for q in params if q is not p]
+                assert p.name.lower() not in {q.attr.lower() for q in other
+                                              if q.kind != "curve"}, (effect, p.name)
+
+    def test_defaults_lie_in_the_range_and_everything_is_described(self):
+        from lmms_mcp import effect_params as ep
+        for effect, params in ep.EFFECT_PARAMS.items():
+            for p in params:
+                assert p.description, (effect, p.name)
+                if p.minimum is not None:
+                    assert p.minimum < p.maximum, (effect, p.name)
+                    assert p.minimum <= p.default <= p.maximum, (effect, p.name)
+                if p.kind == "choice":
+                    assert p.default in p.choices, (effect, p.name)
+
+    def test_real_attribute_names(self):
+        """The attribute names LMMS 1.2 reads (checked against the plugins)."""
+        from lmms_mcp import effect_params as ep
+        attrs = {e: {p.name: p.attr for p in ps}
+                 for e, ps in ep.EFFECT_PARAMS.items()}
+        assert attrs["delay"] == {
+            "time_s": "DelayTimeSamples", "feedback": "FeebackAmount",
+            "lfo_period_s": "LfoFrequency", "lfo_amount_s": "LfoAmount",
+            "out_gain_db": "OutGain"}
+        assert attrs["bitcrush"]["sample_rate_hz"] == "rate"
+        assert attrs["bitcrush"]["bit_levels"] == "levels"
+        assert attrs["bitcrush"]["rate_on"] == "rateon"
+        assert attrs["reverbsc"] == {
+            "input_gain_db": "input_gain", "size": "size",
+            "color_hz": "color", "output_gain_db": "output_gain"}
+        assert attrs["eq"]["peak1_gain_db"] == "Peak1gain"
+        assert attrs["eq"]["highshelf_gain_db"] == "HighShelfgain"
+        assert attrs["eq"]["highshelf_on"] == "Highshelfactive"
+        assert attrs["stereomatrix"]["left_to_right"] == "l-r"
+        assert attrs["crossovereq"]["band1_on"] == "mute1"
+
+    def test_documented_defaults_are_the_plugin_defaults(self):
+        from lmms_mcp import effect_params as ep
+        d = {e: {p.name: p.default for p in ps}
+             for e, ps in ep.EFFECT_PARAMS.items()}
+        assert d["delay"]["time_s"] == 0.5 and d["delay"]["feedback"] == 0
+        assert d["reverbsc"]["size"] == 0.89
+        assert d["bitcrush"]["sample_rate_hz"] == 44100
+        assert d["bitcrush"]["bit_levels"] == 256
+        assert d["dualfilter"]["cutoff1_hz"] == 7000
+        assert d["flanger"]["lfo_period_s"] == 0.25
+
+    def test_wet_is_below_one_exactly_where_the_dry_signal_is_missing(self):
+        """delay, reverbsc and flanger output only the processed signal
+        (verified by rendering with LMMS 1.2.2); all others start at 1."""
+        from lmms_mcp import effect_params as ep
+        low = {e for e, s in ep.EFFECT_START.items() if s.wet < 1.0}
+        assert low == {"delay", "reverbsc", "flanger"}
+        assert {e for e, s in ep.EFFECT_START.items() if s.why_wet} == low
+        assert 0.3 <= ep.EFFECT_START["delay"].wet <= 0.5
+        assert 0.3 <= ep.EFFECT_START["reverbsc"].wet <= 0.5
+
+    def test_start_settings_are_valid_for_every_effect_and_tempo(self):
+        import xml.etree.ElementTree as ET
+        from lmms_mcp import effect_params as ep
+        for effect in ep.EFFECT_START:
+            for bpm in (10, 60, 120, 140, 999):
+                controls = ET.Element("c")
+                ep.ensure_graph_defaults(effect, controls)
+                ep.apply_params(effect, controls, ep.start_params(effect, bpm))
+
+
+class TestAddEffectParams:
+    """add_effect: starting settings, params and wet."""
+
+    @pytest.fixture
+    def proj(self):
+        from lmms_mcp import server as srv
+        proj = LMMSProject()
+        proj.new(bpm=120)
+        srv.set_project(proj)
+        srv.add_instrument_track("Lead")
+        return proj
+
+    @staticmethod
+    def controls(proj, effect):
+        node = proj.root.find(
+            f".//instrumenttrack/fxchain/effect[@name='{effect}']")
+        assert node is not None
+        return node, node[0]
+
+    @staticmethod
+    def add(*args, **kwargs):
+        from lmms_mcp import server as srv
+        return json.loads(srv.add_effect("track", 0, *args, **kwargs))
+
+    def test_plain_delay_keeps_the_dry_sound_and_repeats(self, proj):
+        result = self.add("delay")
+        assert result["wet"] == 0.4
+        assert result["params"] == {"time_s": 0.25, "feedback": 0.3}
+        assert "dry sound" in result["note"] and "wet" in result["note"]
+        effect, controls = self.controls(proj, "delay")
+        assert effect.get("wet") == "0.4"
+        assert controls.tag == "Delay"
+        assert controls.get("DelayTimeSamples") == "0.25"
+        assert controls.get("FeebackAmount") == "0.3"
+
+    def test_delay_time_is_an_eighth_note_of_the_project_tempo(self, proj):
+        from lmms_mcp import server as srv
+        for bpm, seconds in ((60, 0.5), (90, 0.3333), (120, 0.25),
+                             (140, 0.2143), (200, 0.15), (999, 0.03)):
+            srv.set_tempo(bpm)
+            srv.remove_effect("track", 0, "delay")
+            assert self.add("delay")["params"]["time_s"] == pytest.approx(
+                seconds, abs=1e-4), bpm
+        srv.set_tempo(10)  # 3 s, still inside the plugin's 5 s
+        srv.remove_effect("track", 0, "delay")
+        assert self.add("delay")["params"]["time_s"] == 3.0
+
+    def test_explicit_wet_wins_and_has_no_wet_note(self, proj):
+        result = self.add("delay", wet=1.0)
+        assert result["wet"] == 1.0
+        assert "wet defaulted" not in result.get("note", "")
+        assert self.controls(proj, "delay")[0].get("wet") == "1"
+
+    def test_wet_default_per_effect(self, proj):
+        from lmms_mcp import effect_params as ep
+        for effect in ep.EFFECT_START:
+            result = self.add(effect)
+            assert "error" not in result, result
+            assert result["wet"] == ep.EFFECT_START[effect].wet, effect
+            assert ("wet defaulted" in result.get("note", "")) == (
+                ep.EFFECT_START[effect].wet != 1.0), effect
+
+    def test_bad_wet_is_refused(self, proj):
+        for wet in (1.5, -0.1):
+            result = self.add("delay", wet=wet)
+            assert "'wet'" in result["error"] and "0 to 1" in result["error"]
+        assert "must be a number" in self.add("delay", wet="loud")["error"]
+        assert "Give wet once" in self.add(
+            "delay", wet=0.5, params={"wet": 0.2})["error"]
+        assert proj.root.find(".//instrumenttrack/fxchain/effect") is None
+
+    def test_wet_may_be_given_in_params(self, proj):
+        result = self.add("delay", params={"wet": 0.6, "time_s": 0.2})
+        assert result["wet"] == 0.6 and result["params"] == {
+            "time_s": 0.2, "feedback": 0.3}
+
+    def test_effects_with_echoes_or_tails_start_with_a_long_decay(self, proj):
+        """LMMS stops an effect after "decay" ms of silent output: at its
+        default of 1 ms a delay loses its echo after a gap (rendered with
+        LMMS 1.2.2 without disableautoquit: echo at 1 s gone at decay 1 and
+        100, present at 1000 and 8000)."""
+        from lmms_mcp import effect_params as ep
+        from lmms_mcp import server as srv
+        long_decay = {e for e, s in ep.EFFECT_START.items() if s.decay_ms > 1}
+        assert long_decay == {"delay", "reverbsc", "multitapecho", "flanger"}
+        for effect in ep.EFFECT_START:
+            result = self.add(effect)
+            expected = 8000 if effect in long_decay else 1
+            assert result["decay_ms"] == expected, effect
+            assert self.controls(proj, effect)[0].get("autoquit") == str(
+                expected), effect
+            assert ("decay_ms defaulted" in result.get("note", "")) == (
+                effect in long_decay), effect
+        srv.remove_effect("track", 0, "delay")
+        result = self.add("delay", params={"decay_ms": 500})
+        assert result["decay_ms"] == 500
+        assert "decay_ms defaulted" not in result.get("note", "")
+        srv.remove_effect("track", 0, "reverbsc")
+        assert "range" in self.add(
+            "reverbsc", params={"decay_ms": 9000})["error"]
+
+    def test_params_override_the_start_and_keep_the_rest(self, proj):
+        result = self.add("delay", params={"time_s": 0.375})
+        assert result["params"] == {"time_s": 0.375, "feedback": 0.3}
+        assert "note" in result  # wet explanation still applies
+        _, controls = self.controls(proj, "delay")
+        assert controls.get("DelayTimeSamples") == "0.375"
+
+    def test_xml_attribute_names_are_accepted_too(self, proj):
+        result = self.add("delay", params={"FeebackAmount": 0.6,
+                                          "delaytimesamples": 0.2})
+        assert result["params"] == {"time_s": 0.2, "feedback": 0.6}
+
+    def test_unknown_name_adds_nothing_and_lists_valid_ones(self, proj):
+        result = self.add("delay", params={"echo": 1})
+        assert "no parameter 'echo'" in result["error"]
+        assert result["valid_parameters"] == [
+            "time_s", "feedback", "lfo_period_s", "lfo_amount_s",
+            "out_gain_db"]
+        assert "time_s" in result["error"]
+        assert proj.root.find(".//instrumenttrack/fxchain/effect") is None
+
+    def test_out_of_range_is_refused_with_the_range(self, proj):
+        result = self.add("delay", params={"time_s": 9})
+        assert "out of range" in result["error"]
+        assert "0.01 to 5 s" in result["error"]
+        result = self.add("reverbsc", params={"size": -0.1})
+        assert "0 to 1" in result["error"]
+        assert proj.root.find(".//instrumenttrack/fxchain/effect") is None
+
+    def test_value_types(self, proj):
+        assert "must be a number" in self.add(
+            "delay", params={"feedback": "high"})["error"]
+        assert "must be a number" in self.add(
+            "delay", params={"feedback": True})["error"]
+        assert "whole number" in self.add(
+            "bitcrush", params={"bit_levels": 3.5})["error"]
+        assert "true or false" in self.add(
+            "bitcrush", params={"rate_on": 2})["error"]
+        assert "must be one of" in self.add(
+            "dualfilter", params={"filter1_type": "wobble"})["error"]
+        assert "finite" in self.add(
+            "delay", params={"feedback": float("nan")})["error"]
+        assert proj.root.find(".//instrumenttrack/fxchain/effect") is None
+
+    def test_the_same_parameter_twice_is_refused(self, proj):
+        result = self.add("delay", params={"time_s": 0.2,
+                                          "DelayTimeSamples": 0.3})
+        assert "twice" in result["error"]
+
+    def test_values_are_written_as_lmms_reads_them(self, proj):
+        self.add("bitcrush", params={
+            "bit_levels": 8, "rate_on": False, "output_gain_db": -3.5})
+        _, c = self.controls(proj, "bitcrush")
+        assert c.tag == "bitcrushcontrols"
+        assert (c.get("levels"), c.get("rateon"), c.get("outgain")) == (
+            "8", "0", "-3.5")
+        assert c.get("rate") == "8000"  # the start, not overridden
+
+    def test_choices_by_name_and_index(self, proj):
+        self.add("dualfilter", params={"filter1_type": "HighPass",
+                                      "filter2_type": 6})
+        _, c = self.controls(proj, "dualfilter")
+        assert (c.get("filter1"), c.get("filter2")) == ("1", "6")
+
+    def test_eq_slope_writes_the_flags_lmms_reads(self, proj):
+        self.add("eq", params={"lp_slope_db": 24, "hp_slope_db": 48})
+        _, c = self.controls(proj, "eq")
+        assert (c.get("LP"), c.get("LP12"), c.get("LP24"), c.get("LP48")) == (
+            "1", "0", "1", "0")
+        assert (c.get("HP"), c.get("HP12"), c.get("HP24"), c.get("HP48")) == (
+            "2", "0", "0", "1")
+
+    def test_neutral_effects_say_so_unless_params_are_given(self, proj):
+        for effect in ("amplifier", "crossovereq", "eq", "stereomatrix"):
+            result = self.add(effect)
+            assert "Neutral" in result["note"], effect
+            assert "set_effect_params" in result["note"], effect
+        from lmms_mcp import server as srv
+        srv.remove_effect("track", 0, "amplifier")
+        result = self.add("amplifier", params={"volume": 150})
+        assert "note" not in result
+        assert result["params"] == {"volume": 150.0}
+
+    def test_effects_without_a_table_take_no_params(self, proj):
+        result = self.add("compressor")
+        assert result["wet"] == 1.0 and result["params"] == {}
+        result = self.add("dispersion", params={"amount": 1})
+        assert "no settable parameters" in result["error"]
+
+    def test_mixer_channel_target(self, proj):
+        from lmms_mcp import server as srv
+        srv.add_mixer_channel("Bus")
+        result = json.loads(srv.add_effect(
+            "mixer", 1, "reverbsc", params={"size": 0.5}))
+        assert result["params"] == {"size": 0.5} and result["wet"] == 0.3
+
+    def test_graph_effects_always_get_their_curves(self, proj):
+        """LMMS plays uninitialised memory when a curve is missing."""
+        self.add("waveshaper", params={"shape": "linear", "input_gain": 1,
+                                       "output_gain": 1})
+        self.add("dynamicsprocessor", params={"threshold_db": 0, "ratio": 1})
+        self.add("multitapecho")
+        _, ws = self.controls(proj, "waveshaper")
+        assert len(_floats(ws.get("waveShape"))) == 200
+        _, dp = self.controls(proj, "dynamicsprocessor")
+        assert _floats(dp.get("waveShape")) == pytest.approx(
+            [(i + 1) / 200 for i in range(200)])
+        _, mt = self.controls(proj, "multitapecho")
+        assert len(_floats(mt.get("ampsteps"))) == 8
+        assert len(_floats(mt.get("lpsteps"))) == 8
+        assert mt.get("steps") == "8"
+
+    def test_waveshaper_shapes(self, proj):
+        from lmms_mcp import effect_params as ep
+        for name in ep.WAVESHAPES:
+            curve = ep.waveshape_curve(name)
+            assert len(curve) == 200 and all(0 <= v <= 1 for v in curve), name
+        assert ep.waveshape_curve("linear")[99] == pytest.approx(0.5)
+        assert ep.waveshape_curve("soft_clip")[-1] == pytest.approx(1.0)
+        result = self.add("waveshaper", params={"shape": "fuzz"})
+        assert result["params"]["shape"] == "fuzz"
+        _, c = self.controls(proj, "waveshaper")
+        assert _floats(c.get("waveShape")) == pytest.approx(
+            ep.waveshape_curve("fuzz"), abs=1e-6)
+
+    def test_waveshaper_custom_curve_and_bad_curves(self, proj):
+        custom = [min(1.0, i / 100) for i in range(200)]
+        result = self.add("waveshaper", params={"shape": custom})
+        assert result["params"]["shape"] == "custom"
+        from lmms_mcp import server as srv
+        srv.remove_effect("track", 0, "waveshaper")
+        for bad in ("wobble", [0.5] * 10, [2.0] * 200, 3):
+            assert "error" in self.add("waveshaper", params={"shape": bad})
+
+    def test_dynamics_curve_is_a_compressor_curve(self, proj):
+        import math
+        result = self.add("dynamicsprocessor",
+                          params={"threshold_db": -12, "ratio": 4})
+        assert result["params"]["threshold_db"] == -12
+        _, c = self.controls(proj, "dynamicsprocessor")
+        curve = _floats(c.get("waveShape"))
+        t = 10 ** (-12 / 20)
+        for i, y in enumerate(curve):
+            x = (i + 1) / 200
+            if x <= t:
+                assert y == pytest.approx(x, abs=1e-6)
+        # the full-scale level comes out 9 dB down: -12 + 12/4
+        assert 20 * math.log10(curve[-1]) == pytest.approx(-9.0, abs=0.05)
+
+    def test_multitapecho_taps(self, proj):
+        from lmms_mcp import effect_params as ep
+        result = self.add("multitapecho", params={
+            "steps": 4, "tap_levels_db": [-6, -12, -18, -24],
+            "tap_cutoff_hz": 2000})
+        assert result["params"]["tap_levels_db"] == [-6, -12, -18, -24]
+        assert result["params"]["tap_cutoff_hz"] == [2000.0] * 4
+        _, c = self.controls(proj, "multitapecho")
+        assert _floats(c.get("ampsteps")) == [-6, -12, -18, -24]
+        assert _floats(c.get("lpsteps")) == pytest.approx(
+            [math_log(2000 / 20)] * 4, abs=1e-5)
+        assert c.get("steps") == "4"
+        assert ep.decay_levels(3) == [-9.0, -13.0, -17.0]
+
+    def test_multitapecho_step_length_is_a_sixteenth_note(self, proj):
+        from lmms_mcp import server as srv
+        srv.set_tempo(120)
+        assert self.add("multitapecho")["params"]["step_length_ms"] == 125.0
+        srv.remove_effect("track", 0, "multitapecho")
+        srv.set_tempo(20)  # 750 ms would exceed the plugin's 500 ms
+        assert self.add("multitapecho")["params"]["step_length_ms"] == 500.0
+
+    def test_multitapecho_wrong_number_of_taps(self, proj):
+        result = self.add("multitapecho", params={
+            "steps": 4, "tap_levels_db": [-6, -12]})
+        assert "needs 4 values" in result["error"]
+
+    def test_crossovers_must_ascend(self, proj):
+        result = self.add("crossovereq", params={"xover_1_2_hz": 3000})
+        assert "must ascend" in result["error"]
+        result = self.add("crossovereq", params={
+            "xover_1_2_hz": 300, "xover_2_3_hz": 900, "xover_3_4_hz": 3000})
+        assert "error" not in result
+
+
+def math_log(x):
+    import math
+    return math.log10(x)
+
+
+class TestSetEffectParams:
+    """set_effect_params and get_effect_chain."""
+
+    @pytest.fixture
+    def proj(self):
+        from lmms_mcp import server as srv
+        proj = LMMSProject()
+        proj.new(bpm=120)
+        srv.set_project(proj)
+        srv.add_instrument_track("Lead")
+        srv.add_mixer_channel("Bus")
+        return proj
+
+    @staticmethod
+    def call(fn, *args):
+        return json.loads(fn(*args))
+
+    def test_sets_on_a_track_and_keeps_the_other_params(self, proj):
+        from lmms_mcp import server as srv
+        srv.add_effect("track", 0, "delay")
+        result = self.call(srv.set_effect_params, "track", 0, "delay",
+                           {"time_s": 0.5, "feedback": 0.6})
+        assert result["params"] == {"time_s": 0.5, "feedback": 0.6}
+        assert result["effect"] == "delay" and result["position"] == 0
+        controls = proj.root.find(".//instrumenttrack/fxchain/effect/Delay")
+        assert controls.get("DelayTimeSamples") == "0.5"
+        assert controls.get("FeebackAmount") == "0.6"
+        self.call(srv.set_effect_params, "track", 0, "delay", {"feedback": 0.1})
+        assert controls.get("DelayTimeSamples") == "0.5"
+        assert controls.get("FeebackAmount") == "0.1"
+
+    def test_sets_on_a_mixer_channel_by_position(self, proj):
+        from lmms_mcp import server as srv
+        srv.add_effect("mixer", 1, "eq")
+        srv.add_effect("mixer", 1, "reverbsc")
+        result = self.call(srv.set_effect_params, "mixer", 1, 1,
+                           {"size": 0.7, "color_hz": 4000})
+        assert result["effect"] == "reverbsc" and result["position"] == 1
+        node = [c for c in xml_parser_channels(proj)
+                if c.get("num") == "1"][0]
+        controls = node.find("fxchain/effect[@name='reverbsc']/ReverbSCControls")
+        assert (controls.get("size"), controls.get("color")) == ("0.7", "4000")
+
+    def test_wet_can_be_changed_and_is_validated(self, proj):
+        from lmms_mcp import server as srv
+        srv.add_effect("track", 0, "delay")
+        result = self.call(srv.set_effect_params, "track", 0, "delay",
+                           {"wet": 0.25, "feedback": 0.2})
+        assert result["params"] == {"wet": 0.25, "feedback": 0.2}
+        effect = proj.root.find(".//instrumenttrack/fxchain/effect")
+        assert effect.get("wet") == "0.25"
+        bad = self.call(srv.set_effect_params, "track", 0, "delay", {"wet": 2})
+        assert "'wet'" in bad["error"] and "0 to 1" in bad["error"]
+        assert effect.get("wet") == "0.25"
+
+    def test_decay_can_be_changed_and_is_listed(self, proj):
+        from lmms_mcp import server as srv
+        srv.add_effect("track", 0, "delay")
+        srv.add_effect("track", 0, "eq")
+        result = self.call(srv.set_effect_params, "track", 0, "eq",
+                           {"decay_ms": 2000, "hp_on": True})
+        assert result["params"] == {"decay_ms": 2000, "hp_on": True}
+        effect = proj.root.find(".//instrumenttrack/fxchain/effect[@name='eq']")
+        assert effect.get("autoquit") == "2000"
+        chain = self.call(srv.get_effect_chain, "track", 0)["effects"]
+        assert [e["decay_ms"] for e in chain] == [8000, 2000]
+        # either spelling
+        self.call(srv.set_effect_params, "track", 0, "eq", {"autoquit": 5})
+        assert effect.get("autoquit") == "5"
+        assert "range" in self.call(srv.set_effect_params, "track", 0, "eq",
+                                    {"decay_ms": 0})["error"]
+
+    def test_a_refused_call_changes_nothing(self, proj):
+        from lmms_mcp import server as srv
+        srv.add_effect("track", 0, "delay")
+        controls = proj.root.find(".//instrumenttrack/fxchain/effect/Delay")
+        before = dict(controls.attrib)
+        for params in ({"time_s": 0.9, "feedback": 7},
+                       {"time_s": 0.9, "nonsense": 1}):
+            result = self.call(srv.set_effect_params, "track", 0, "delay",
+                               params)
+            assert "error" in result
+            assert dict(controls.attrib) == before
+        result = self.call(srv.set_effect_params, "track", 0, "delay",
+                           {"nonsense": 1})
+        assert result["valid_parameters"][0] == "time_s"
+        assert "0 to 1" in self.call(
+            srv.set_effect_params, "track", 0, "delay",
+            {"feedback": 7})["error"]
+
+    def test_errors(self, proj):
+        from lmms_mcp import server as srv
+        assert "not found" in self.call(
+            srv.set_effect_params, "track", 0, "delay", {"time_s": 1})["error"]
+        srv.add_effect("track", 0, "delay")
+        assert "not found" in self.call(
+            srv.set_effect_params, "track", 0, "eq", {"hp_on": True})["error"]
+        assert "not found" in self.call(
+            srv.set_effect_params, "track", 0, 4, {"hp_on": True})["error"]
+        assert "at least one" in self.call(
+            srv.set_effect_params, "track", 0, "delay", {})["error"]
+        assert "error" in self.call(
+            srv.set_effect_params, "track", 7, "delay", {"time_s": 1})
+        assert "error" in self.call(
+            srv.set_effect_params, "bus", 0, "delay", {"time_s": 1})
+
+    def test_multitapecho_steps_resize_the_curves(self, proj):
+        from lmms_mcp import server as srv
+        srv.add_effect("track", 0, "multitapecho")
+        result = self.call(srv.set_effect_params, "track", 0, "multitapecho",
+                           {"steps": 12})
+        assert result["params"]["steps"] == 12
+        c = proj.root.find(".//instrumenttrack/fxchain/effect/multitapechocontrols")
+        assert len(_floats(c.get("ampsteps"))) == 12
+        assert len(_floats(c.get("lpsteps"))) == 12
+        self.call(srv.set_effect_params, "track", 0, "multitapecho",
+                  {"steps": 5})
+        assert len(_floats(c.get("ampsteps"))) == 5
+        result = self.call(srv.set_effect_params, "track", 0, "multitapecho",
+                           {"tap_levels_db": -20})
+        assert _floats(c.get("ampsteps")) == [-20.0] * 5
+
+    def test_dynamics_hints_when_nothing_would_be_reduced(self, proj):
+        from lmms_mcp import server as srv
+        srv.add_effect("track", 0, "dynamicsprocessor",
+                       params={"threshold_db": -6, "ratio": 1})
+        result = self.call(srv.set_effect_params, "track", 0,
+                           "dynamicsprocessor", {"threshold_db": -20})
+        assert "ratio is 1" in result["note"]
+        # a curve with ratio 1 holds no threshold, so it reads back as 0 dB
+        result = self.call(srv.set_effect_params, "track", 0,
+                           "dynamicsprocessor", {"ratio": 3})
+        assert "threshold_db is 0" in result["note"]
+        result = self.call(srv.set_effect_params, "track", 0,
+                           "dynamicsprocessor",
+                           {"ratio": 3, "threshold_db": -20})
+        assert "note" not in result
+
+    def test_dynamics_threshold_and_ratio_are_set_separately(self, proj):
+        from lmms_mcp import server as srv
+        srv.add_effect("track", 0, "dynamicsprocessor")
+        self.call(srv.set_effect_params, "track", 0, "dynamicsprocessor",
+                  {"ratio": 8})
+        chain = self.call(srv.get_effect_chain, "track", 0)
+        assert chain["effects"][0]["params"] == {
+            "threshold_db": -12.0, "ratio": 8.0}
+
+    def test_dualfilter_and_eq_names(self, proj):
+        from lmms_mcp import server as srv
+        srv.add_effect("track", 0, "dualfilter")
+        result = self.call(srv.set_effect_params, "track", 0, "dualfilter",
+                           {"filter1_type": "notch", "mix": -1})
+        assert result["params"] == {"filter1_type": "notch", "mix": -1.0}
+        srv.add_effect("track", 0, "eq")
+        result = self.call(srv.set_effect_params, "track", 0, "eq", {
+            "peak2_on": True, "peak2_gain_db": -6, "peak2_freq_hz": 300,
+            "peak2_bw": 1.5, "hp_on": True, "hp_freq_hz": 40})
+        c = proj.root.find(".//instrumenttrack/fxchain/effect/Eq")
+        assert (c.get("Peak2active"), c.get("Peak2gain"),
+                c.get("Peak2freq"), c.get("Peak2bw")) == (
+                    "1", "-6", "300", "1.5")
+
+    def test_get_effect_chain_lists_only_changed_params(self, proj):
+        from lmms_mcp import server as srv
+        srv.add_effect("track", 0, "delay")
+        srv.add_effect("track", 0, "eq")
+        srv.add_effect("track", 0, "waveshaper")
+        srv.add_effect("track", 0, "compressor")
+        srv.set_effect_params("track", 0, "eq", {"lp_on": True,
+                                                  "lp_slope_db": 24})
+        srv.set_effect_params("track", 0, "waveshaper", {"output_gain": 1})
+        chain = self.call(srv.get_effect_chain, "track", 0)["effects"]
+        by = {e["name"]: e for e in chain}
+        assert by["delay"]["params"] == {"time_s": 0.25, "feedback": 0.3}
+        assert by["delay"]["wet"] == 0.4
+        assert by["eq"]["params"] == {"lp_on": True, "lp_slope_db": 24}
+        assert by["waveshaper"]["params"] == {
+            "input_gain": 1.5, "shape": "soft_clip"}
+        assert "params" not in by["compressor"]
+        # a switched-off value goes back to being unlisted
+        srv.set_effect_params("track", 0, "delay", {"feedback": 0})
+        chain = self.call(srv.get_effect_chain, "track", 0)["effects"]
+        assert chain[0]["params"] == {"time_s": 0.25}
+
+    def test_chain_of_a_mixer_channel_shows_params(self, proj):
+        from lmms_mcp import server as srv
+        srv.add_effect("mixer", 1, "bitcrush")
+        chain = self.call(srv.get_effect_chain, "mixer", 1)["effects"]
+        assert chain[0]["params"] == {"sample_rate_hz": 8000, "bit_levels": 16}
+
+    def test_custom_curves_are_reported_as_custom(self, proj):
+        from lmms_mcp import effect_params as ep
+        from lmms_mcp import server as srv
+        srv.add_effect("track", 0, "waveshaper")
+        srv.add_effect("track", 0, "dynamicsprocessor")
+        srv.set_effect_params("track", 0, "waveshaper",
+                              {"shape": [0.5] * 200})
+        c = proj.root.find(".//instrumenttrack/fxchain/effect/dynamicsprocessor_controls")
+        c.set("waveShape", ep.pack_floats([0.5] * 200))
+        chain = {e["name"]: e["params"] for e in self.call(
+            srv.get_effect_chain, "track", 0)["effects"]}
+        assert chain["waveshaper"]["shape"] == "custom"
+        assert chain["dynamicsprocessor"]["curve"] == "custom"
+
+    def test_legacy_project_with_empty_controls(self, proj):
+        """Effects written by earlier versions have no curve (LMMS plays
+        garbage); changing any parameter repairs that."""
+        from lmms_mcp import server as srv
+        srv.add_effect("track", 0, "waveshaper")
+        c = proj.root.find(".//instrumenttrack/fxchain/effect/waveshapercontrols")
+        c.attrib.clear()
+        chain = self.call(srv.get_effect_chain, "track", 0)["effects"]
+        assert chain[0]["params"] == {}
+        self.call(srv.set_effect_params, "track", 0, "waveshaper",
+                  {"input_gain": 2})
+        assert len(_floats(c.get("waveShape"))) == 200
+
+    def test_loaded_project_with_log_scale_children(self, proj):
+        """LMMS saves some knobs (eq frequencies...) as child elements."""
+        from lmms_mcp import server as srv
+        srv.add_effect("track", 0, "eq")
+        c = proj.root.find(".//instrumenttrack/fxchain/effect/Eq")
+        child = ET.SubElement(c, "Peak1freq", {
+            "id": "1234", "value": "800", "scale_type": "log"})
+        ET.SubElement(c, "Peak1gain", {"id": "1235", "value": "4.5",
+                                      "scale_type": "log"})
+        chain = self.call(srv.get_effect_chain, "track", 0)["effects"]
+        assert chain[0]["params"] == {"peak1_freq_hz": 800.0,
+                                      "peak1_gain_db": 4.5}
+        self.call(srv.set_effect_params, "track", 0, "eq",
+                  {"peak1_freq_hz": 900})
+        assert child.get("value") == "900" and child.get("id") == "1234"
+        assert c.get("Peak1freq") == "900"
+
+    def test_effects_without_a_table(self, proj):
+        from lmms_mcp import server as srv
+        srv.add_effect("track", 0, "compressor")
+        result = self.call(srv.set_effect_params, "track", 0, "compressor",
+                           {"threshold": -10})
+        assert "no settable parameters" in result["error"]
+        # an effect from a loaded project that this server knows nothing of
+        fx = proj.root.find(".//instrumenttrack/fxchain")
+        ET.SubElement(fx, "effect", {"name": "ladspaeffect", "on": "1",
+                                     "wet": "1"}).append(ET.Element("ladspacontrols"))
+        entry = self.call(srv.get_effect_chain, "track", 0)["effects"][-1]
+        assert entry["name"] == "ladspaeffect" and "params" not in entry
+        assert "error" in self.call(srv.set_effect_params, "track", 0,
+                                    "ladspaeffect", {"x": 1})
+
+
+def xml_parser_channels(proj):
+    from lmms_mcp import xml_parser
+    return xml_parser.find_mixer_channels(proj.root)
+
+
+class TestEffectDocs:
+    """Tool descriptions and the effects resource name the parameters."""
+
+    def test_add_effect_lists_the_starting_settings(self):
+        from lmms_mcp import server as srv
+        doc = srv.add_effect.__doc__
+        assert "Starting settings:" in doc
+        assert "delay: wet 0.4, feedback 0.3" in doc
+        assert "1/8 note" in doc and "reverbsc: wet 0.3" in doc
+        assert "set_effect_params" in doc and "params:" in doc
+
+    def test_set_effect_params_lists_every_effects_parameters(self):
+        from lmms_mcp import effect_params as ep
+        from lmms_mcp import server as srv
+        doc = srv.set_effect_params.__doc__
+        assert "$" not in doc
+        for effect, params in ep.EFFECT_PARAMS.items():
+            assert f"- {effect}:" in doc, effect
+            for p in params:
+                if effect != "eq":  # eq is described by band
+                    assert p.name in doc, (effect, p.name)
+        assert "time_s (0.01..5 s, 0.5)" in doc
+        assert "rc_lowpass_24" in doc  # the dualfilter types
+        assert "lfo_period_s is the period" in doc
+        for token in ("<band>_on", "peak1, peak2", "hp_slope_db", "lowshelf",
+                      "highshelf"):
+            assert token in doc
+
+    def test_docs_only_name_the_effects_this_lmms_has(self, server_for):
+        from lmms_mcp.effects import KNOWN_EFFECTS
+        installed = {"tripleoscillator", "delay", "reverbsc", "eq",
+                     "dynamicsprocessor"}
+        srv = server_for(installed)
+        for fn in (srv.add_effect, srv.set_effect_params):
+            doc = fn.__doc__
+            assert "- reverbsc:" in doc and "- eq:" in doc
+            for name in set(KNOWN_EFFECTS) - installed:
+                assert f"- {name}:" not in doc, (fn.__name__, name)
+                assert f"{name}," not in doc, (fn.__name__, name)
+        assert "bitcrush" not in srv.resource_effects()
+
+    def test_effects_without_a_table_are_listed_as_such(self, server_for):
+        srv = server_for({"tripleoscillator", "delay", "compressor"}, "1.3.0")
+        assert "compressor: no parameters can be set yet" in \
+            srv.set_effect_params.__doc__
+
+    def test_resource_has_parameters_defaults_and_attributes(self):
+        from lmms_mcp import server as srv
+        data = json.loads(srv.resource_effects())
+        by = {e["name"]: e for e in data["effects"]}
+        delay = by["delay"]
+        assert delay["wet_default"] == 0.4
+        assert delay["decay_ms_default"] == 8000
+        assert {p["name"] for p in data["settings_of_every_effect"]} == {
+            "wet", "decay_ms"}
+        assert delay["outputs_dry_signal"] is False
+        assert "feedback 0.3" in delay["starting_settings"]
+        params = {p["name"]: p for p in delay["parameters"]}
+        assert params["feedback"]["xml_attribute"] == "FeebackAmount"
+        assert (params["time_s"]["min"], params["time_s"]["max"],
+                params["time_s"]["default"], params["time_s"]["unit"]) == (
+                    0.01, 5, 0.5, "s")
+        assert by["bassbooster"]["outputs_dry_signal"] is True
+        assert "Neutral" in by["eq"]["note"]
+        assert "soft_clip" in by["waveshaper"]["shapes"]
+        assert by["compressor"]["parameters"].startswith("none")
+
+    def test_instructions_point_to_set_effect_params(self):
+        from lmms_mcp import server as srv
+        assert "set_effect_params" in srv.mcp.instructions
+
+    def test_tool_is_registered(self):
+        import asyncio
+        from lmms_mcp import server as srv
+        tools = {t.name: t for t in asyncio.run(srv.mcp.list_tools())}
+        assert "set_effect_params" in tools
+        assert "time_s" in tools["set_effect_params"].description
+
+
 class TestZynAddSubFX:
     """Tests for ZynAddSubFX preset and parameter support."""
 
@@ -2755,7 +3472,8 @@ class TestPluginAvailability:
 
     def test_tool_docstrings_list_only_available(self, lmms122):
         srv, _ = lmms122
-        for fn in (srv.add_instrument_track, srv.add_effect):
+        for fn in (srv.add_instrument_track, srv.add_effect,
+                   srv.set_effect_params):
             doc = srv.render_plugin_doc(
                 fn.__plugin_doc_template__, srv._availability)
             assert "$" not in doc
