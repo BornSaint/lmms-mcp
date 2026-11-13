@@ -22,6 +22,7 @@ from .xml_parser import (
     element_to_dict,
     find_mixer_channels,
     find_tracks,
+    get_track_mixer_channel,
     get_track_name,
     get_track_type,
     load_project,
@@ -67,14 +68,21 @@ class LMMSProject:
         time_sig_denominator: int = 4,
         master_volume: int = 100,
         master_pitch: int = 0,
+        lmms_version: str | None = None,
     ) -> None:
-        """Create a new empty project."""
+        """Create a new empty project.
+
+        lmms_version is the installed LMMS (e.g. "1.2.2"): the project is
+        written with the mixer names that version reads (see
+        xml_parser.MixerNames). A project that is loaded keeps its own.
+        """
         self._root = create_empty_project(
             bpm=bpm,
             time_sig_numerator=time_sig_numerator,
             time_sig_denominator=time_sig_denominator,
             master_volume=master_volume,
             master_pitch=master_pitch,
+            lmms_version=lmms_version,
         )
         self._path = ""
         self._modified = True
@@ -158,7 +166,7 @@ class LMMSProject:
 
         track.volume = int(inst_elem.get("vol", "100"))
         track.panning = int(inst_elem.get("pan", "0"))
-        track.mixer_channel = int(inst_elem.get("mixch", "0"))
+        track.mixer_channel = get_track_mixer_channel(inst_elem)
         track.base_note = pitch.get_base_note(inst_elem)
         track.pitch_cents = pitch.json_cents(pitch.get_pitch_cents(inst_elem))
 
@@ -220,6 +228,7 @@ class LMMSProject:
         if sample_elem is not None:
             track.volume = int(sample_elem.get("vol", "100"))
             track.panning = int(sample_elem.get("pan", "0"))
+            track.mixer_channel = get_track_mixer_channel(sample_elem)
 
     def _parse_mixer_channels(self) -> list[MixerChannel]:
         """Parse all mixer channels."""
@@ -436,12 +445,16 @@ class LMMSProject:
 _current_project: LMMSProject | None = None
 
 
-def get_project() -> LMMSProject:
-    """Get the current project singleton."""
+def get_project(lmms_version: str | None = None) -> LMMSProject:
+    """Get the current project singleton.
+
+    If there is none yet, an empty one is created for lmms_version (see
+    LMMSProject.new).
+    """
     global _current_project
     if _current_project is None:
         _current_project = LMMSProject()
-        _current_project.new()
+        _current_project.new(lmms_version=lmms_version)
     return _current_project
 
 

@@ -1,13 +1,95 @@
 """XML parser for LMMS .mmpz and .mmp project files."""
 
+import re
 import struct
 import zlib
 from collections.abc import Collection
+from dataclasses import dataclass
 from pathlib import Path
 from xml.etree import ElementTree as ET
 
 from . import lmms_app, pitch
 from .models import DEFAULT_KEY
+
+
+# ──────────────────────────────────────────────────────────────────
+# MIXER ELEMENT / ATTRIBUTE NAMES (differ between LMMS versions)
+# ──────────────────────────────────────────────────────────────────
+
+@dataclass(frozen=True)
+class MixerNames:
+    """The names a project file uses for the mixer.
+
+    LMMS 1.2.x calls it the FX mixer and reads <fxmixer>, <fxchannel> and
+    the track attribute fxch; LMMS 1.3 renamed these to <mixer>,
+    <mixerchannel> and mixch. LMMS ignores the names it does not know
+    (a track then plays on Master and a mixer is not loaded), so a project
+    must be written with the names of the LMMS that will open it. <send>
+    and the effect chain <fxchain> are named the same in both.
+
+    sample_track_attr: the attribute that routes a sample track to a
+        channel, or None where LMMS cannot (1.2.x sample tracks always
+        play on Master and ignore fxch).
+    """
+
+    mixer: str
+    channel: str
+    track_attr: str
+    sample_track_attr: str | None
+
+
+# LMMS 1.2.x (verified with 1.2.2: its binary and all its demo projects).
+FX_MIXER = MixerNames("fxmixer", "fxchannel", "fxch", None)
+# LMMS 1.3+.
+MIXER = MixerNames("mixer", "mixerchannel", "mixch", "mixch")
+ALL_MIXER_NAMES = (FX_MIXER, MIXER)
+
+# Used when no LMMS is installed to ask (and for a project that has no
+# mixer at all). LMMS 1.3+ upgrades a file that was created by LMMS 1.2
+# (creatorversion below) by renaming fxmixer/fxchannel/fxch, so a project
+# written with the 1.2 names loads in every LMMS version.
+DEFAULT_MIXER_NAMES = FX_MIXER
+
+
+def mixer_names_for_version(version: str | None) -> MixerNames:
+    """The mixer names the given LMMS version (e.g. '1.2.2') reads.
+
+    An unknown or unparsable version gives DEFAULT_MIXER_NAMES.
+    """
+    match = re.match(r"\s*(\d+)\.(\d+)", version or "")
+    if match is None:
+        return DEFAULT_MIXER_NAMES
+    return MIXER if (int(match[1]), int(match[2])) >= (1, 3) else FX_MIXER
+
+
+def mixer_names(root: ET.Element) -> MixerNames:
+    """The mixer names a loaded or created project uses.
+
+    Edits must keep them (a project never mixes the two spellings): taken
+    from the project's mixer element, else from its tracks, else
+    DEFAULT_MIXER_NAMES.
+    """
+    song = root.find("song")
+    if song is not None:
+        for names in ALL_MIXER_NAMES:
+            if song.find(names.mixer) is not None:
+                return names
+    for track in root.iter("instrumenttrack"):
+        for names in ALL_MIXER_NAMES:
+            if names.track_attr in track.attrib:
+                return names
+    return DEFAULT_MIXER_NAMES
+
+
+def get_track_mixer_channel(track_settings: ET.Element) -> int:
+    """The mixer channel an <instrumenttrack> or <sampletrack> plays on.
+
+    Reads either spelling (fxch or mixch); 0 (Master) when it has none.
+    """
+    for names in ALL_MIXER_NAMES:
+        if names.track_attr in track_settings.attrib:
+            return _to_int(track_settings.get(names.track_attr))
+    return 0
 
 
 def _q_compress(data: bytes) -> bytes:
@@ -98,8 +180,15 @@ def create_empty_project(
     time_sig_denominator: int = 4,
     master_volume: int = 100,
     master_pitch: int = 0,
+    lmms_version: str | None = None,
 ) -> ET.Element:
-    """Create a minimal empty LMMS project element tree."""
+    """Create a minimal empty LMMS project element tree.
+
+    The mixer is written with the names the given LMMS version reads (the
+    installed one, e.g. '1.2.2'; see MixerNames). Without a version the
+    names of LMMS 1.2, which every version loads, are used.
+    """
+    names = mixer_names_for_version(lmms_version)
     root = ET.Element("lmms-project", {
         "version": "1.0",
         "creator": "LMMS MCP Server",
@@ -128,7 +217,7 @@ def create_empty_project(
         "minimized": "0",
     })
 
-    mixer = ET.SubElement(song, "mixer", {
+    mixer = ET.SubElement(song, names.mixer, {
         "visible": "1",
         "width": "561",
         "height": "332",
@@ -137,7 +226,7 @@ def create_empty_project(
         "maximized": "0",
         "minimized": "0",
     })
-    ET.SubElement(mixer, "mixerchannel", {
+    ET.SubElement(mixer, names.channel, {
         "num": "0",
         "muted": "0",
         "volume": "1",
@@ -202,17 +291,26 @@ def find_tracks(root: ET.Element) -> list[ET.Element]:
     return container.findall("track")
 
 
-def find_mixer_channels(root: ET.Element) -> list[ET.Element]:
-    """Find all <mixerchannel> elements."""
+def find_mixer(root: ET.Element) -> ET.Element | None:
+    """The project's mixer element (<fxmixer> or <mixer>), or None."""
     song = root.find("song")
     if song is None:
-        return []
+        return None
+    for names in ALL_MIXER_NAMES:
+        mixer = song.find(names.mixer)
+        if mixer is not None:
+            return mixer
+    return None
 
-    mixer = song.find("mixer")
+
+def find_mixer_channels(root: ET.Element) -> list[ET.Element]:
+    """Find all channels of the mixer (<fxchannel> or <mixerchannel>)."""
+    mixer = find_mixer(root)
     if mixer is None:
         return []
 
-    return mixer.findall("mixerchannel")
+    tags = {names.channel for names in ALL_MIXER_NAMES}
+    return [child for child in mixer if child.tag in tags]
 
 
 def get_track_type(elem: ET.Element) -> int:
@@ -260,8 +358,12 @@ def _make_instrument_track(
     mixer_channel: int = 0,
     volume: int = 100,
     panning: int = 0,
+    names: MixerNames = DEFAULT_MIXER_NAMES,
 ) -> ET.Element:
-    """Append an instrument <track> element to a trackcontainer parent."""
+    """Append an instrument <track> element to a trackcontainer parent.
+
+    The mixer channel is written under the attribute name of `names`.
+    """
     track = ET.SubElement(parent, "track", {
         "muted": "0",
         "type": "0",
@@ -271,7 +373,7 @@ def _make_instrument_track(
 
     inst_track = ET.SubElement(track, "instrumenttrack", {
         "pan": str(panning),
-        "mixch": str(mixer_channel),
+        names.track_attr: str(mixer_channel),
         "usemasterpitch": "1",
         "pitchrange": "1",
         "pitch": "0",
@@ -342,7 +444,8 @@ def add_instrument_track(
     song = root.find("song")
     container = song.find("trackcontainer[@type='song']")
     return _make_instrument_track(
-        container, name, instrument, mixer_channel, volume, panning
+        container, name, instrument, mixer_channel, volume, panning,
+        names=mixer_names(root),
     )
 
 
@@ -353,7 +456,21 @@ def add_sample_track(
     volume: int = 100,
     panning: int = 0,
 ) -> ET.Element:
-    """Add a sample track to the project."""
+    """Add a sample track to the project.
+
+    Raises ValueError (nothing is added) for a mixer channel other than
+    Master when the project's LMMS cannot route sample tracks: LMMS 1.2.x
+    ignores a channel on a sample track, it always plays on Master.
+    """
+    names = mixer_names(root)
+    if mixer_channel and names.sample_track_attr is None:
+        raise ValueError(
+            f"Sample tracks cannot be routed to mixer channel "
+            f"{mixer_channel}: this project uses the LMMS 1.2 mixer format, "
+            f"in which sample tracks always play on Master (channel 0). "
+            f"Use mixer_channel=0, or an instrument track for sound that "
+            f"needs its own channel."
+        )
     song = root.find("song")
     container = song.find("trackcontainer[@type='song']")
 
@@ -364,10 +481,10 @@ def add_sample_track(
         "solo": "0",
     })
 
-    sample_track = ET.SubElement(track, "sampletrack", {
-        "pan": str(panning),
-        "vol": str(volume),
-    })
+    attributes = {"pan": str(panning), "vol": str(volume)}
+    if names.sample_track_attr is not None:
+        attributes[names.sample_track_attr] = str(mixer_channel)
+    sample_track = ET.SubElement(track, "sampletrack", attributes)
     ET.SubElement(sample_track, "fxchain", {
         "numofeffects": "0", "enabled": "0",
     })
@@ -414,7 +531,8 @@ def add_pattern_track(root: ET.Element, name: str = "Pattern 0") -> ET.Element:
         "height": "400", "visible": "0", "type": "bbtrackcontainer",
         "minimized": "0",
     })
-    _make_instrument_track(bb_container, name, instrument="kicker")
+    _make_instrument_track(
+        bb_container, name, instrument="kicker", names=mixer_names(root))
 
     return track
 
@@ -548,15 +666,16 @@ def add_mixer_channel(
     volume: float = 1.0,
 ) -> ET.Element:
     """Add a new mixer channel to the project."""
-    song = root.find("song")
-    mixer = song.find("mixer")
+    mixer = find_mixer(root)
     if mixer is None:
         raise ValueError("No mixer element found")
 
-    existing = mixer.findall("mixerchannel")
+    # A new channel is named like the others (never mixes spellings).
+    names = mixer_names(root)
+    existing = find_mixer_channels(root)
     num = max(int(ch.get("num", "0")) for ch in existing) + 1
 
-    channel = ET.SubElement(mixer, "mixerchannel", {
+    channel = ET.SubElement(mixer, names.channel, {
         "num": str(num),
         "muted": "0",
         "volume": str(volume),
@@ -1207,9 +1326,7 @@ def resolve_automation_target(
         )
 
     if target_type == "mixer":
-        song = root.find("song")
-        mixer = song.find("mixer")
-        channels = mixer.findall("mixerchannel")
+        channels = find_mixer_channels(root)
         if not 0 <= target_index < len(channels):
             raise ValueError(
                 f"Mixer channel {target_index} out of range "

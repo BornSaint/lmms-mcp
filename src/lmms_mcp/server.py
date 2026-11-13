@@ -41,7 +41,8 @@ from .models import (
 # The tools below are named note_name_to_key / key_to_note_name too.
 from .models import key_to_note_name as _key_to_note_name
 from .models import note_name_to_key as _note_name_to_key
-from .project import LMMSProject, get_project, set_project
+from .project import LMMSProject, set_project
+from .project import get_project as _get_project
 
 DEFAULT_PROJECTS_DIR = os.environ.get(
     "LMMS_PROJECTS_DIR",
@@ -126,6 +127,12 @@ TOOL_REQUIRES = {
 _availability = lmms_app.detect_availability(
     KNOWN_INSTRUMENTS, effects_mod.KNOWN_EFFECTS
 )
+
+
+def get_project() -> LMMSProject:
+    """The current project. A first, empty one is written for the installed
+    LMMS (its mixer names, see xml_parser.MixerNames)."""
+    return _get_project(_availability.version)
 
 
 def _ordered(known, names) -> list[str]:
@@ -596,6 +603,7 @@ def create_project(
         time_sig_denominator=time_sig_denominator,
         master_volume=master_volume,
         master_pitch=master_pitch,
+        lmms_version=_availability.version,
     )
     set_project(proj)
     return json.dumps({
@@ -1166,17 +1174,22 @@ def add_sample_track(
 
     Args:
         name: Track name
-        mixer_channel: Mixer channel number (0=Master)
+        mixer_channel: Mixer channel number (0=Master). LMMS 1.2.x cannot
+            route sample tracks (they always play on Master), so a channel
+            other than 0 is refused there; LMMS 1.3+ routes them.
         volume: Track volume (0-200)
         panning: Track panning (-100 to +100)
     """
     proj = get_project()
-    result = proj.add_track(
-        "sample", name,
-        mixer_channel=mixer_channel,
-        volume=volume,
-        panning=panning,
-    )
+    try:
+        result = proj.add_track(
+            "sample", name,
+            mixer_channel=mixer_channel,
+            volume=volume,
+            panning=panning,
+        )
+    except ValueError as exc:
+        return json.dumps({"error": str(exc)})
     return json.dumps(result)
 
 
@@ -1744,9 +1757,7 @@ def _resolve_fxchain_target(target_type: str, target_index: int) -> ET.Element:
             )
         return inst_track
     if target_type == "mixer":
-        song = root.find("song")
-        mixer = song.find("mixer")
-        channels = mixer.findall("mixerchannel")
+        channels = xml_parser.find_mixer_channels(root)
         if not 0 <= target_index < len(channels):
             raise ValueError(
                 f"Mixer channel {target_index} out of range "

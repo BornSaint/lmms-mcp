@@ -222,6 +222,18 @@ once at startup and adapts to it:
   is offered and allowed. The server instructions say so, and plugins that
   need LMMS 1.3+ carry a warning when added. Set `LMMS_EXECUTABLE` to enable
   the checks.
+- **Mixer names in the project file**: LMMS 1.2.x reads `<fxmixer>`,
+  `<fxchannel>` and the track attribute `fxch`; LMMS 1.3+ reads `<mixer>`,
+  `<mixerchannel>` and `mixch`. LMMS silently ignores the names it does not
+  know (the track then plays on Master, and the volume and effects of the
+  mixer channel do nothing), so a new project is written with the names of
+  the installed LMMS. Without a detected LMMS the 1.2 names are used: LMMS
+  1.3+ upgrades them when it opens the file, so they load everywhere. A
+  loaded project is read in either spelling and every edit keeps the
+  spelling the project already has (the two are never mixed). LMMS 1.2.x
+  does not route sample tracks to a mixer channel (they always play on
+  Master), so `add_sample_track` refuses a `mixer_channel` other than 0
+  there.
 
 `list_available_plugins` also shows what is missing and why
 (`unavailable_in_installed_lmms`). Restart the server after installing or
