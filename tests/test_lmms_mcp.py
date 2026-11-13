@@ -4383,3 +4383,599 @@ class TestPitchCalibration:
         assert pitch.default_playable_keys("OPL2") == (0, 90)
         assert pitch.default_playable_keys("papu") == (24, 95)
         assert pitch.default_playable_keys("monstro") is None
+
+
+class TestTrackTuning:
+    """set_track_tuning: a track's base note and fine tune (cents).
+
+    LMMS plays a sample at its original pitch when the key equals the
+    track's base note and moves every note by `pitch` cents (limited to
+    100 cents times `pitchrange`). Both were measured with LMMS 1.2.2
+    renders; see pitch.py for the plugins that do not follow the fine tune.
+    """
+
+    @staticmethod
+    def _inst(root, index=0):
+        return find_tracks(root)[index].find("instrumenttrack")
+
+    @staticmethod
+    def _new_project():
+        from lmms_mcp import server as srv
+        proj = LMMSProject()
+        proj.new()
+        srv.set_project(proj)
+        return srv, proj
+
+    def _track(self, instrument):
+        root = create_empty_project()
+        add_instrument_track(root, "T", instrument=instrument)
+        return self._inst(root)
+
+    # --- parse_base_note -----------------------------------------------------
+
+    @pytest.mark.parametrize("value, key", [
+        ("C4", 48), ("A4", 57), ("Bb2", 34), ("bb2", 34), ("c0", 0),
+        ("C9", 108), (48, 48), (0, 0), (108, 108), (48.0, 48), ("48", 48),
+        (" D3 ", 38),
+    ])
+    def test_parse_base_note(self, value, key):
+        from lmms_mcp import pitch
+        assert pitch.parse_base_note(value) == key
+
+    @pytest.mark.parametrize("value", [
+        "H4", "", "C", "C10", True, 48.5, -1, 109, 200, None, [48], "4.5",
+    ])
+    def test_parse_base_note_rejects(self, value):
+        from lmms_mcp import pitch
+        with pytest.raises(ValueError):
+            pitch.parse_base_note(value)
+
+    def test_parse_base_note_out_of_range_mentions_midi(self):
+        from lmms_mcp import pitch
+        with pytest.raises(ValueError, match="use 108"):
+            pitch.parse_base_note(120)
+
+    # --- the base note maps through the plugin's offset ----------------------
+
+    def test_base_note_name_and_key_on_a_sampler(self):
+        from lmms_mcp import pitch
+        track = self._track("audiofileprocessor")
+        assert pitch.set_tuning(track, pitch.parse_base_note("C4")).basenote == 48
+        assert track.get("basenote") == "48"
+        pitch.set_tuning(track, 26)
+        assert track.get("basenote") == "26"
+        assert pitch.get_base_note(track) == 26
+
+    @pytest.mark.parametrize("base, written", [
+        (57, "45"),   # A4: the calibrated default stays
+        (48, "36"),   # C4
+        (45, "33"),   # A3
+        (60, "48"),
+        (12, "0"),    # lowest base note the compensation allows
+    ])
+    def test_base_note_keeps_the_zynaddsubfx_offset(self, base, written):
+        from lmms_mcp import pitch
+        track = self._track("zynaddsubfx")
+        pitch.set_tuning(track, base)
+        assert track.get("basenote") == written
+        assert pitch.get_base_note(track) == base
+
+    def test_base_note_keeps_the_opl2_offset(self):
+        from lmms_mcp import pitch
+        for name in ("OPL2", "opl2"):
+            track = self._track(name)
+            pitch.set_tuning(track, 48)
+            assert track.get("basenote") == "36"
+            assert pitch.get_base_note(track) == 48
+
+    def test_base_note_keeps_a_zyn_preset_octave(self):
+        from lmms_mcp import pitch
+        from lmms_mcp.xml_parser import embed_zyn_preset
+        root = create_empty_project()
+        add_instrument_track(root, "Z", instrument="zynaddsubfx")
+        embed_zyn_preset(root, 0, TestPitchCalibration._preset_xml(1))
+        track = self._inst(root)
+        assert track.get("basenote") == "57"   # +1 octave needs no offset
+        pitch.set_tuning(track, 48)
+        assert track.get("basenote") == "48"
+        assert pitch.get_base_note(track) == 48
+        # loading another preset keeps the user's base note
+        embed_zyn_preset(root, 0, TestPitchCalibration._preset_xml(-1))
+        assert pitch.get_base_note(track) == 48
+        assert track.get("basenote") == "24"
+
+    def test_zyn_base_note_too_low_names_the_lowest_one(self):
+        from lmms_mcp import pitch
+        track = self._track("zynaddsubfx")
+        with pytest.raises(ValueError) as exc:
+            pitch.set_tuning(track, 5)
+        assert "F0 (5)" in str(exc.value) or "Base note F0" in str(exc.value)
+        assert "C1 (12)" in str(exc.value)
+        assert track.get("basenote") == "45"
+
+    # --- the fine tune -----------------------------------------------------
+
+    @pytest.mark.parametrize("cents, pitch_attr, rng", [
+        (18, "18", "1"), (-18, "-18", "1"), (0, "0", "1"), (100, "100", "1"),
+        (-100, "-100", "1"), (100.5, "100.5", "2"), (150, "150", "2"),
+        (-250.5, "-250.5", "3"), (299.99, "299.99", "3"), (300, "300", "3"),
+        (1200, "1200", "12"), (-1200, "-1200", "12"), (18.0, "18", "1"),
+        (12.345, "12.35", "1"),
+    ])
+    def test_pitch_cents_writes_pitch_and_the_range_it_needs(
+            self, cents, pitch_attr, rng):
+        from lmms_mcp import pitch
+        track = self._track("tripleoscillator")
+        pitch.set_tuning(track, pitch_cents=cents)
+        assert track.get("pitch") == pitch_attr
+        assert track.get("pitchrange") == rng
+        assert track.get("basenote") == "57"      # untouched
+
+    def test_pitch_range_is_raised_never_lowered(self):
+        from lmms_mcp import pitch
+        track = self._track("tripleoscillator")
+        track.set("pitchrange", "5")
+        pitch.set_tuning(track, pitch_cents=150)
+        assert track.get("pitchrange") == "5"
+        pitch.set_tuning(track, pitch_cents=900)
+        assert track.get("pitchrange") == "9"
+        pitch.set_tuning(track, pitch_cents=10)
+        assert track.get("pitchrange") == "9"
+
+    def test_reads_back_pitch_cents_and_range(self):
+        from lmms_mcp import pitch
+        track = self._track("tripleoscillator")
+        assert pitch.get_pitch_cents(track) == 0
+        assert pitch.get_pitchrange(track) == 1
+        pitch.set_tuning(track, pitch_cents=-250)
+        assert pitch.get_pitch_cents(track) == -250
+        assert pitch.get_pitchrange(track) == 3
+        track.set("pitch", "garbage")
+        assert pitch.get_pitch_cents(track) == 0
+
+    @pytest.mark.parametrize("cents", [
+        1200.5, -1201, 5000, float("nan"), float("inf"), True, "18", None,
+    ])
+    def test_pitch_cents_validation(self, cents):
+        from lmms_mcp import pitch
+        track = self._track("tripleoscillator")
+        if cents is None:   # None means "leave alone"
+            assert pitch.plan_tuning(track, None, None) == pitch.Tuning()
+            return
+        with pytest.raises(ValueError):
+            pitch.set_tuning(track, pitch_cents=cents)
+        assert track.get("pitch") == "0"
+
+    def test_out_of_range_error_points_to_base_note(self):
+        from lmms_mcp import pitch
+        track = self._track("tripleoscillator")
+        with pytest.raises(ValueError, match="-1200 to \\+1200.*base_note"):
+            pitch.set_tuning(track, pitch_cents=1500)
+
+    def test_nothing_is_written_when_one_argument_is_invalid(self):
+        from lmms_mcp import pitch
+        track = self._track("tripleoscillator")
+        with pytest.raises(ValueError):
+            pitch.set_tuning(track, 48, 5000)
+        assert (track.get("basenote"), track.get("pitch")) == ("57", "0")
+        zyn = self._track("zynaddsubfx")
+        with pytest.raises(ValueError):
+            pitch.set_tuning(zyn, 48, 150)      # fine tune too large for zyn
+        assert (zyn.get("basenote"), zyn.get("pitch")) == ("45", "0")
+
+    # --- plugins that do not follow the fine tune ----------------------------
+
+    def test_zynaddsubfx_fine_tune_is_limited_to_100_cents(self):
+        from lmms_mcp import pitch
+        zyn = self._track("zynaddsubfx")
+        pitch.set_tuning(zyn, pitch_cents=-100)
+        assert zyn.get("pitch") == "-100"
+        with pytest.raises(ValueError, match="only up to \\+-100 cents.*base_note"):
+            pitch.set_tuning(zyn, pitch_cents=150)
+
+    def test_zynaddsubfx_keeps_pitchrange_1(self):
+        """A bigger range would divide the fine tune (measured: +150 cents
+        at range 2 sounds +75)."""
+        from lmms_mcp import pitch
+        zyn = self._track("zynaddsubfx")
+        zyn.set("pitchrange", "12")
+        pitch.set_tuning(zyn, pitch_cents=20)
+        assert zyn.get("pitchrange") == "1"
+
+    def test_opl2_ignores_the_fine_tune_but_takes_a_base_note(self):
+        from lmms_mcp import pitch
+        track = self._track("OPL2")
+        with pytest.raises(ValueError, match="ignores the fine tune.*base_note"):
+            pitch.set_tuning(track, pitch_cents=50)
+        pitch.set_tuning(track, pitch_cents=0)      # resetting is fine
+        pitch.set_tuning(track, base_note=48)
+        assert track.get("basenote") == "36"
+
+    def test_kicker_cannot_be_tuned(self):
+        from lmms_mcp import pitch
+        track = self._track("kicker")
+        for kwargs in ({"base_note": 48}, {"pitch_cents": 10}):
+            with pytest.raises(ValueError, match="ignores the key"):
+                pitch.set_tuning(track, **kwargs)
+        assert pitch.plan_tuning(track) == pitch.Tuning()   # reading is fine
+        assert "ignores the key" in pitch.tuning_hint(track)
+
+    # --- reports and hints ---------------------------------------------------
+
+    def test_tuning_report_of_a_default_and_a_tuned_track(self):
+        from lmms_mcp import pitch
+        track = self._track("zynaddsubfx")
+        report = pitch.tuning_report(track)
+        assert report["base_note"] == 57 and report["base_note_name"] == "A4"
+        assert report["written_basenote"] == 45
+        assert report["pitch_cents"] == 0 and report["pitchrange"] == 1
+        assert report["playable_keys"] == [0, 95]
+        assert report["instrument"] == "zynaddsubfx"
+        pitch.set_tuning(track, 48, 25.5)
+        report = pitch.tuning_report(track)
+        assert (report["base_note"], report["base_note_name"]) == (48, "C4")
+        assert report["written_basenote"] == 36
+        assert report["pitch_cents"] == 25.5
+        assert report["playable_keys"] == [0, 86]
+        assert isinstance(pitch.tuning_report(self._track("monstro"))["pitch_cents"], int)
+        assert "playable_keys" not in pitch.tuning_report(self._track("monstro"))
+
+    def test_hint_for_a_sampler(self):
+        from lmms_mcp import pitch
+        track = self._track("audiofileprocessor")
+        assert pitch.tuning_hint(track) == (
+            "Key 57 (A4) plays the sample at its original pitch.")
+        pitch.set_tuning(track, 48, 18)
+        hint = pitch.tuning_hint(track)
+        assert hint.startswith("Key 48 (C4) plays the sample at its original pitch")
+        assert "key 57 = A4 is 9 semitones higher" in hint
+        assert "fine tune +18 cents" in hint
+        pitch.set_tuning(track, 60)
+        assert "key 57 = A4 is 3 semitones lower" in pitch.tuning_hint(track)
+
+    def test_hint_for_a_synth(self):
+        from lmms_mcp import pitch
+        track = self._track("tripleoscillator")
+        assert pitch.tuning_hint(track) == "Key 57 (A4) sounds at 440 Hz."
+        pitch.set_tuning(track, 48, -30)
+        hint = pitch.tuning_hint(track)
+        assert hint.startswith("Key 48 (C4) sounds at 440 Hz (A4)")
+        assert "every key sounds 9 semitones higher than its note name" in hint
+        assert "fine tune -30 cents" in hint
+        pitch.set_tuning(track, 69)
+        assert "12 semitones lower" in pitch.tuning_hint(track)
+
+    # --- the tool ------------------------------------------------------------
+
+    def test_tool_tunes_a_piano_sample_recorded_at_c4(self):
+        srv, proj = self._new_project()
+        srv.add_instrument_track("Piano", instrument="audiofileprocessor")
+        result = json.loads(srv.set_track_tuning(0, base_note="C4"))
+        assert "error" not in result
+        assert result["track_index"] == 0
+        assert result["base_note"] == 48
+        assert result["base_note_name"] == "C4"
+        assert result["written_basenote"] == 48
+        assert result["pitch_cents"] == 0
+        assert result["pitchrange"] == 1
+        assert "playable_keys" not in result
+        assert result["hint"].startswith("Key 48 (C4) plays the sample")
+        assert "C4" in result["message"]
+        assert self._inst(proj.root).get("basenote") == "48"
+        assert proj.modified is True
+
+    def test_tool_accepts_a_key_number_and_both_arguments(self):
+        srv, proj = self._new_project()
+        srv.add_instrument_track("Cello", instrument="audiofileprocessor")
+        result = json.loads(srv.set_track_tuning(0, base_note=38, pitch_cents=18))
+        assert result["base_note"] == 38 and result["base_note_name"] == "D3"
+        assert result["pitch_cents"] == 18 and result["pitchrange"] == 1
+        track = self._inst(proj.root)
+        assert (track.get("basenote"), track.get("pitch")) == ("38", "18")
+        assert "+18" in result["message"] and "D3" in result["message"]
+
+    def test_tool_leaves_an_omitted_argument_alone(self):
+        srv, _ = self._new_project()
+        srv.add_instrument_track("S", instrument="audiofileprocessor")
+        srv.set_track_tuning(0, base_note="G4", pitch_cents=-12)
+        first = json.loads(srv.set_track_tuning(0, pitch_cents=7))
+        assert first["base_note"] == 55 and first["pitch_cents"] == 7
+        second = json.loads(srv.set_track_tuning(0, base_note="C4"))
+        assert second["base_note"] == 48 and second["pitch_cents"] == 7
+
+    def test_tool_without_arguments_returns_the_tuning_and_changes_nothing(self):
+        srv, proj = self._new_project()
+        srv.add_instrument_track("S", instrument="audiofileprocessor")
+        srv.set_track_tuning(0, base_note="C4", pitch_cents=18)
+        proj._modified = False
+        before = ET.tostring(proj.root)
+        result = json.loads(srv.set_track_tuning(0))
+        assert result["base_note_name"] == "C4" and result["pitch_cents"] == 18
+        assert "unchanged" in result["message"]
+        assert proj.modified is False
+        assert ET.tostring(proj.root) == before
+
+    def test_tool_pitch_cents_beyond_100_raises_the_range(self):
+        srv, proj = self._new_project()
+        srv.add_instrument_track("L", instrument="tripleoscillator")
+        result = json.loads(srv.set_track_tuning(0, pitch_cents=-250))
+        assert result["pitch_cents"] == -250 and result["pitchrange"] == 3
+        assert self._inst(proj.root).get("pitchrange") == "3"
+
+    def test_tool_on_zynaddsubfx_reports_playable_keys_and_offset(self):
+        srv, proj = self._new_project()
+        srv.add_instrument_track("Z", instrument="zynaddsubfx")
+        default = json.loads(srv.set_track_tuning(0))
+        assert default["base_note"] == 57 and default["written_basenote"] == 45
+        assert default["playable_keys"] == [0, 95]
+        result = json.loads(srv.set_track_tuning(0, base_note="C4"))
+        assert result["base_note"] == 48 and result["written_basenote"] == 36
+        assert result["playable_keys"] == [0, 86]
+        too_low = json.loads(srv.set_track_tuning(0, base_note="C0"))
+        assert "C1 (12)" in too_low["error"]
+        too_far = json.loads(srv.set_track_tuning(0, pitch_cents=150))
+        assert "+-100 cents" in too_far["error"]
+        assert self._inst(proj.root).get("basenote") == "36"
+
+    def test_tool_errors_are_json_and_change_nothing(self):
+        srv, proj = self._new_project()
+        srv.add_instrument_track("S", instrument="audiofileprocessor")
+        before = ET.tostring(proj.root)
+        for kwargs in ({"base_note": "H4"}, {"base_note": 200},
+                       {"base_note": "C4", "pitch_cents": 2000},
+                       {"pitch_cents": float("nan")}, {"base_note": ""}):
+            result = json.loads(srv.set_track_tuning(0, **kwargs))
+            assert result["error"].startswith("Tuning NOT changed:"), kwargs
+        assert ET.tostring(proj.root) == before
+        for index in (5, -1):
+            assert "error" in json.loads(srv.set_track_tuning(index, base_note="C4"))
+
+    def test_tool_refuses_tracks_that_are_not_instrument_tracks(self):
+        srv, _ = self._new_project()
+        srv.add_sample_track("Samples")
+        srv.add_pattern_track("Beat")
+        srv.add_automation_track("Auto")
+        for index, kind in ((0, "sample"), (1, "pattern"), (2, "automation")):
+            result = json.loads(srv.set_track_tuning(index, base_note="C4"))
+            assert f"is a {kind} track, not an instrument track" in result["error"]
+            assert "add_instrument_track" in result["error"]
+        empty = LMMSProject()
+        empty.new()
+        srv.set_project(empty)
+        assert "no tracks" in json.loads(srv.set_track_tuning(0))["error"]
+
+    def test_tool_refuses_kicker_and_opl2_fine_tune(self):
+        srv, proj = self._new_project()
+        srv.add_instrument_track("K", instrument="kicker")
+        # LMMS 1.2 loads opulenz as "OPL2" (the test install has "opulenz")
+        proj.add_track("instrument", "FM", instrument="OPL2")
+        assert "ignores the key" in json.loads(
+            srv.set_track_tuning(0, base_note="C4"))["error"]
+        assert "ignores the fine tune" in json.loads(
+            srv.set_track_tuning(1, pitch_cents=10))["error"]
+        ok = json.loads(srv.set_track_tuning(1, base_note="C4"))
+        assert ok["base_note"] == 48 and ok["written_basenote"] == 36
+
+    # --- get_track / list_tracks ---------------------------------------------
+
+    def test_get_track_and_list_tracks_show_a_non_default_tuning(self):
+        srv, _ = self._new_project()
+        srv.add_instrument_track("Plain", instrument="tripleoscillator")
+        srv.add_instrument_track("Zyn", instrument="zynaddsubfx")
+        srv.add_instrument_track("Cello", instrument="audiofileprocessor")
+        srv.add_instrument_track("Pad", instrument="audiofileprocessor")
+        srv.add_sample_track("Samples")
+        srv.set_track_tuning(2, base_note="D3", pitch_cents=18)
+        srv.set_track_tuning(3, pitch_cents=-7.5)
+        for index in (0, 1, 4):     # default tuning: no extra fields
+            track = json.loads(srv.get_track(index))
+            assert not {"base_note", "base_note_name", "pitch_cents"} & set(track)
+        cello = json.loads(srv.get_track(2))
+        assert cello["base_note"] == 38 and cello["base_note_name"] == "D3"
+        assert cello["pitch_cents"] == 18
+        pad = json.loads(srv.get_track(3))
+        assert pad["base_note"] == 57 and pad["base_note_name"] == "A4"
+        assert pad["pitch_cents"] == -7.5
+        listed = {t["index"]: t for t in json.loads(srv.list_tracks())["tracks"]}
+        assert listed[2]["base_note_name"] == "D3" and listed[2]["pitch_cents"] == 18
+        assert listed[3]["pitch_cents"] == -7.5
+        for index in (0, 1, 4):
+            assert "base_note" not in listed[index]
+            assert "pitch_cents" not in listed[index]
+
+    def test_zyn_track_shows_the_user_facing_base_note(self):
+        srv, _ = self._new_project()
+        srv.add_instrument_track("Zyn", instrument="zynaddsubfx")
+        srv.set_track_tuning(0, base_note="C4")       # written 36
+        track = json.loads(srv.get_track(0))
+        assert track["base_note"] == 48 and track["base_note_name"] == "C4"
+
+    # --- set_audiofile_sample takes the tuning too -------------------------------
+
+    def test_set_audiofile_sample_sets_sample_and_tuning_in_one_call(self):
+        srv, proj = self._new_project()
+        srv.add_instrument_track("Cello", instrument="audiofileprocessor")
+        result = json.loads(srv.set_audiofile_sample(
+            0, "instruments/cello01.ogg", base_note="D3", pitch_cents=18))
+        assert "error" not in result
+        assert result["tuning"]["base_note"] == 38
+        assert result["tuning"]["base_note_name"] == "D3"
+        assert result["tuning"]["pitch_cents"] == 18
+        assert "Key 38 (D3) plays the sample at its original pitch" in result["tuning"]["hint"]
+        assert "note" not in result["tuning"]
+        track = self._inst(proj.root)
+        assert (track.get("basenote"), track.get("pitch"),
+                track.get("pitchrange")) == ("38", "18", "1")
+        assert track.find("instrument/audiofileprocessor").get("src") == \
+            "instruments/cello01.ogg"
+
+    def test_set_audiofile_sample_with_a_key_number_and_only_one_value(self):
+        srv, _ = self._new_project()
+        srv.add_instrument_track("P", instrument="audiofileprocessor")
+        result = json.loads(srv.set_audiofile_sample(
+            0, "instruments/piano01.ogg", base_note=48))
+        assert result["tuning"]["base_note_name"] == "C4"
+        assert result["tuning"]["pitch_cents"] == 0
+        result = json.loads(srv.set_audiofile_sample(
+            0, "instruments/piano01.ogg", pitch_cents=-4))
+        assert result["tuning"]["base_note"] == 48      # kept
+        assert result["tuning"]["pitch_cents"] == -4
+
+    def test_set_audiofile_sample_default_response_has_no_tuning(self):
+        srv, proj = self._new_project()
+        srv.add_instrument_track("Kick", instrument="audiofileprocessor")
+        result = json.loads(srv.set_audiofile_sample(0, "drums/kick01.ogg"))
+        assert "tuning" not in result
+        assert self._inst(proj.root).get("basenote") == "57"
+
+    def test_set_audiofile_sample_with_bad_tuning_changes_nothing(self):
+        srv, proj = self._new_project()
+        srv.add_instrument_track("S", instrument="audiofileprocessor")
+        for kwargs in ({"base_note": "H4"}, {"pitch_cents": 5000},
+                       {"base_note": "C4", "pitch_cents": 5000}):
+            result = json.loads(srv.set_audiofile_sample(
+                0, "drums/kick01.ogg", **kwargs))
+            assert "error" in result, kwargs
+        track = self._inst(proj.root)
+        assert "src" not in track.find("instrument/audiofileprocessor").attrib
+        assert (track.get("basenote"), track.get("pitch")) == ("57", "0")
+
+    def test_set_audiofile_sample_bad_tuning_keeps_the_previous_sample(self):
+        srv, proj = self._new_project()
+        srv.add_instrument_track("S", instrument="audiofileprocessor")
+        srv.set_audiofile_sample(0, "drums/kick01.ogg", amp=150)
+        result = json.loads(srv.set_audiofile_sample(
+            0, "drums/snare01.ogg", amp=50, base_note="C4", pitch_cents=-2000))
+        assert "error" in result
+        afp = self._inst(proj.root).find("instrument/audiofileprocessor")
+        assert (afp.get("src"), afp.get("amp")) == ("drums/kick01.ogg", "150")
+
+    def test_new_sample_on_a_tuned_track_reports_the_kept_tuning(self):
+        srv, _ = self._new_project()
+        srv.add_instrument_track("S", instrument="audiofileprocessor")
+        srv.set_audiofile_sample(0, "instruments/piano01.ogg", base_note="C4")
+        other = json.loads(srv.set_audiofile_sample(
+            0, "instruments/violin_pizzicato01.ogg"))
+        assert other["tuning"]["base_note_name"] == "C4"
+        assert "keeps the tuning it had" in other["tuning"]["note"]
+        assert "set_track_tuning(0, base_note=57, pitch_cents=0)" in other["tuning"]["note"]
+        # the same sample again (e.g. to change amp): no note
+        again = json.loads(srv.set_audiofile_sample(
+            0, "instruments/violin_pizzicato01.ogg", amp=80))
+        assert "note" not in again["tuning"]
+        # giving the tuning for the new sample: no note either
+        fixed = json.loads(srv.set_audiofile_sample(
+            0, "instruments/flute01.ogg", base_note="A5"))
+        assert "note" not in fixed["tuning"]
+        reset = json.loads(srv.set_track_tuning(0, base_note=57, pitch_cents=0))
+        assert reset["base_note_name"] == "A4" and reset["pitch_cents"] == 0
+
+    def test_set_audiofile_sample_xml_level_tuning(self):
+        from lmms_mcp.xml_parser import set_audiofile_sample
+        root = create_empty_project()
+        add_instrument_track(root, "S", instrument="audiofileprocessor")
+        set_audiofile_sample(root, 0, "x.ogg", base_note=38, pitch_cents=18)
+        track = self._inst(root)
+        assert (track.get("basenote"), track.get("pitch")) == ("38", "18")
+        with pytest.raises(ValueError):
+            set_audiofile_sample(root, 0, "y.ogg", base_note=1000)
+        assert track.find("instrument/audiofileprocessor").get("src") == "x.ogg"
+        assert track.get("basenote") == "38"
+
+    # --- save and load -----------------------------------------------------
+
+    @pytest.mark.parametrize("suffix", [".mmp", ".mmpz"])
+    def test_tuning_survives_save_and_load(self, tmp_path, suffix):
+        srv, proj = self._new_project()
+        srv.add_instrument_track("Cello", instrument="audiofileprocessor")
+        srv.add_instrument_track("Zyn", instrument="zynaddsubfx")
+        srv.add_instrument_track("Lead", instrument="tripleoscillator")
+        srv.set_audiofile_sample(0, "instruments/cello01.ogg",
+                                 base_note="D3", pitch_cents=17.5)
+        srv.set_track_tuning(1, base_note="C4", pitch_cents=-40)
+        srv.set_track_tuning(2, pitch_cents=-250)
+        path = tmp_path / f"tuned{suffix}"
+        proj.save(path)
+        loaded = LMMSProject()
+        loaded.load(path)
+        srv.set_project(loaded)
+        for index, (base, name, cents, written) in enumerate((
+                (38, "D3", 17.5, 38), (48, "C4", -40, 36), (57, "A4", -250, 57))):
+            report = json.loads(srv.set_track_tuning(index))
+            assert report["base_note"] == base and report["base_note_name"] == name
+            assert report["pitch_cents"] == cents
+            assert report["written_basenote"] == written
+        assert json.loads(srv.set_track_tuning(2))["pitchrange"] == 3
+        track = json.loads(srv.get_track(0))
+        assert track["base_note_name"] == "D3" and track["pitch_cents"] == 17.5
+
+    # --- what the agent is told -------------------------------------------------
+
+    def test_tool_is_offered_with_its_arguments(self, server_for):
+        import asyncio
+        srv = server_for(LMMS_122_PLUGINS)
+        tools = {t.name: t for t in asyncio.run(srv.mcp.list_tools())}
+        schema = tools["set_track_tuning"].input_schema
+        assert set(schema["properties"]) == {
+            "track_index", "base_note", "pitch_cents"}
+        assert schema["required"] == ["track_index"]
+        props = tools["set_audiofile_sample"].input_schema["properties"]
+        assert {"base_note", "pitch_cents"} <= set(props)
+
+    def test_tool_description_explains_the_sample_example(self, server_for):
+        import asyncio
+        srv = server_for(LMMS_122_PLUGINS)
+        tools = {t.name: t.description or ""
+                 for t in asyncio.run(srv.mcp.list_tools())}
+        flat = " ".join(tools["set_track_tuning"].split())
+        assert 'a piano sample recorded at C4 gets base_note="C4"' in flat
+        assert "key 48 (C4) plays it unchanged" in flat
+        assert "+18 for a sample that is 18 cents flat" in flat
+        assert "-1200 to +1200" in flat
+        assert "set_audiofile_sample accepts the same two arguments" in flat
+        # the limits name only offered instruments
+        assert "zynaddsubfx follows the fine tune only up to +-100 cents" in flat
+        assert "opulenz ignores the fine tune" in flat
+        assert "kicker ignores the key" in flat
+        sample = " ".join(tools["set_audiofile_sample"].split())
+        assert 'base_note="C4"' in sample and "pitch_cents" in sample
+        assert "key 57 (A4, the LMMS default)" in sample
+
+    def test_tool_description_names_only_offered_instruments(self, server_for):
+        import asyncio
+        srv = server_for({"tripleoscillator", "monstro", "sf2player"})
+        tools = {t.name: t.description or ""
+                 for t in asyncio.run(srv.mcp.list_tools())}
+        flat = " ".join(tools["set_track_tuning"].split())
+        for word in ("zynaddsubfx", "opulenz", "kicker", "Limits:",
+                     "set_audiofile_sample"):
+            assert word not in flat, word
+        assert "set_audiofile_sample" not in tools
+
+    def test_instructions_explain_tuning(self):
+        from lmms_mcp import server as srv
+        text = " ".join(srv.build_instructions(
+            srv._availability, "/tmp/p").split())
+        assert "set_track_tuning(track_index, base_note, pitch_cents)" in text
+        assert 'a piano sample recorded at C4 gets base_note="C4"' in text
+        assert "pitch_cents=18" in text
+        assert "set_audiofile_sample takes the same two arguments" in text
+        assert "give set_audiofile_sample its base_note" in text
+
+    def test_instructions_without_a_sampler_do_not_mention_samples(self):
+        from lmms_mcp import lmms_app
+        from lmms_mcp import server as srv
+        av = lmms_app.build_availability(
+            srv.KNOWN_INSTRUMENTS, srv.effects_mod.KNOWN_EFFECTS,
+            {"tripleoscillator", "lb302"}, "1.2.2", windows=False)
+        text = " ".join(srv.build_instructions(av, "/tmp/p").split())
+        assert "set_track_tuning" in text
+        for word in ("audiofileprocessor", "set_audiofile_sample",
+                     "tuned sample", "pitch_cents=18"):
+            assert word not in text, word
+
+    def test_readme_documents_the_tool(self):
+        readme = (Path(__file__).resolve().parents[1] / "README.md").read_text()
+        assert "`set_track_tuning`" in readme
+        flat = " ".join(readme.split())
+        assert "base_note" in flat and "pitch_cents" in flat

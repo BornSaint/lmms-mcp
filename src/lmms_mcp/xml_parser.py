@@ -638,6 +638,8 @@ def set_audiofile_sample(
     stutter: bool = False,
     start: float = 0.0,
     end: float = 1.0,
+    base_note: int | None = None,
+    pitch_cents: float | None = None,
 ) -> ET.Element:
     """Set the sample of an audiofileprocessor instrument track.
 
@@ -653,9 +655,15 @@ def set_audiofile_sample(
         stutter: Restart the sample when a new note starts.
         start: Sample start point as a fraction (0 <= start < end).
         end: Sample end point as a fraction (start < end <= 1).
+        base_note: LMMS key (0-108) at which the sample sounds at its
+            original pitch, written to the track (see pitch.plan_tuning).
+            None leaves the track's base note alone.
+        pitch_cents: Fine tune in cents written to the track (+18 for a
+            sample that is 18 cents flat). None leaves it alone.
 
     Creates the <audiofileprocessor> element if missing; repeated calls
-    overwrite the previous settings. Returns the element.
+    overwrite the previous settings. Nothing is changed when an argument
+    is invalid (a ValueError). Returns the element.
     """
     tracks = find_tracks(root)
     if not 0 <= track_index < len(tracks):
@@ -695,9 +703,13 @@ def set_audiofile_sample(
             f"Need 0 <= start < end <= 1, got start={start}, end={end}"
         )
 
+    inst_track = track.find("instrumenttrack")
+    tuning = pitch.plan_tuning(inst_track, base_note, pitch_cents)
+
     afp = inst.find("audiofileprocessor")
     if afp is None:
         afp = ET.SubElement(inst, "audiofileprocessor")
+    pitch.apply_tuning(inst_track, tuning)
     afp.set("src", str(src))
     afp.set("amp", _fmt_number(amp))
     afp.set("reversed", "1" if reversed else "0")

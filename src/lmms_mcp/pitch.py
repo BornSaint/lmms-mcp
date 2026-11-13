@@ -16,11 +16,26 @@ get_base_note() / set_base_note() to read and write a track's. A plugin's
 offset is not the whole story for ZynAddSubFX: every preset carries its own
 octave transposition (see zyn_preset_octave), which track_pitch_offset()
 adds to the table value so each preset sounds at the pitch of the key too.
+
+The agent can also tune a track: set_tuning() writes a base note (the key at
+which a sample plays at its recorded pitch, e.g. C4 for a piano sample
+recorded at C4) and a fine tune in cents (`pitch`, with the `pitchrange` it
+needs). tuning_report() / tuning_hint() describe the result.
 """
 
+import math
+import re
+from dataclasses import dataclass
 from xml.etree import ElementTree as ET
 
-from .models import DEFAULT_BASE_NOTE, KEY_MAX, KEY_MIN, key_to_note_name
+from .models import (
+    DEFAULT_BASE_NOTE,
+    KEY_MAX,
+    KEY_MIN,
+    KEY_RANGE_TEXT,
+    key_to_note_name,
+    note_name_to_key,
+)
 
 # LMMS accepts base notes 0..127 (NumKeys); it clamps anything outside.
 BASE_NOTE_MIN = 0
@@ -68,6 +83,30 @@ PLUGIN_KEY_LIMITS: dict[str, tuple[int, int]] = {
     "vibedstrings": (0, 78),
     "sfxr": (0, 78),
 }
+
+# Largest track fine tune (the <instrumenttrack pitch> attribute, in cents)
+# each plugin follows, measured with LMMS 1.2.2 by rendering a note with a
+# fine tune of +-50, +-100, +-150, +-250 and +-1200 cents. Plugins not listed
+# follow the fine tune exactly up to FINE_TUNE_MAX_CENTS (LMMS limits it to
+# 100 cents times the track's `pitchrange`, which set_tuning raises as needed).
+#
+# zynaddsubfx: LMMS sends the fine tune as a MIDI pitch bend and ZynAddSubFX
+#   always bends +-100 cents at full deflection, whatever pitchrange says. A
+#   range above 1 makes the sound pitch / range cents (e.g. +150 with range 2
+#   sounds +75), so ZynAddSubFX tracks keep pitchrange 1 and +-100 cents.
+# opl2: ignores the fine tune completely.
+# kicker: a drum that ignores the key; neither the fine tune nor the base
+#   note changes its sound (see PLUGINS_IGNORING_KEY).
+PLUGIN_FINE_TUNE_LIMITS: dict[str, int] = {
+    "zynaddsubfx": 100,
+    "opl2": 0,
+    "kicker": 0,
+}
+
+# Plugins whose sound does not depend on the key, so tuning them is useless.
+PLUGINS_IGNORING_KEY = frozenset({"kicker"})
+
+FINE_TUNE_MAX_CENTS = 1200
 
 _ZYN_PLUGIN = "zynaddsubfx"
 
@@ -198,16 +237,32 @@ def get_base_note(inst_track: ET.Element) -> int:
     return _written_basenote(inst_track) + track_pitch_offset(inst_track)
 
 
+def _written_for(inst_track: ET.Element, base_note: int) -> int:
+    """The basenote to write for a user-facing base note, or ValueError.
+
+    Compensating the plugin's pitch (see track_pitch_offset) can need a
+    value LMMS does not accept; the error then names the base notes that
+    work on this track.
+    """
+    offset = track_pitch_offset(inst_track)
+    written = base_note - offset
+    if BASE_NOTE_MIN <= written <= BASE_NOTE_MAX:
+        return written
+    low = max(KEY_MIN, BASE_NOTE_MIN + offset)
+    high = min(KEY_MAX, BASE_NOTE_MAX + offset)
+    raise ValueError(
+        f"Base note {key_to_note_name(base_note)} ({base_note}) cannot be "
+        f"used on this '{_plugin_of(inst_track)}' track: compensating the "
+        f"instrument's pitch would need basenote {written}, but LMMS only "
+        f"accepts {BASE_NOTE_MIN}-{BASE_NOTE_MAX}. Choose a base note from "
+        f"{key_to_note_name(low)} ({low}) to {key_to_note_name(high)} "
+        f"({high})."
+    )
+
+
 def set_base_note(inst_track: ET.Element, base_note: int) -> int:
     """Write the basenote for a user-facing base note; returns the written one."""
-    written = base_note - track_pitch_offset(inst_track)
-    if not BASE_NOTE_MIN <= written <= BASE_NOTE_MAX:
-        raise ValueError(
-            f"Base note {base_note} cannot be used with "
-            f"'{_plugin_of(inst_track)}': compensating its pitch would need "
-            f"{written}, but LMMS only accepts "
-            f"{BASE_NOTE_MIN}-{BASE_NOTE_MAX}."
-        )
+    written = _written_for(inst_track, base_note)
     inst_track.set("basenote", str(written))
     return written
 
@@ -271,3 +326,231 @@ def key_range_warning(inst_track: ET.Element, key: int) -> str | None:
         f"({low}-{high}, {key_to_note_name(low)}-{key_to_note_name(high)}); "
         f"expect silence or a wrong pitch."
     )
+
+
+# --- tuning a track: base note and fine tune ----------------------------------
+
+def parse_base_note(value) -> int:
+    """A base note given as a note name or an LMMS key, as a key (0-108).
+
+    Accepts a note name ("C4", "Bb2"), an int (48), a whole float (48.0) and
+    a string of digits ("48"). Raises ValueError saying what to pass.
+    """
+    if isinstance(value, bool):
+        raise ValueError(
+            f"base_note must be a note name like 'C4' or an LMMS key number "
+            f"({KEY_RANGE_TEXT}), got {value!r}."
+        )
+    if isinstance(value, str):
+        text = value.strip()
+        if not re.fullmatch(r"[+-]?\d+", text):
+            return note_name_to_key(text)
+        value = int(text)
+    if isinstance(value, float):
+        if not value.is_integer():
+            raise ValueError(
+                f"base_note must be a note name or a whole key number, "
+                f"got {value!r}. Use pitch_cents for a fraction of a "
+                f"semitone."
+            )
+        value = int(value)
+    if not isinstance(value, int):
+        raise ValueError(
+            f"base_note must be a note name like 'C4' or an LMMS key number "
+            f"({KEY_RANGE_TEXT}), got {value!r}."
+        )
+    if not KEY_MIN <= value <= KEY_MAX:
+        hint = (
+            f" If {value} is a MIDI note number, use {value - 12}."
+            if value > KEY_MAX else ""
+        )
+        raise ValueError(
+            f"base_note {value} is out of range: valid LMMS keys are "
+            f"{KEY_RANGE_TEXT}.{hint}"
+        )
+    return value
+
+
+def fine_tune_limit(plugin: str) -> int:
+    """Cents of fine tune the plugin follows (FINE_TUNE_MAX_CENTS for most)."""
+    return PLUGIN_FINE_TUNE_LIMITS.get(plugin.strip().lower(), FINE_TUNE_MAX_CENTS)
+
+
+def _float_attr(inst_track: ET.Element, name: str, default: float) -> float:
+    try:
+        value = float(inst_track.get(name, default))
+    except ValueError:
+        return default
+    return value if math.isfinite(value) else default
+
+
+def get_pitch_cents(inst_track: ET.Element) -> float:
+    """The track's fine tune in cents (0 when none)."""
+    return _float_attr(inst_track, "pitch", 0.0)
+
+
+def get_pitchrange(inst_track: ET.Element) -> int:
+    """The track's pitch range in semitones (LMMS default 1)."""
+    return max(1, int(_float_attr(inst_track, "pitchrange", 1.0)))
+
+
+def _format_cents(cents: float) -> str:
+    """Cents for the XML or JSON: 18.0 -> "18", 12.5 -> "12.5"."""
+    return str(int(cents)) if cents == int(cents) else repr(cents)
+
+
+def json_cents(cents: float) -> float | int:
+    return int(cents) if cents == int(cents) else cents
+
+
+def _parse_cents(value) -> float:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ValueError(
+            f"pitch_cents must be a number of cents (e.g. 18 or -12.5), "
+            f"got {value!r}."
+        )
+    cents = float(value)
+    if not math.isfinite(cents):
+        raise ValueError(f"pitch_cents must be a finite number, got {value!r}.")
+    if abs(cents) > FINE_TUNE_MAX_CENTS:
+        raise ValueError(
+            f"pitch_cents {value:g} is out of range: the fine tune is "
+            f"-{FINE_TUNE_MAX_CENTS} to +{FINE_TUNE_MAX_CENTS} cents (100 "
+            f"cents = 1 semitone). Use base_note to shift by whole "
+            f"semitones or octaves."
+        )
+    return round(cents, 2)
+
+
+@dataclass(frozen=True)
+class Tuning:
+    """What apply_tuning() writes to a track; None leaves that value alone."""
+
+    basenote: int | None = None
+    pitch: float | None = None
+    pitchrange: int | None = None
+
+
+def plan_tuning(
+    inst_track: ET.Element,
+    base_note: int | None = None,
+    pitch_cents: float | None = None,
+) -> Tuning:
+    """Check a base note (an LMMS key) and a fine tune for the track.
+
+    Nothing is written; raises ValueError saying what is wrong and what to
+    do instead. Hand the result to apply_tuning(). base_note is the key at
+    which the instrument or sample sounds at its natural pitch (user-facing,
+    see get_base_note); pitch_cents raises (+) or lowers (-) every note.
+    Both None gives an empty Tuning. The pitch range is raised to cover the
+    fine tune (never lowered), except on plugins that do not follow it (see
+    PLUGIN_FINE_TUNE_LIMITS).
+    """
+    plugin = _plugin_of(inst_track)
+    if base_note is None and pitch_cents is None:
+        return Tuning()
+    if plugin.strip().lower() in PLUGINS_IGNORING_KEY:
+        raise ValueError(
+            f"'{plugin}' ignores the key it is played at, so neither a base "
+            f"note nor a fine tune changes its sound. Use a pitched "
+            f"instrument such as tripleoscillator to play notes."
+        )
+
+    written = None
+    if base_note is not None:
+        written = _written_for(inst_track, base_note)
+
+    pitch = pitchrange = None
+    if pitch_cents is not None:
+        cents = _parse_cents(pitch_cents)
+        limit = fine_tune_limit(plugin)
+        if abs(cents) > limit:
+            if limit == 0:
+                raise ValueError(
+                    f"'{plugin}' ignores the fine tune (pitch_cents), so "
+                    f"{cents:+g} cents would not change its sound. Only "
+                    f"whole semitones work: use base_note."
+                )
+            raise ValueError(
+                f"'{plugin}' follows the fine tune only up to +-{limit} "
+                f"cents, so {cents:+g} cents would sound wrong. Use "
+                f"base_note for whole semitones and pitch_cents "
+                f"(within +-{limit}) for the rest."
+            )
+        needed = max(1, math.ceil(abs(cents) / 100))
+        pitch = cents
+        pitchrange = (
+            needed if limit < FINE_TUNE_MAX_CENTS
+            else max(get_pitchrange(inst_track), needed)
+        )
+    return Tuning(written, pitch, pitchrange)
+
+
+def apply_tuning(inst_track: ET.Element, tuning: Tuning) -> None:
+    """Write a plan_tuning() result to the <instrumenttrack> element."""
+    if tuning.basenote is not None:
+        inst_track.set("basenote", str(tuning.basenote))
+    if tuning.pitch is not None:
+        inst_track.set("pitch", _format_cents(tuning.pitch))
+        inst_track.set("pitchrange", str(tuning.pitchrange))
+
+
+def set_tuning(
+    inst_track: ET.Element,
+    base_note: int | None = None,
+    pitch_cents: float | None = None,
+) -> Tuning:
+    """plan_tuning() and apply_tuning() in one step; nothing is written on error."""
+    tuning = plan_tuning(inst_track, base_note, pitch_cents)
+    apply_tuning(inst_track, tuning)
+    return tuning
+
+
+def tuning_hint(inst_track: ET.Element) -> str:
+    """One sentence saying what the track's keys play now."""
+    plugin = _plugin_of(inst_track)
+    if plugin.strip().lower() in PLUGINS_IGNORING_KEY:
+        return (
+            f"{plugin} ignores the key, so the base note and the fine tune "
+            f"have no effect on it."
+        )
+    base = get_base_note(inst_track)
+    cents = get_pitch_cents(inst_track)
+    name = key_to_note_name(base)
+    shift = DEFAULT_BASE_NOTE - base
+    direction = "higher" if shift > 0 else "lower"
+    tune = (
+        f" (fine tune {cents:+g} cents)" if cents else ""
+    )
+    if plugin.strip().lower() == "audiofileprocessor":
+        text = f"Key {base} ({name}) plays the sample at its original pitch"
+        if shift:
+            text += (
+                f"; other keys transpose it (key {DEFAULT_BASE_NOTE} = A4 "
+                f"is {abs(shift)} semitones {direction})"
+            )
+        return text + tune + "."
+    if not shift:
+        return f"Key {base} ({name}) sounds at 440 Hz{tune}."
+    return (
+        f"Key {base} ({name}) sounds at 440 Hz (A4): every key sounds "
+        f"{abs(shift)} semitones {direction} than its note name{tune}."
+    )
+
+
+def tuning_report(inst_track: ET.Element) -> dict:
+    """The track's tuning as a JSON-ready dict (see set_track_tuning)."""
+    base = get_base_note(inst_track)
+    report = {
+        "instrument": _plugin_of(inst_track),
+        "base_note": base,
+        "base_note_name": key_to_note_name(base),
+        "written_basenote": _written_basenote(inst_track),
+        "pitch_cents": json_cents(get_pitch_cents(inst_track)),
+        "pitchrange": get_pitchrange(inst_track),
+    }
+    keys = playable_key_range(inst_track)
+    if keys:
+        report["playable_keys"] = list(keys)
+    report["hint"] = tuning_hint(inst_track)
+    return report

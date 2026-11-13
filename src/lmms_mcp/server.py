@@ -19,6 +19,7 @@ from . import pitch
 from . import presets as zyn_presets
 from . import xml_parser
 from .models import (
+    DEFAULT_BASE_NOTE,
     DEFAULT_KEY,
     KEY_MAX,
     KEY_MIN,
@@ -207,7 +208,8 @@ def _pitch_note(av) -> str:
     if "audiofileprocessor" in pool:
         exceptions.append(
             "audiofileprocessor plays its sample at its original pitch at "
-            "key 57"
+            "the track's base note (key 57 until set_track_tuning or "
+            "set_audiofile_sample says at which note the sample was recorded)"
         )
     if exceptions:
         text += " Exceptions: " + "; ".join(exceptions) + "."
@@ -228,6 +230,51 @@ def _pitch_note(av) -> str:
     return text
 
 
+def _tuning_note(av) -> str:
+    """Instructions paragraph: tuning a track with set_track_tuning."""
+    text = (
+        "Tuning: set_track_tuning(track_index, base_note, pitch_cents) sets "
+        "an instrument track's base note (the key that sounds at the "
+        "instrument's natural pitch; A4 = key 57 by default) and its fine "
+        "tune in cents."
+    )
+    if "audiofileprocessor" in av.instruments:
+        text += (
+            " It is how you play a tuned sample: a piano sample recorded at "
+            "C4 gets base_note=\"C4\", then every key sounds at its note "
+            "name; a sample that is 18 cents flat gets pitch_cents=18. "
+            "set_audiofile_sample takes the same two arguments. Never shift "
+            "notes by hand to correct a sample's pitch."
+        )
+    text += (
+        " Synths and soundfonts are already tuned: for them a changed base "
+        "note only transposes the track."
+    )
+    return text
+
+
+def _tuning_exceptions(av) -> str:
+    """Sentence naming the offered instruments that cannot follow every
+    tuning (empty when there are none); fills $TUNING_LIMITS."""
+    parts = []
+    for name in _ordered(KNOWN_INSTRUMENTS, av.instruments):
+        plugin = av.plugin_name(name)
+        limit = pitch.fine_tune_limit(plugin)
+        if plugin.lower() in pitch.PLUGINS_IGNORING_KEY:
+            parts.append(f"{name} ignores the key, so it cannot be tuned at all")
+        elif limit == 0:
+            parts.append(f"{name} ignores the fine tune")
+        elif limit < pitch.FINE_TUNE_MAX_CENTS:
+            parts.append(
+                f"{name} follows the fine tune only up to +-{limit} cents")
+    if not parts:
+        return ""
+    return (
+        "Limits: " + "; ".join(parts) + ". A call they cannot follow is "
+        "refused, nothing changes, and the error says what to do instead."
+    )
+
+
 def _doc_bullets(lines: list[str], indent: str = " " * 4) -> str:
     """Bulleted lines wrapped for a docstring (first line unindented)."""
     return "\n".join(
@@ -240,11 +287,14 @@ def _doc_bullets(lines: list[str], indent: str = " " * 4) -> str:
 
 
 def render_plugin_doc(template: str, av) -> str:
-    """Fill $INSTRUMENTS / $EFFECTS / $FILE_* in a tool docstring template.
+    """Fill $INSTRUMENTS / $EFFECTS / $FILE_* / $TUNING_LIMITS in a tool
+    docstring template.
 
     $FILE_INSTRUMENTS names the offered instruments that play a file,
     $FILE_DETAILS describes them (bullets) and $FILE_NOTE is a pointer to
-    set_instrument_file (empty when none is offered).
+    set_instrument_file (empty when none is offered). $TUNING_LIMITS names
+    the offered instruments that cannot follow every set_track_tuning and
+    $SAMPLE_TUNING points to set_audiofile_sample (empty without a sampler).
     """
     files = _file_instruments(av)
     return string.Template(template).safe_substitute(
@@ -252,6 +302,13 @@ def render_plugin_doc(template: str, av) -> str:
         EFFECTS=_wrap_names(_effect_choices(av)),
         FILE_INSTRUMENTS=" / ".join(files),
         FILE_DETAILS=_doc_bullets(_file_instrument_details(av)),
+        TUNING_LIMITS=textwrap.fill(
+            _tuning_exceptions(av), width=74, subsequent_indent=" " * 4),
+        SAMPLE_TUNING=textwrap.fill(
+            "set_audiofile_sample accepts the same two arguments, to set "
+            "the sample and its tuning in one call."
+            if "audiofileprocessor" in av.instruments else "",
+            width=74, subsequent_indent=" " * 4),
         FILE_NOTE=(
             f"File-based instruments ({', '.join(files)}) get their file and "
             f"sound from set_instrument_file."
@@ -387,6 +444,7 @@ Key concepts:
   Tools take either the key number or a note name ("C4", "Bb2").
 - Volume: 0-200 (100=normal), Panning: -100 to +100""",
         pitch_note,
+        _tuning_note(av),
         status,
         f"""IMPORTANT - Instruments: Only use built-in LMMS instrument names (see the
 add_instrument_track tool description or lmms://reference/instruments).
@@ -414,7 +472,9 @@ instrument "audiofileprocessor", then call set_audiofile_sample on each
 (e.g. "drums/kick_hiphop01.ogg", "drums/snare01.ogg",
 "drums/hihat_closed02.ogg" from LMMS's factory samples) and play it with
 add_note / add_notes_batch at key 57 (the track's base note = original
-pitch). An audiofileprocessor track without a sample is silent."""
+pitch). A tuned sample (piano, strings ...) is different: give
+set_audiofile_sample its base_note (the note it was recorded at) and
+pitch_cents. An audiofileprocessor track without a sample is silent."""
             + (" For synthesized drums use kicker instead."
                if "kicker" in pool else "")
         )
@@ -820,6 +880,13 @@ def _sample_path_warning(file_path: str) -> str | None:
     return None
 
 
+def _tuning_summary(inst_track: ET.Element) -> dict:
+    """The tuning fields set_audiofile_sample reports."""
+    report = pitch.tuning_report(inst_track)
+    return {k: report[k] for k in (
+        "base_note", "base_note_name", "pitch_cents", "hint")}
+
+
 @mcp.tool()
 def set_audiofile_sample(
     track_index: int,
@@ -830,6 +897,8 @@ def set_audiofile_sample(
     stutter: bool = False,
     start: float = 0.0,
     end: float = 1.0,
+    base_note: int | str | None = None,
+    pitch_cents: float | None = None,
 ) -> str:
     """Set the sample played by an audiofileprocessor instrument track.
 
@@ -852,10 +921,18 @@ def set_audiofile_sample(
     the response contains a "warning" (the sample is still set).
 
     Pitch: the sample sounds at its original pitch when the note equals
-    the track's base note, which this server creates as key 57 (A4, the
-    LMMS default). So trigger drum one-shots with key=57. Other keys
-    transpose the sample (higher key = higher pitch and shorter), which
-    can be used on purpose for tuned samples or toms.
+    the track's base note. A new track's base note is key 57 (A4, the LMMS
+    default), right for drum one-shots: trigger them with key=57. Other
+    keys transpose the sample (higher key = higher pitch and shorter).
+    For a tuned sample (piano, strings, a bass note) pass base_note, the
+    note the sample was recorded at, and keys then sound at their note
+    names: a piano sample recorded at C4 gets base_note="C4", key 48 (C4)
+    plays it unchanged and key 57 (A4) plays it as 440 Hz. A sample that
+    is slightly out of tune gets pitch_cents (+18 raises every note by 18
+    cents, for a sample that is 18 cents flat). The track keeps its tuning
+    when you set another sample, so pass both again (or call
+    set_track_tuning) when the new sample has another pitch. The same
+    tuning is available alone as set_track_tuning.
 
     Note length: the sample is cut off when the note ends, so use a
     length at least as long as the sample (24 ticks is enough for most
@@ -871,12 +948,23 @@ def set_audiofile_sample(
         start: Sample start point as a fraction 0..1 (e.g. 0.1 skips the
             first 10%); must be smaller than end
         end: Sample end point as a fraction 0..1 (1.0 = whole sample)
+        base_note: Note (name like "C4" or LMMS key 0-108) the sample was
+            recorded at. Omit to leave the track's base note alone.
+        pitch_cents: Fine tune in cents, -1200 to +1200 (+18 for a sample
+            that is 18 cents flat). Omit to leave it alone.
     """
     proj = get_project()
+    inst_track = proj._instrument_track_element(track_index) \
+        if isinstance(track_index, int) else None
+    previous = None if inst_track is None else inst_track.find(
+        "instrument/audiofileprocessor")
+    previous_src = None if previous is None else previous.get("src")
     try:
+        key = None if base_note is None else pitch.parse_base_note(base_note)
         xml_parser.set_audiofile_sample(
             proj.root, track_index, file_path, amp=amp, reversed=reversed,
             looped=looped, stutter=stutter, start=start, end=end,
+            base_note=key, pitch_cents=pitch_cents,
         )
     except (ValueError, IndexError) as exc:
         return json.dumps({"error": str(exc)})
@@ -890,6 +978,20 @@ def set_audiofile_sample(
     warning = _sample_path_warning(file_path)
     if warning:
         result["warning"] = warning
+    inst_track = proj._instrument_track_element(track_index)
+    given = base_note is not None or pitch_cents is not None
+    summary = _tuning_summary(inst_track)
+    tuned = summary["base_note"] != DEFAULT_BASE_NOTE \
+        or summary["pitch_cents"] != 0
+    if given or tuned:
+        result["tuning"] = summary
+        if not given and previous_src != file_path:
+            result["tuning"]["note"] = (
+                f"The track keeps the tuning it had. If this sample has "
+                f"another pitch, pass base_note / pitch_cents, or reset "
+                f"with set_track_tuning({track_index}, base_note=57, "
+                f"pitch_cents=0)."
+            )
     return json.dumps(result)
 
 
@@ -945,6 +1047,101 @@ def set_instrument_file(
         "message": f"Set {Path(info['file']).name}{sound} on "
                    f"{info['instrument']} track {track_index}",
     })
+
+
+def _tuning_track(proj, track_index) -> tuple[ET.Element | None, str | None]:
+    """(<instrumenttrack> element, None), or (None, error message)."""
+    error = _track_index_error(proj, track_index)
+    if error:
+        return None, error
+    inst_track = proj._instrument_track_element(track_index)
+    if inst_track is None:
+        kind = xml_parser.track_type_name(xml_parser.get_track_type(
+            xml_parser.find_track_element(proj.root, track_index))).lower()
+        return None, (
+            f"Track {track_index} is a {kind} track, not an instrument "
+            f"track, so it has no base note or fine tune. Tuning applies to "
+            f"tracks made with add_instrument_track (list_tracks shows the "
+            f"types)."
+        )
+    return inst_track, None
+
+
+@_plugin_tool
+def set_track_tuning(
+    track_index: int,
+    base_note: int | str | None = None,
+    pitch_cents: float | None = None,
+) -> str:
+    """Tune an instrument track: its base note and a fine tune in cents.
+
+    base_note is the note at which the instrument or sample sounds at its
+    natural, recorded pitch. A new track's base note is key 57 (A4, 440
+    Hz). For a sample (audiofileprocessor) this says which note it was
+    recorded at: a piano sample recorded at C4 gets base_note="C4", then
+    key 48 (C4) plays it unchanged, other keys transpose it, and every key
+    sounds at its note name. Without it a tuned sample only plays at its
+    original pitch on key 57 and every note would need shifting by hand.
+    For synths and soundfonts (already tuned: key 57 = 440 Hz) a changed
+    base note only transposes the whole track: base_note="C4" makes key 48
+    sound as A4, every key 9 semitones higher than its name. Whatever a
+    plugin does on its own is compensated, so the base note you give is
+    always the note that sounds at 440 Hz (or at the sample's original
+    pitch).
+
+    pitch_cents is a fine tune applied to every note: positive raises,
+    negative lowers (+18 for a sample that is 18 cents flat; 100 cents = 1
+    semitone; -1200 to +1200). Use base_note for whole semitones.
+    $TUNING_LIMITS
+
+    Give either argument or both; omit one to leave it as it is. Called with
+    neither, nothing changes and the current tuning is returned. Tuning
+    applies to instrument tracks only (not sample, pattern or automation
+    tracks).
+
+    $SAMPLE_TUNING
+
+    The response has the track's "base_note" (key) and "base_note_name",
+    "written_basenote" (the value stored in the project; it differs from
+    base_note on instruments the server compensates), "pitch_cents",
+    "pitchrange" (LMMS limits the fine tune to 100 cents times it; it is
+    raised for you), "playable_keys" when the instrument cannot play all
+    keys 0-108 at the right pitch with this tuning, and a "hint" saying
+    what the keys play now.
+
+    Args:
+        track_index: Zero-based index of the instrument track
+        base_note: Note (name like "C4", "Bb2" or LMMS key 0-108; C4 = 48,
+            A4 = 57) at which the instrument/sample sounds at its natural
+            pitch. Omit to leave it alone.
+        pitch_cents: Fine tune in cents, -1200 to +1200. Omit to leave it
+            alone.
+    """
+    proj = get_project()
+    inst_track, error = _tuning_track(proj, track_index)
+    if error:
+        return json.dumps({"error": error})
+    try:
+        key = None if base_note is None else pitch.parse_base_note(base_note)
+        tuning = pitch.set_tuning(inst_track, key, pitch_cents)
+    except ValueError as exc:
+        return json.dumps({"error": f"Tuning NOT changed: {exc}"})
+    report = pitch.tuning_report(inst_track)
+    if tuning == pitch.Tuning():
+        message = (
+            f"Track {track_index} tuning (unchanged): base note "
+            f"{report['base_note_name']} ({report['base_note']}), fine tune "
+            f"{report['pitch_cents']:+g} cents."
+        )
+    else:
+        proj._modified = True
+        message = (
+            f"Set track {track_index} to base note "
+            f"{report['base_note_name']} ({report['base_note']}), fine tune "
+            f"{report['pitch_cents']:+g} cents."
+        )
+    return json.dumps({
+        "track_index": track_index, "message": message, **report})
 
 
 @mcp.tool()
@@ -1016,6 +1213,10 @@ def remove_track(track_index: int) -> str:
 def get_track(track_index: int) -> str:
     """Get detailed information about a specific track.
 
+    Instrument tracks with a base note other than 57 (A4) or a fine tune
+    also show "base_note", "base_note_name" and "pitch_cents" (see
+    set_track_tuning).
+
     Args:
         track_index: Zero-based index of the track
     """
@@ -1029,7 +1230,12 @@ def get_track(track_index: int) -> str:
 
 @mcp.tool()
 def list_tracks() -> str:
-    """List all tracks in the current project with their index, name, and type."""
+    """List all tracks in the current project with their index, name, and type.
+
+    Instrument tracks with a base note other than 57 (A4) or a fine tune
+    also show "base_note", "base_note_name" and "pitch_cents" (see
+    set_track_tuning).
+    """
     proj = get_project()
     info = proj.get_info()
     tracks = [
@@ -1038,6 +1244,7 @@ def list_tracks() -> str:
             "name": t.name,
             "type": t.type_name,
             "instrument": t.instrument,
+            **t.tuning_dict(),
             "muted": t.muted,
             "patterns": len(t.patterns),
         }

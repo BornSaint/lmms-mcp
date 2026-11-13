@@ -159,6 +159,8 @@ class LMMSProject:
         track.volume = int(inst_elem.get("vol", "100"))
         track.panning = int(inst_elem.get("pan", "0"))
         track.mixer_channel = int(inst_elem.get("mixch", "0"))
+        track.base_note = pitch.get_base_note(inst_elem)
+        track.pitch_cents = pitch.json_cents(pitch.get_pitch_cents(inst_elem))
 
         instrument = inst_elem.find("instrument")
         if instrument is not None:

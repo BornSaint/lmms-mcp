@@ -97,10 +97,29 @@ class Track:
     instrument: str = ""
     patterns: list[Pattern] = field(default_factory=list)
     index: int = 0
+    # Tuning of an instrument track (see pitch.py): the key that sounds at
+    # the instrument's natural pitch and the fine tune in cents.
+    base_note: int = DEFAULT_BASE_NOTE
+    pitch_cents: float = 0
 
     @property
     def type_name(self) -> str:
         return self.track_type.name
+
+    @property
+    def tuned(self) -> bool:
+        """Whether the base note or the fine tune differs from the default."""
+        return self.base_note != DEFAULT_BASE_NOTE or self.pitch_cents != 0
+
+    def tuning_dict(self) -> dict:
+        """base_note, base_note_name and pitch_cents; empty at the defaults."""
+        if not self.tuned:
+            return {}
+        return {
+            "base_note": self.base_note,
+            "base_note_name": key_to_note_name(self.base_note),
+            "pitch_cents": self.pitch_cents,
+        }
 
     def to_dict(self) -> dict:
         return {
@@ -114,6 +133,7 @@ class Track:
             "panning": self.panning,
             "mixer_channel": self.mixer_channel,
             "instrument": self.instrument,
+            **self.tuning_dict(),
             "patterns": [p.to_dict() for p in self.patterns],
         }
 

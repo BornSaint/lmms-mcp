@@ -7,6 +7,7 @@ An MCP (Model Context Protocol) server for [LMMS](https://lmms.io/) - the free, 
 - **Create & save** LMMS projects (`.mmpz` compressed, `.mmp` XML)
 - **Add tracks**: Instrument, Sample, Pattern (Beat/Bassline), Automation
 - **Add notes** by LMMS key number or note name, with position, velocity, and panning
+- **Tuned samples and tracks**: set a track's base note and a fine tune in cents (`set_track_tuning`, or in the same call as `set_audiofile_sample`) so a piano sample recorded at C4 sounds at its note names
 - **Effects**: built-in effects on tracks and mixer channels (delay, reverb, EQ, dynamics...)
 - **Adapts to your LMMS**: only plugins your installed LMMS version really has are offered or accepted (see [Installed LMMS version](#installed-lmms-version))
 - **ZynAddSubFX presets**: Load any of ~950 factory instruments (.xiz), tune parameters
@@ -98,12 +99,13 @@ python -m lmms_mcp
 |------|-------------|
 | `add_instrument_track` | Add a synthesizer/sampler track |
 | `add_sample_track` | Add an audio sample track |
-| `set_audiofile_sample` | Set the sample (and amp, reverse, loop, start/end) of an `audiofileprocessor` track |
+| `set_audiofile_sample` | Set the sample (and amp, reverse, loop, start/end) of an `audiofileprocessor` track; optional `base_note` / `pitch_cents` tune it in the same call |
+| `set_track_tuning` | Tune an instrument track: `base_note` (the note a sample was recorded at, e.g. `"C4"`) and a `pitch_cents` fine tune; without arguments it returns the current tuning |
 | `add_automation_track` | Add a parameter automation track |
 | `add_pattern_track` | Add a beat/bassline pattern track |
 | `remove_track` | Remove a track by index |
-| `get_track` | Get detailed track information |
-| `list_tracks` | List all tracks with summary |
+| `get_track` | Get detailed track information (instrument tracks with a base note other than A4 or a fine tune also show `base_note`, `base_note_name`, `pitch_cents`) |
+| `list_tracks` | List all tracks with summary (same tuning fields) |
 | `set_track_volume` | Set track volume (0-200) |
 | `set_track_panning` | Set track panning (-100 to +100) |
 | `mute_track` | Mute/unmute a track |
@@ -315,7 +317,9 @@ is not corrected.
 Exceptions: `kicker` is a drum and ignores the key; `sfxr` is a
 sound-effect synth that follows the key but plays about 5.5 semitones flat
 and is silent from key 80; `audiofileprocessor` plays its sample at its
-original pitch at key 57. The default patches of `tripleoscillator` (its
+original pitch at the track's base note (key 57 until `set_track_tuning` or
+`set_audiofile_sample` says at which note the sample was recorded, see
+[Tuning a track](#tuning-a-track-base-note-and-fine-tune)). The default patches of `tripleoscillator` (its
 second and third oscillator are one and two octaves down) and `organic` (a
 partial one octave down) layer sub-octave partials on purpose: their main
 oscillator is on the key. `bitinvader` and `watsyn` start with a random
@@ -336,6 +340,58 @@ Some instruments do not play all of keys 0-108 at the right pitch.
 | `vibedstrings` | 0-78 | too quiet to hear |
 | `sfxr` | 0-78 | silent from 80 |
 | `sf2player` | depends on the soundfont (the default GM soundfont's piano is silent from about key 100) | silent |
+
+### Tuning a track: base note and fine tune
+
+`set_track_tuning(track_index, base_note, pitch_cents)` sets the two things
+LMMS stores on an instrument track to tune it (`basenote` and `pitch`
+on `<instrumenttrack>`). `set_audiofile_sample` takes the same
+`base_note` and `pitch_cents`, to set a sample and its tuning in one call.
+
+- `base_note` is the note (a name like `"C4"` or an LMMS key 0-108) at
+  which the instrument or sample sounds at its natural, recorded pitch.
+  A new track's is key 57 (A4). A piano sample recorded at C4 gets
+  `base_note="C4"`: key 48 plays it unchanged, other keys transpose it and
+  every key sounds at its note name, so no note has to be shifted by hand.
+  For synths and soundfonts (already tuned: key 57 = 440 Hz) a changed base
+  note only transposes the track: `base_note="C4"` makes key 48 sound as
+  A4. The base note you give is the user-facing one: plugins that are
+  compensated (see above) keep their compensation, so a `zynaddsubfx` track
+  at base note C4 is stored as basenote 36.
+- `pitch_cents` is a fine tune for every note (positive raises, negative
+  lowers; 100 cents = 1 semitone; -1200 to +1200). `+18` fixes a sample
+  that is 18 cents flat. LMMS limits the fine tune to 100 cents times the
+  track's `pitchrange`, so the server raises `pitchrange` to the smallest
+  whole number of semitones that covers the value (it never lowers it).
+  Measured with LMMS 1.2.2 by rendering at `-x 1`: the instruments follow
+  the fine tune within a few cents (a `tripleoscillator` sine at +50 cents
+  is 452.9 Hz, at -100 cents 415.3 Hz, at +150 cents 479.8 Hz; the same
+  holds for `audiofileprocessor`, `monstro`, `lb302`, `organic`, `sid`,
+  `sf2player` and others), except the ones in the table below, whose calls
+  are refused with a message saying what to do instead.
+
+| Instrument | Base note | Fine tune |
+|------------|-----------|-----------|
+| `zynaddsubfx` | works (keeps its compensation; the lowest base note is C1 on a default track) | only +-100 cents (LMMS sends it as a pitch bend that ZynAddSubFX always scales to +-100 cents; the pitch range stays 1) |
+| `opulenz` (`OPL2` in LMMS 1.2.x) | works | ignored |
+| `kicker` | ignores the key, so tuning is refused | refused |
+| every other instrument | works | follows it up to +-1200 cents |
+
+The response of `set_track_tuning` has `base_note` and `base_note_name`, the
+`written_basenote` stored in the project, `pitch_cents`, `pitchrange`,
+`playable_keys` when the instrument cannot play every key with this tuning,
+and a `hint` saying what the keys play now. A tuned sample keeps its tuning
+when you set another sample on the track; `set_audiofile_sample` says so
+in a `note` when it happens. Example (LMMS factory samples, pitch measured
+at `-x 1`): `instruments/piano01.ogg` is a C4, `instruments/cello01.ogg` a D3
+that is about 18 cents flat (17.4 measured) and
+`instruments/violin_pizzicato01.ogg` a G4. With the call below, key 45 (A3)
+plays the cello at 219.9 Hz and key 57 (A4) at 440.0 Hz:
+
+```
+set_audiofile_sample(0, "instruments/cello01.ogg", base_note="D3", pitch_cents=18)
+add_note_by_name(0, "A3")      # key 45: sounds at 220 Hz
+```
 
 ## Available Instruments
 
