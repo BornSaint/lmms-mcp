@@ -109,6 +109,7 @@ python -m lmms_mcp
 | `list_tracks` | List all tracks with summary (same tuning fields) |
 | `set_track_volume` | Set track volume (0-200) |
 | `set_track_panning` | Set track panning (-100 to +100) |
+| `set_track_mixer_channel` | Route an existing track to another mixer channel (the channel must exist) |
 | `mute_track` | Mute/unmute a track |
 | `solo_track` | Solo/unsolo a track |
 
@@ -126,7 +127,7 @@ python -m lmms_mcp
 |------|-------------|
 | `add_mixer_channel` | Create a new mixer channel |
 | `get_mixer_channels` | List all mixer channels |
-| `set_mixer_channel_volume` | Set channel volume |
+| `set_mixer_channel_volume` | Set channel volume (the static value, if the volume is automated) |
 | `set_mixer_channel_name` | Rename a channel |
 
 ### Song Settings
@@ -233,8 +234,27 @@ once at startup and adapts to it:
   loaded project is read in either spelling and every edit keeps the
   spelling the project already has (the two are never mixed). LMMS 1.2.x
   does not route sample tracks to a mixer channel (they always play on
-  Master), so `add_sample_track` refuses a `mixer_channel` other than 0
-  there.
+  Master), so `add_sample_track` and `set_track_mixer_channel` refuse a
+  `mixer_channel` other than 0 there.
+- **Mixer routing**: a mixer channel must exist before a track is routed to
+  it (`add_mixer_channel`); LMMS plays a track on a missing channel on
+  another one, so the tools refuse that. `load_project` under LMMS 1.2
+  converts a project that uses the 1.3 spelling (an older version of this
+  server wrote it for 1.2, where its mixer and routing did nothing) and
+  reports it as `converted_mixer`. A loaded track that is routed to a
+  missing channel is listed in `warnings`; `set_track_mixer_channel(track,
+  channel)` fixes it without removing the track.
+- **Automated values**: a parameter with an automation curve
+  (`add_automation`) is stored as a child element, which LMMS reads instead
+  of the plain attribute. `set_track_volume`, `set_track_panning`,
+  `set_mixer_channel_volume`, `mute_track`, `solo_track`, `set_tempo` and
+  the master settings change that stored value and keep the curve, and the
+  response then has `automated: true` and a `note`. The value is the static
+  one: it applies from the start of the song until the curve begins (a
+  curve starts at its first point), then the curve overrides it wherever it
+  has points, and after the last point LMMS keeps the last curve value. To
+  change the curve itself, `remove_track` its automation track and call
+  `add_automation` again.
 
 `list_available_plugins` also shows what is missing and why
 (`unavailable_in_installed_lmms`). Restart the server after installing or

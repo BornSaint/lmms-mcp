@@ -7024,7 +7024,10 @@ class TestMixerChannelMustExist:
         (warning,) = result["warnings"]
         assert "track 0 'Bass' (channel 5)" in warning
         assert "0 (Master), 1 (drums)" in warning
-        assert "add_mixer_channel" in warning and "remove_track" in warning
+        # the fix is a re-route, not removing and re-adding the track
+        assert "set_track_mixer_channel(0, 0)" in warning
+        assert "add_mixer_channel" in warning
+        assert "remove_track" not in warning
         assert "another channel" in warning
         assert srv.get_project().unroutable_tracks() == [(0, "Bass", 5)]
 
@@ -7063,9 +7066,213 @@ class TestMixerChannelMustExist:
         (warning,) = result["warnings"]
         assert "keeps its mixer channel 9" in warning
         assert "does not exist" in warning and "add_mixer_channel" in warning
+        assert "set_track_mixer_channel(0, channel)" in warning
         assert "last channel" in warning
         # a new track takes channel 0
         assert "warnings" not in lab.load(None, "TripleOscillator/Bubbles")
+
+
+# ──────────────────────────────────────────────────────────────────
+# set_track_mixer_channel: re-route a track that already exists
+# ──────────────────────────────────────────────────────────────────
+
+class TestSetTrackMixerChannel:
+    """A track on a missing channel (a loaded project, a preset) is fixed
+    by routing it to a channel that exists: no remove_track and re-add."""
+
+    @staticmethod
+    def _project(installed, version="1.2.2"):
+        """Channels 0 Master, 1 Drums, 2 Bass; track 0 'Lead' on channel 1."""
+        srv = installed(version)
+        srv.create_project()
+        srv.add_mixer_channel("Drums")
+        srv.add_mixer_channel("Bass")
+        srv.add_instrument_track("Lead", mixer_channel=1)
+        return srv
+
+    @staticmethod
+    def _lead(srv):
+        return find_tracks(srv.get_project().root)[0].find("instrumenttrack")
+
+    def test_routes_an_instrument_track(self, installed):
+        srv = self._project(installed)
+        srv.get_project()._modified = False
+        result = json.loads(srv.set_track_mixer_channel(0, 2))
+        assert result["track_index"] == 0
+        assert (result["mixer_channel"], result["previous_mixer_channel"]) == (2, 1)
+        assert result["message"] == "Routed track 0 'Lead' to mixer channel 2 (Bass)"
+        assert "error" not in result
+        assert get_track_mixer_channel(self._lead(srv)) == 2
+        assert json.loads(srv.get_track(0))["mixer_channel"] == 2
+        assert srv.get_project().modified
+        # Master and back
+        assert "error" not in json.loads(srv.set_track_mixer_channel(0, 0))
+        assert get_track_mixer_channel(self._lead(srv)) == 0
+
+    @pytest.mark.parametrize("version", ["1.2.2", "1.3.0", None])
+    def test_a_channel_the_project_lacks_is_refused(self, installed, version):
+        srv = self._project(installed, version)
+        before = srv.get_project().get_xml_string()
+        srv.get_project()._modified = False
+        result = json.loads(srv.set_track_mixer_channel(0, 5))
+        assert "Mixer channel 5 does not exist" in result["error"]
+        assert "0 (Master), 1 (Drums), 2 (Bass)" in result["error"]
+        assert "add_mixer_channel" in result["error"]
+        assert "channel 3" in result["error"]  # the next one it creates
+        assert "set_track_mixer_channel(0, channel)" in result["error"]
+        assert "plays such a track on the last channel, 2 (Bass)" in (
+            result["error"])
+        assert srv.get_project().get_xml_string() == before
+        assert not srv.get_project().modified
+        # a channel created first can be routed to
+        for _ in range(3):
+            srv.add_mixer_channel("More")
+        assert "error" not in json.loads(srv.set_track_mixer_channel(0, 5))
+        assert get_track_mixer_channel(self._lead(srv)) == 5
+
+    @pytest.mark.parametrize("channel", [-1, 3, 99])
+    def test_other_numbers_are_refused(self, installed, channel):
+        srv = self._project(installed)
+        result = json.loads(srv.set_track_mixer_channel(0, channel))
+        assert f"Mixer channel {channel} does not exist" in result["error"]
+        assert get_track_mixer_channel(self._lead(srv)) == 1
+
+    def test_bad_arguments(self, installed):
+        srv = self._project(installed)
+        assert "out of range" in json.loads(
+            srv.set_track_mixer_channel(4, 1))["error"]
+        assert "out of range" in json.loads(
+            srv.set_track_mixer_channel(-1, 1))["error"]
+        assert "must be an integer" in json.loads(
+            srv.set_track_mixer_channel(0, "1"))["error"]
+        assert "must be an integer" in json.loads(
+            srv.set_track_mixer_channel(0, True))["error"]
+        assert get_track_mixer_channel(self._lead(srv)) == 1
+
+    @pytest.mark.parametrize("version,attr", [
+        ("1.2.2", "FX_MIXER"), ("1.3.0", "MIXER"), (None, "FX_MIXER")])
+    def test_the_projects_spelling_is_kept(self, installed, version, attr):
+        from lmms_mcp import xml_parser
+        names = getattr(xml_parser, attr)
+        srv = self._project(installed, version)
+        srv.set_track_mixer_channel(0, 2)
+        assert self._lead(srv).get(names.track_attr) == "2"
+        _assert_only_spelling(srv.get_project().root, names)
+
+    def test_a_loaded_project_keeps_its_spelling_and_drops_a_leftover(
+            self, installed, tmp_path):
+        from lmms_mcp import xml_parser
+        srv = installed("1.2.2")
+        text = _mixer_project_xml(xml_parser.FX_MIXER).replace(
+            'fxch="1"', 'fxch="1" mixch="1"')  # a leftover of the 1.3 name
+        path = TestMixerNames._write(tmp_path, None, text=text)
+        assert "error" not in json.loads(srv.load_project(str(path)))
+        result = json.loads(srv.set_track_mixer_channel(0, 0))
+        assert "error" not in result
+        bass = self._lead(srv)
+        assert bass.get("fxch") == "0" and "mixch" not in bass.attrib
+
+    def test_an_automated_channel_changes_the_child_element(self, installed):
+        from lmms_mcp import xml_parser
+        srv = self._project(installed)
+        inst = self._lead(srv)
+        del inst.attrib["fxch"]
+        ET.SubElement(inst, "fxch", {"id": "77", "value": "1"})
+        srv.set_track_mixer_channel(0, 2)
+        assert inst.find("fxch").attrib == {"id": "77", "value": "2"}
+        assert "fxch" not in inst.attrib
+        assert xml_parser.get_track_mixer_channel(inst) == 2
+
+    def test_a_track_on_a_missing_channel_is_fixed_by_the_tool(
+            self, installed, tmp_path):
+        srv = installed("1.2.2")
+        path = TestMixerChannelMustExist._stale_project(tmp_path)
+        (warning,) = json.loads(srv.load_project(str(path)))["warnings"]
+        assert "set_track_mixer_channel" in warning
+        assert srv.get_project().unroutable_tracks() == [(0, "Bass", 5)]
+        result = json.loads(srv.set_track_mixer_channel(0, 1))
+        assert result["previous_mixer_channel"] == 5
+        assert srv.get_project().unroutable_tracks() == []
+
+    def test_a_pattern_track_routes_its_instruments(self, installed):
+        srv = self._project(installed)
+        srv.add_pattern_track("Beat")
+        inner = srv.get_project().root.find(".//bbtrack//instrumenttrack")
+        result = json.loads(srv.set_track_mixer_channel(1, 2))
+        assert result["message"] == (
+            "Routed every instrument of pattern track 1 'Beat' to mixer "
+            "channel 2 (Bass)")
+        assert result["routed"] == [{"name": "Beat", "previous": 0}]
+        assert get_track_mixer_channel(inner) == 2
+        assert srv.get_project().unroutable_tracks() == []
+        # the instrument track is untouched
+        assert get_track_mixer_channel(self._lead(srv)) == 1
+
+    def test_a_pattern_track_on_a_missing_channel_is_fixed(self, installed):
+        from lmms_mcp import xml_parser
+        srv = self._project(installed)
+        srv.add_pattern_track("Beat")
+        srv.get_project().root.find(".//bbtrack//instrumenttrack").set(
+            "fxch", "9")
+        assert srv.get_project().unroutable_tracks() == [(1, "Beat", 9)]
+        srv.set_track_mixer_channel(1, 0)
+        assert srv.get_project().unroutable_tracks() == []
+
+    def test_an_automation_track_has_no_channel(self, installed):
+        srv = self._project(installed)
+        srv.add_automation_track("Auto")
+        before = srv.get_project().get_xml_string()
+        result = json.loads(srv.set_track_mixer_channel(1, 1))
+        assert "automation track" in result["error"]
+        assert "no audio output" in result["error"]
+        assert srv.get_project().get_xml_string() == before
+
+    def test_sample_track_on_lmms_12(self, installed):
+        # 1.2.x sample tracks always play on Master: the same refusal as
+        # add_sample_track, and Master is accepted without a change
+        srv = self._project(installed, "1.2.2")
+        srv.add_sample_track("Loop")
+        before = srv.get_project().get_xml_string()
+        result = json.loads(srv.set_track_mixer_channel(1, 1))
+        assert "Sample tracks cannot be routed to mixer channel 1" in (
+            result["error"])
+        assert "LMMS 1.2 mixer format" in result["error"]
+        assert srv.get_project().get_xml_string() == before
+        # the refusal comes before the check of the channel
+        assert "LMMS 1.2 mixer format" in json.loads(
+            srv.set_track_mixer_channel(1, 9))["error"]
+        ok = json.loads(srv.set_track_mixer_channel(1, 0))
+        assert "error" not in ok
+        assert "nothing to change" in ok["message"]
+        assert srv.get_project().get_xml_string() == before
+        sample = find_tracks(srv.get_project().root)[1].find("sampletrack")
+        assert get_track_mixer_channel(sample) == 0
+
+    def test_sample_track_on_lmms_13(self, installed):
+        srv = self._project(installed, "1.3.0")
+        srv.add_sample_track("Loop")
+        sample = find_tracks(srv.get_project().root)[1].find("sampletrack")
+        result = json.loads(srv.set_track_mixer_channel(1, 2))
+        assert "error" not in result
+        assert result["message"] == "Routed track 1 'Loop' to mixer channel 2 (Bass)"
+        assert sample.get("mixch") == "2" and "fxch" not in sample.attrib
+        # ... but only to a channel that exists
+        assert "Mixer channel 7 does not exist" in json.loads(
+            srv.set_track_mixer_channel(1, 7))["error"]
+        assert sample.get("mixch") == "2"
+
+    def test_the_project_function_raises_for_the_same_cases(self):
+        from lmms_mcp import xml_parser
+        root = create_empty_project()
+        xml_parser.add_mixer_channel(root, "Drums")
+        add_instrument_track(root, "Lead")
+        info = xml_parser.set_track_mixer_channel(root, 0, 1)
+        assert info == {"track": "Lead", "type": "Instrument", "channel": 1,
+                        "routed": [{"name": "Lead", "previous": 0}]}
+        with pytest.raises(ValueError, match="does not exist"):
+            xml_parser.set_track_mixer_channel(root, 0, 4)
+        with pytest.raises(ValueError, match="out of range"):
+            xml_parser.set_track_mixer_channel(root, 3, 0)
 
 
 # ──────────────────────────────────────────────────────────────────
@@ -7409,3 +7616,236 @@ class TestAutomatedValues:
         channel = find_mixer_channel_element(srv.get_project().root, 1)
         assert channel.find("volume").attrib == {
             "id": "11", "value": "0.4", "scale_type": "linear"}
+
+
+class TestSettersKeepAutomatedValues:
+    """LMMS reads the child element of an automated model, not an attribute
+    of the same name (verified with LMMS 1.2.2: <vol value="0"/> beside
+    vol="100" is silent). The setters must write the child, or they change
+    nothing; the value they write is the static one, which an automation
+    curve overrides where it has points."""
+
+    # --- the shared helper -------------------------------------------
+
+    def test_set_model_value(self):
+        from lmms_mcp.xml_parser import set_model_value
+        plain = ET.fromstring('<t vol="1"/>')
+        assert set_model_value(plain, "vol", "50") is False
+        assert plain.attrib == {"vol": "50"} and len(plain) == 0
+
+        missing = ET.fromstring("<t/>")
+        assert set_model_value(missing, "vol", "50") is False
+        assert missing.attrib == {"vol": "50"}
+
+        child = ET.fromstring('<t><vol id="3" value="100" scale_type="linear"/></t>')
+        assert set_model_value(child, "vol", "50") is True
+        assert child.find("vol").attrib == {
+            "id": "3", "value": "50", "scale_type": "linear"}  # id kept
+        assert "vol" not in child.attrib  # no attribute is added
+
+        # both (an older version of this server wrote the attribute beside
+        # the child): the one LMMS reads changes, the stale one follows
+        both = ET.fromstring('<t vol="100"><vol id="3" value="0"/></t>')
+        assert set_model_value(both, "vol", "50") is True
+        assert both.get("vol") == "50" and both.find("vol").get("value") == "50"
+
+        # a child without a value is not the model's value
+        empty = ET.fromstring('<t vol="1"><vol id="3"/></t>')
+        assert set_model_value(empty, "vol", "50") is False
+        assert empty.get("vol") == "50"
+
+    def test_model_automation(self):
+        from lmms_mcp import xml_parser
+        root = create_empty_project()
+        add_instrument_track(root, "Lead")
+        inst = find_tracks(root)[0].find("instrumenttrack")
+        assert xml_parser.model_automation(root, inst, "vol") == []
+        model_id, _ = xml_parser.resolve_automation_target(root, "track", 0, "volume")
+        assert xml_parser.model_automation(root, inst, "vol") == []  # no curve yet
+        xml_parser.add_automation_curve_track(
+            root, "Swell", [(384, 100.0), (768, 50.0)], target_id=model_id)
+        xml_parser.add_automation_curve_track(
+            root, "Later", [(1152, 80.0), (1344, 60.0)], target_id=model_id)
+        xml_parser.add_automation_curve_track(  # another model's curve
+            root, "Other", [(0, 1.0), (192, 0.0)], target_id=model_id + 99)
+        assert xml_parser.model_automation(root, inst, "vol") == [
+            {"track_index": 1, "track": "Swell", "start": 384, "last_point": 768},
+            {"track_index": 2, "track": "Later", "start": 1152, "last_point": 1344},
+        ]
+        assert xml_parser.model_automation(root, inst, "pan") == []
+
+    # --- setters on a file with automated values ---------------------
+
+    @staticmethod
+    def _loaded(installed, tmp_path):
+        srv = installed("1.2.2")
+        path = TestMixerNames._write(
+            tmp_path, None, text=TestAutomatedValues._automated_xml())
+        assert "error" not in json.loads(srv.load_project(str(path)))
+        return srv
+
+    def test_track_setters_change_the_child(self, installed, tmp_path):
+        srv = self._loaded(installed, tmp_path)
+        inst = find_tracks(srv.get_project().root)[0].find("instrumenttrack")
+        for call in (srv.set_track_volume(0, 55), srv.set_track_panning(0, 15)):
+            assert "error" not in json.loads(call)
+        assert inst.find("vol").attrib["value"] == "55"
+        assert inst.find("vol").get("id") == "14"
+        assert inst.find("pan").attrib["value"] == "15"
+        assert "vol" not in inst.attrib and "pan" not in inst.attrib
+        track = json.loads(srv.get_track(0))
+        assert (track["volume"], track["panning"]) == (55, 15)
+
+        srv.mute_track(0, False)
+        srv.solo_track(0, False)
+        outer = find_tracks(srv.get_project().root)[0]
+        assert outer.find("muted").get("value") == "0"
+        assert outer.find("solo").get("value") == "0"
+        assert "muted" not in outer.attrib and "solo" not in outer.attrib
+        track = json.loads(srv.get_track(0))
+        assert (track["muted"], track["solo"]) == (False, False)
+
+    def test_mixer_channel_volume_changes_the_child(self, installed, tmp_path):
+        srv = self._loaded(installed, tmp_path)
+        assert "error" not in json.loads(srv.set_mixer_channel_volume(1, 0.3))
+        channel = find_mixer_channel_element(srv.get_project().root, 1)
+        assert channel.find("volume").attrib["value"] == "0.3"
+        assert channel.find("volume").get("id") == "11"
+        assert "volume" not in channel.attrib
+        assert json.loads(srv.get_mixer_channels())["channels"][1]["volume"] == 0.3
+        # a plain channel still gets an attribute
+        srv.set_mixer_channel_volume(0, 0.9)
+        master = find_mixer_channel_element(srv.get_project().root, 0)
+        assert master.get("volume") == "0.9" and master.find("volume") is None
+
+    def test_a_stale_attribute_beside_the_child_is_brought_in_line(
+            self, installed, tmp_path):
+        # what an older version of this server left after set_track_volume
+        # on an automated track: LMMS read the child, the attribute did nothing
+        srv = self._loaded(installed, tmp_path)
+        inst = find_tracks(srv.get_project().root)[0].find("instrumenttrack")
+        inst.set("vol", "100")
+        srv.set_track_volume(0, 40)
+        assert inst.get("vol") == "40" and inst.find("vol").get("value") == "40"
+        assert json.loads(srv.get_track(0))["volume"] == 40
+
+    def test_song_settings_change_the_child(self, installed):
+        from lmms_mcp import xml_parser
+        srv = installed("1.2.2")
+        srv.create_project()
+        for param in ("tempo", "master_volume", "master_pitch"):
+            srv.add_automation(
+                "song", param, [{"bar": 1, "value": 100}, {"bar": 2, "value": 90}])
+        srv.set_tempo(150)
+        srv.set_master_volume(60)
+        srv.set_master_pitch(-3)
+        head = xml_parser.find_head(srv.get_project().root)
+        for name, value in (("bpm", "150"), ("mastervol", "60"),
+                            ("masterpitch", "-3")):
+            assert head.find(name).get("value") == value
+            assert name not in head.attrib
+        info = json.loads(srv.get_project_info())
+        assert (info["bpm"], info["master_volume"], info["master_pitch"]) == (
+            150, 60, -3)
+        # a project without automation keeps plain attributes
+        srv.create_project()
+        srv.set_tempo(150)
+        head = xml_parser.find_head(srv.get_project().root)
+        assert head.get("bpm") == "150" and head.find("bpm") is None
+
+    # --- the response says the parameter is automated ----------------
+
+    @staticmethod
+    def _automated_track(installed, first_bar=2):
+        srv = installed("1.2.2")
+        srv.create_project()
+        srv.add_mixer_channel("Drums")
+        srv.add_instrument_track("Lead", mixer_channel=1, volume=100)
+        srv.add_automation("track", "volume", [
+            {"bar": first_bar, "value": 50}, {"bar": first_bar + 2, "value": 80}],
+            target_index=0, name="Swell")
+        return srv
+
+    def test_response_notes_an_automated_volume(self, installed):
+        srv = self._automated_track(installed)
+        result = json.loads(srv.set_track_volume(0, 30))
+        assert result["automated"] is True
+        assert result["message"] == "Set track 0 volume to 30"
+        note = result["note"]
+        assert note.startswith("Track 0's volume is automated")
+        assert "automation track 1 'Swell'" in note
+        assert "30 is its static value" in note
+        # the static value applies until the curve starts (the pattern
+        # starts at its first point), the curve overrides it from there and
+        # LMMS keeps its last value after the last point
+        assert "from the start of the song until the automation begins at bar 2" in note
+        assert "overrides it wherever it has points" in note
+        assert "after its last point, at bar 4" in note
+        assert "remove_track" in note and "add_automation" in note
+        # the static value was written
+        inst = find_tracks(srv.get_project().root)[0].find("instrumenttrack")
+        assert inst.find("vol").get("value") == "30"
+        assert json.loads(srv.get_track(0))["volume"] == 30
+        # the curve itself is untouched
+        pattern = find_tracks(srv.get_project().root)[1].find("automationpattern")
+        assert [t.get("value") for t in pattern.findall("time")] == ["50.0", "80.0"]
+
+    def test_the_note_names_the_bar_the_curve_starts_at(self, installed):
+        srv = self._automated_track(installed, first_bar=0)
+        note = json.loads(srv.set_track_panning(0, 0))
+        assert "error" not in note
+        assert "note" not in note  # panning is not the automated parameter
+        note = json.loads(srv.set_track_volume(0, 30))["note"]
+        # nothing plays before bar 0: the static value is not heard
+        assert "starts at the beginning of the song" in note
+        assert "30 (its static value) is not heard in playback" in note
+        assert "after its last point, at bar 2" in note
+
+    def test_other_automated_parameters(self, installed):
+        srv = self._automated_track(installed)
+        srv.add_automation("track", "panning", [
+            {"bar": 1, "value": -50}, {"bar": 3, "value": 50}], target_index=0)
+        srv.add_automation("mixer", "volume", [
+            {"bar": 1.5, "value": 0.5}, {"bar": 2, "value": 1.0}], target_index=1)
+        srv.add_automation("song", "tempo", [
+            {"bar": 1, "value": 120}, {"bar": 2, "value": 140}])
+        pan = json.loads(srv.set_track_panning(0, 25))
+        assert pan["automated"] and "Track 0's panning is automated" in pan["note"]
+        assert "begins at bar 1" in pan["note"]
+        mixer = json.loads(srv.set_mixer_channel_volume(1, 0.75))
+        assert mixer["automated"] is True
+        assert "Mixer channel 1's volume is automated" in mixer["note"]
+        assert "0.75 is its static value" in mixer["note"]
+        assert "begins at bar 1.5" in mixer["note"]
+        tempo = json.loads(srv.set_tempo(100))
+        assert tempo["automated"] is True
+        assert "The tempo is automated" in tempo["note"]
+        assert "100 BPM is its static value" in tempo["note"]
+
+    def test_response_has_no_note_without_automation(self, installed):
+        srv = installed("1.2.2")
+        srv.create_project()
+        srv.add_mixer_channel("Drums")
+        srv.add_instrument_track("Lead", mixer_channel=1)
+        for result in (
+            srv.set_track_volume(0, 30), srv.set_track_panning(0, 5),
+            srv.mute_track(0), srv.solo_track(0),
+            srv.set_mixer_channel_volume(1, 0.5), srv.set_tempo(100),
+            srv.set_master_volume(90), srv.set_master_pitch(1),
+        ):
+            data = json.loads(result)
+            assert set(data) == {"message"}, data
+        # a model stored as a child that no curve plays is not "automated"
+        inst = find_tracks(srv.get_project().root)[0].find("instrumenttrack")
+        del inst.attrib["vol"]
+        ET.SubElement(inst, "vol", {"id": "5", "value": "100"})
+        assert set(json.loads(srv.set_track_volume(0, 20))) == {"message"}
+        assert inst.find("vol").get("value") == "20"
+
+    def test_the_mix_note_of_a_preset_reads_an_automated_volume(self, lab):
+        lab.put("TripleOscillator/Loud.xpf", _xpf("Loud", vol=50, pan=0))
+        inst = lab.inst_track()
+        del inst.attrib["vol"]
+        ET.SubElement(inst, "vol", {"id": "5", "value": "80"})
+        result = lab.load(0, "TripleOscillator/Loud")
+        assert "volume 50 (the track keeps 80" in result["note"]

@@ -476,6 +476,7 @@ Key concepts:
 - Pattern tracks (Beat/Bassline) hold drum patterns in the song editor
 - The Mixer has channels (0=Master) where tracks route their audio; a
   channel must exist (add_mixer_channel) before a track is routed to it
+  (set_track_mixer_channel re-routes an existing track)
 - Time is measured in ticks: 192 ticks = 1 bar (4/4 time)
 - {KEY_NUMBERING_TEXT} Valid keys are {KEY_RANGE_TEXT}.
   Tools take either the key number or a note name ("C4", "Bb2").
@@ -658,7 +659,7 @@ def load_project(path: str) -> str:
     tracks, message); the file stays as it is until save_project. Nothing
     is converted when no LMMS is installed. "warnings" lists tracks routed
     to a mixer channel the project lacks (LMMS plays those on another
-    channel).
+    channel); set_track_mixer_channel routes them to a channel that exists.
 
     Args:
         path: Full path to the LMMS project file
@@ -734,15 +735,19 @@ def _unroutable_warning(proj) -> str | None:
     listed = ", ".join(
         f"track {index} '{name}' (channel {channel})"
         for index, name, channel in found)
+    many = len(found) > 1
+    next_channel = xml_parser.mixer_channel_numbers(proj.root)[-1] + 1
     return (
-        f"Misrouted in LMMS: {listed} {'is' if len(found) == 1 else 'are'} "
+        f"Misrouted in LMMS: {listed} {'are' if many else 'is'} "
         f"routed to a mixer channel the project does not have (it has "
         f"{xml_parser.describe_mixer_channels(proj.root)}), so LMMS plays "
-        f"{'it' if len(found) == 1 else 'them'} on another channel, with "
-        f"that channel's volume and effects. add_mixer_channel creates the "
-        f"next channel, so call it until the channel exists, or "
-        f"remove_track and add the track again with an existing "
-        f"mixer_channel."
+        f"{'them' if many else 'it'} on another channel, with "
+        f"that channel's volume and effects. Route "
+        f"{'each' if many else 'the track'} to a channel that exists with "
+        f"set_track_mixer_channel(track_index, mixer_channel), e.g. "
+        f"set_track_mixer_channel({found[0][0]}, 0); add_mixer_channel(name) "
+        f"first creates another channel (the next one is channel "
+        f"{next_channel})."
     )
 
 
@@ -1395,13 +1400,68 @@ def list_tracks() -> str:
     return json.dumps({"tracks": tracks, "count": len(tracks)}, indent=2)
 
 
-@mcp.tool()
-def set_track_volume(track_index: int, volume: int) -> str:
-    """Set the volume of a track.
+def _bars_text(ticks: int) -> str:
+    """A tick position as a bar number: 384 -> 'bar 2', 480 -> 'bar 2.5'."""
+    return f"bar {round(ticks / TICKS_PER_BAR, 2):g}"
 
-    Args:
-        track_index: Zero-based track index
-        volume: Volume level (0-200, 100=normal)
+
+def _automation_note(
+    proj, parent: ET.Element, name: str, what: str, value: str,
+) -> dict:
+    """The response fields for a model that was just set, or {}.
+
+    When the model `name` of `parent` is played by automation patterns the
+    value just written is its static value, not what is heard everywhere:
+    "automated": True and a "note" say where each applies. `what` names
+    the parameter ("Track 2's volume"), `value` is the value as given.
+    """
+    patterns = xml_parser.model_automation(proj.root, parent, name)
+    if not patterns:
+        return {}
+    listed = ", ".join(
+        f"automation track {p['track_index']} '{p['track']}'" for p in patterns)
+    first = min(p["start"] for p in patterns)
+    last = max(p["last_point"] for p in patterns)
+    if first <= 0:
+        timing = (
+            f"the automation starts at the beginning of the song, so "
+            f"{value} (its static value) is not heard in playback: the "
+            f"curve overrides it wherever it has points, and after its last "
+            f"point, at {_bars_text(last)}, LMMS keeps the last curve value."
+        )
+    else:
+        timing = (
+            f"{value} is its static value: it applies from the start of the "
+            f"song until the automation begins at {_bars_text(first)}. From "
+            f"there the curve overrides it wherever it has points (and "
+            f"after its last point, at {_bars_text(last)}, LMMS keeps the "
+            f"last curve value), so the curve decides what is heard there."
+        )
+    return {
+        "automated": True,
+        "note": (
+            f"{what} is automated ({listed}): {timing} To change the "
+            f"automated part, remove the automation track with remove_track "
+            f"and create the curve again with add_automation."
+        ),
+    }
+
+
+def _head_automation_note(proj, name: str, what: str, value: str) -> dict:
+    """_automation_note for a song setting (tempo, master volume/pitch)."""
+    head = xml_parser.find_head(proj.root)
+    if head is None:
+        return {}
+    return _automation_note(proj, head, name, what, value)
+
+
+def _set_track_model(
+    track_index: int, attr: str, label: str, value: int,
+) -> str:
+    """Set the volume or panning model of an instrument or sample track.
+
+    The model is written where the project stores it (attribute, or the
+    child element of an automated model, see xml_parser.set_model_value).
     """
     proj = get_project()
     from .xml_parser import find_tracks
@@ -1412,47 +1472,112 @@ def set_track_volume(track_index: int, volume: int) -> str:
     track = tracks[track_index]
     track_type = int(track.get("type", "0"))
 
+    settings = None
     if track_type == 0:
-        inst = track.find("instrumenttrack")
-        if inst is not None:
-            inst.set("vol", str(volume))
+        settings = track.find("instrumenttrack")
     elif track_type == 2:
-        samp = track.find("sampletrack")
-        if samp is not None:
-            samp.set("vol", str(volume))
+        settings = track.find("sampletrack")
+
+    result: dict = {}
+    if settings is not None:
+        xml_parser.set_model_value(settings, attr, str(value))
+        result = _automation_note(
+            proj, settings, attr, f"Track {track_index}'s {label}",
+            str(value))
 
     proj._modified = True
-    return json.dumps({"message": f"Set track {track_index} volume to {volume}"})
+    return json.dumps({
+        "message": f"Set track {track_index} {label} to {value}", **result})
+
+
+@mcp.tool()
+def set_track_volume(track_index: int, volume: int) -> str:
+    """Set the volume of a track.
+
+    If the track's volume is automated (add_automation), the value is its
+    static one: it applies until the automation curve starts, and the curve
+    overrides it wherever it has points. The response then has
+    "automated": true and a "note" saying where each applies.
+
+    Args:
+        track_index: Zero-based track index
+        volume: Volume level (0-200, 100=normal)
+    """
+    return _set_track_model(track_index, "vol", "volume", volume)
 
 
 @mcp.tool()
 def set_track_panning(track_index: int, panning: int) -> str:
     """Set the panning of a track.
 
+    If the track's panning is automated (add_automation), the value is its
+    static one: it applies until the automation curve starts, and the curve
+    overrides it wherever it has points. The response then has
+    "automated": true and a "note" saying where each applies.
+
     Args:
         track_index: Zero-based track index
         panning: Pan value (-100=left, 0=center, 100=right)
     """
+    return _set_track_model(track_index, "pan", "panning", panning)
+
+
+@mcp.tool()
+def set_track_mixer_channel(track_index: int, mixer_channel: int) -> str:
+    """Route an existing track to another mixer channel.
+
+    The channel must exist (add_mixer_channel creates one; get_mixer_channels
+    lists them): LMMS plays a track routed to a channel the project lacks
+    on another channel, so such a route is refused and nothing changes. Use
+    this to fix the "warnings" load_project or load_instrument_preset give
+    about a track on a missing channel.
+
+    It routes an instrument track, a sample track, or every instrument
+    inside a pattern track (the response lists them). LMMS 1.2.x cannot
+    route sample tracks (they always play on Master), so a sample track
+    there only accepts mixer_channel=0 (nothing to change). The channel is
+    written with the spelling the project already uses.
+
+    Args:
+        track_index: Zero-based track index
+        mixer_channel: Mixer channel number (0=Master)
+    """
     proj = get_project()
-    from .xml_parser import find_tracks
-    tracks = find_tracks(proj.root)
-    if track_index >= len(tracks):
-        return json.dumps({"error": f"Track index {track_index} out of range"})
+    error = _track_index_error(proj, track_index)
+    if error:
+        return json.dumps({"error": error})
+    if isinstance(mixer_channel, bool) or not isinstance(mixer_channel, int):
+        return json.dumps({
+            "error": f"mixer_channel must be an integer, got "
+                     f"{mixer_channel!r}."})
+    try:
+        routed = xml_parser.set_track_mixer_channel(
+            proj.root, track_index, mixer_channel)
+    except ValueError as exc:
+        return json.dumps({"error": str(exc)})
 
-    track = tracks[track_index]
-    track_type = int(track.get("type", "0"))
-
-    if track_type == 0:
-        inst = track.find("instrumenttrack")
-        if inst is not None:
-            inst.set("pan", str(panning))
-    elif track_type == 2:
-        samp = track.find("sampletrack")
-        if samp is not None:
-            samp.set("pan", str(panning))
-
-    proj._modified = True
-    return json.dumps({"message": f"Set track {track_index} panning to {panning}"})
+    channel = xml_parser.channel_label(proj.root, mixer_channel)
+    result = {
+        "track_index": track_index,
+        "mixer_channel": mixer_channel,
+        "previous_mixer_channel": (
+            routed["routed"][0]["previous"] if routed["routed"] else 0),
+    }
+    if routed["type"] == "Pattern":
+        result["routed"] = routed["routed"]
+    if routed["routed"]:
+        proj._modified = True
+        what = (
+            f"every instrument of pattern track {track_index} "
+            f"'{routed['track']}'" if routed["type"] == "Pattern"
+            else f"track {track_index} '{routed['track']}'")
+        result["message"] = f"Routed {what} to mixer channel {channel}"
+    else:
+        result["message"] = (
+            f"Track {track_index} '{routed['track']}' is a sample track: "
+            f"LMMS 1.2.x always plays those on Master (channel 0), so there "
+            f"is nothing to change")
+    return json.dumps(result)
 
 
 @mcp.tool()
@@ -1469,9 +1594,14 @@ def mute_track(track_index: int, muted: bool = True) -> str:
     if track_index >= len(tracks):
         return json.dumps({"error": f"Track index {track_index} out of range"})
 
-    tracks[track_index].set("muted", "1" if muted else "0")
+    xml_parser.set_model_value(tracks[track_index], "muted", "1" if muted else "0")
     proj._modified = True
-    return json.dumps({"message": f"Track {track_index} {'muted' if muted else 'unmuted'}"})
+    result = _automation_note(
+        proj, tracks[track_index], "muted", f"Track {track_index}'s mute",
+        "muted" if muted else "unmuted")
+    return json.dumps({
+        "message": f"Track {track_index} {'muted' if muted else 'unmuted'}",
+        **result})
 
 
 @mcp.tool()
@@ -1488,9 +1618,14 @@ def solo_track(track_index: int, solo: bool = True) -> str:
     if track_index >= len(tracks):
         return json.dumps({"error": f"Track index {track_index} out of range"})
 
-    tracks[track_index].set("solo", "1" if solo else "0")
+    xml_parser.set_model_value(tracks[track_index], "solo", "1" if solo else "0")
     proj._modified = True
-    return json.dumps({"message": f"Track {track_index} {'soloed' if solo else 'unsoloed'}"})
+    result = _automation_note(
+        proj, tracks[track_index], "solo", f"Track {track_index}'s solo",
+        "soloed" if solo else "unsoloed")
+    return json.dumps({
+        "message": f"Track {track_index} {'soloed' if solo else 'unsoloed'}",
+        **result})
 
 
 # ──────────────────────────────────────────────────────────────────
@@ -1823,6 +1958,11 @@ def get_mixer_channels() -> str:
 def set_mixer_channel_volume(channel_num: int, volume: float) -> str:
     """Set the volume of a mixer channel.
 
+    If the channel's volume is automated (add_automation), the value is
+    its static one: it applies until the automation curve starts, and the
+    curve overrides it wherever it has points. The response then has
+    "automated": true and a "note" saying where each applies.
+
     Args:
         channel_num: Channel number (0=Master)
         volume: Volume (0.0-2.0, 1.0=0dB)
@@ -1832,9 +1972,14 @@ def set_mixer_channel_volume(channel_num: int, volume: float) -> str:
     channels = find_mixer_channels(proj.root)
     for ch in channels:
         if int(ch.get("num", "-1")) == channel_num:
-            ch.set("volume", str(volume))
+            xml_parser.set_model_value(ch, "volume", str(volume))
             proj._modified = True
-            return json.dumps({"message": f"Set mixer channel {channel_num} volume to {volume}"})
+            return json.dumps({
+                "message": f"Set mixer channel {channel_num} volume to {volume}",
+                **_automation_note(
+                    proj, ch, "volume",
+                    f"Mixer channel {channel_num}'s volume", str(volume)),
+            })
     return json.dumps({"error": f"Mixer channel {channel_num} not found"})
 
 
@@ -2359,10 +2504,12 @@ def _preset_mix_note(index: int, preset, inst_track) -> str | None:
     parts = []
     for label, stored, current, tool in (
         ("volume", preset.volume,
-         int(inst_presets.number(inst_track.get("vol"), 100)),
+         int(inst_presets.number(
+             xml_parser.model_value(inst_track, "vol", "100"), 100)),
          "set_track_volume"),
         ("panning", preset.panning,
-         int(inst_presets.number(inst_track.get("pan"), 0)),
+         int(inst_presets.number(
+             xml_parser.model_value(inst_track, "pan", "0"), 0)),
          "set_track_panning"),
     ):
         if stored != current:
@@ -2513,7 +2660,7 @@ def load_instrument_preset(
         channel = xml_parser.get_track_mixer_channel(
             track.find("instrumenttrack"))
         try:
-            xml_parser.check_mixer_channel(proj.root, channel)
+            xml_parser.check_mixer_channel(proj.root, channel, track_index)
         except ValueError as exc:
             warnings.append(f"The track keeps its mixer channel {channel}. {exc}")
 
@@ -3230,7 +3377,9 @@ def add_automation(
     active from the first to the last point only: before the first point
     the parameter keeps its normal (track/mixer/song) value, and after the
     last point it stays at the last value (LMMS keeps the last automated
-    value).
+    value). The normal value stays editable afterwards: set_track_volume,
+    set_track_panning, set_mixer_channel_volume, set_tempo and the other
+    setters change it (the response says the parameter is automated).
 
     Args:
         target_type: "song", "track" or "mixer"
@@ -3300,12 +3449,20 @@ def add_automation(
 def set_tempo(bpm: int) -> str:
     """Set the song tempo (BPM).
 
+    If the tempo is automated (add_automation), the value is its static
+    one: it applies until the automation curve starts, and the curve
+    overrides it wherever it has points ("automated" and "note" in the
+    response say so).
+
     Args:
         bpm: Tempo in beats per minute (10-999)
     """
     proj = get_project()
     proj.set_tempo(bpm)
-    return json.dumps({"message": f"Tempo set to {bpm} BPM"})
+    return json.dumps({
+        "message": f"Tempo set to {bpm} BPM",
+        **_head_automation_note(proj, "bpm", "The tempo", f"{bpm} BPM"),
+    })
 
 
 @mcp.tool()
@@ -3325,24 +3482,42 @@ def set_time_signature(numerator: int, denominator: int) -> str:
 def set_master_volume(volume: int) -> str:
     """Set the master volume.
 
+    If the master volume is automated (add_automation), the value is its static
+    one: it applies until the automation curve starts, and the curve
+    overrides it wherever it has points ("automated" and "note" in the
+    response say so).
+
     Args:
         volume: Master volume (0-200, 100=normal)
     """
     proj = get_project()
     proj.set_master_volume(volume)
-    return json.dumps({"message": f"Master volume set to {volume}"})
+    return json.dumps({
+        "message": f"Master volume set to {volume}",
+        **_head_automation_note(
+            proj, "mastervol", "The master volume", str(volume)),
+    })
 
 
 @mcp.tool()
 def set_master_pitch(pitch: int) -> str:
     """Set the master pitch offset.
 
+    If the master pitch is automated (add_automation), the value is its static
+    one: it applies until the automation curve starts, and the curve
+    overrides it wherever it has points ("automated" and "note" in the
+    response say so).
+
     Args:
         pitch: Pitch offset in semitones (-12 to +12)
     """
     proj = get_project()
     proj.set_master_pitch(pitch)
-    return json.dumps({"message": f"Master pitch set to {pitch} semitones"})
+    return json.dumps({
+        "message": f"Master pitch set to {pitch} semitones",
+        **_head_automation_note(
+            proj, "masterpitch", "The master pitch", f"{pitch} semitones"),
+    })
 
 
 # ──────────────────────────────────────────────────────────────────
@@ -3811,7 +3986,7 @@ Steps:
    - FX returns (reverb, delay)
    A track can only be routed to a channel that exists, so create the
    channel first (add_mixer_channel), then add the track with that
-   mixer_channel.
+   mixer_channel (or move an existing track with set_track_mixer_channel).
 4. Adjust mixer channel volumes
 5. Save the project"""
 

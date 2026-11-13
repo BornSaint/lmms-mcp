@@ -141,11 +141,11 @@ class LMMSProject:
             head = root.find("song/head")
 
         info = SongInfo(
-            bpm=int(head.get("bpm", "140")) if head is not None else 140,
+            bpm=int(float(model_value(head, "bpm", "140"))) if head is not None else 140,
             time_sig_numerator=int(head.get("timesig_numerator", "4")) if head is not None else 4,
             time_sig_denominator=int(head.get("timesig_denominator", "4")) if head is not None else 4,
-            master_volume=int(head.get("mastervol", "100")) if head is not None else 100,
-            master_pitch=int(head.get("masterpitch", "0")) if head is not None else 0,
+            master_volume=int(float(model_value(head, "mastervol", "100"))) if head is not None else 100,
+            master_pitch=int(float(model_value(head, "masterpitch", "0"))) if head is not None else 0,
             file_path=self._path,
             modified=self._modified,
         )

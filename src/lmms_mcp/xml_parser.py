@@ -112,11 +112,15 @@ def mixer_names(root: ET.Element) -> MixerNames:
 def get_track_mixer_channel(track_settings: ET.Element) -> int:
     """The mixer channel an <instrumenttrack> or <sampletrack> plays on.
 
-    Reads either spelling (fxch or mixch); 0 (Master) when it has none.
+    Reads either spelling (fxch or mixch), and the child element LMMS
+    writes for an automated model (see model_value); 0 (Master) when it
+    has none.
     """
     for names in ALL_MIXER_NAMES:
-        if names.track_attr in track_settings.attrib:
-            return _to_int(track_settings.get(names.track_attr))
+        attr = names.track_attr
+        if attr in track_settings.attrib or model_element(
+                track_settings, attr) is not None:
+            return _to_int(model_value(track_settings, attr, "0"))
     return 0
 
 
@@ -136,7 +140,7 @@ def mixer_channel_numbers(root: ET.Element) -> list[int]:
     return sorted(numbers)
 
 
-def _channel_label(root: ET.Element, number: int) -> str:
+def channel_label(root: ET.Element, number: int) -> str:
     """A channel as text: '1 (drums)', or '2' when it has no name."""
     name = "Master" if number == 0 else ""
     for channel in find_mixer_channels(root):
@@ -149,7 +153,7 @@ def _channel_label(root: ET.Element, number: int) -> str:
 def describe_mixer_channels(root: ET.Element) -> str:
     """The channels as text, e.g. '0 (Master), 1 (drums), 2'."""
     return ", ".join(
-        _channel_label(root, n) for n in mixer_channel_numbers(root))
+        channel_label(root, n) for n in mixer_channel_numbers(root))
 
 
 def _misrouting(root: ET.Element, channel: int) -> str:
@@ -160,7 +164,7 @@ def _misrouting(root: ET.Element, channel: int) -> str:
         # volume (silent when that is 0), not a silence of its own
         return (
             f"LMMS 1.2.2 plays such a track on the last channel, "
-            f"{_channel_label(root, last)}, so it would take the volume and "
+            f"{channel_label(root, last)}, so it would take the volume and "
             f"effects of that channel instead of the one you meant (and be "
             f"silent if that channel is).")
     if channel > 0:
@@ -171,24 +175,35 @@ def _misrouting(root: ET.Element, channel: int) -> str:
     return ""
 
 
-def check_mixer_channel(root: ET.Element, channel: int) -> None:
+def check_mixer_channel(
+    root: ET.Element, channel: int, track_index: int | None = None,
+) -> None:
     """Raise ValueError unless the project has the mixer channel.
 
     LMMS does not route a track to a channel that is not in the project: it
     plays it on another one (see _misrouting), so nothing may be routed to
-    one. The message names the channels there are and how to create another.
+    one. The message names the channels there are and how to get another;
+    for a track that already exists (`track_index`) it points to
+    set_track_mixer_channel.
     """
     numbers = mixer_channel_numbers(root)
     if channel in numbers:
         return
     next_number = numbers[-1] + 1
+    if track_index is None:
+        advice = (
+            "Use one of those, or create a channel first with "
+            "add_mixer_channel(name)")
+    else:
+        advice = (
+            f"Route the track to one of those with "
+            f"set_track_mixer_channel({track_index}, channel), or create a "
+            f"channel first with add_mixer_channel(name)")
     raise ValueError(" ".join(filter(None, (
         f"Mixer channel {channel} does not exist: the project has the "
         f"channels {describe_mixer_channels(root)}.",
         _misrouting(root, channel),
-        f"Use one of those, or create a channel first with "
-        f"add_mixer_channel(name) (the next one it creates is channel "
-        f"{next_number}).",
+        f"{advice} (the next one it creates is channel {next_number}).",
     ))))
 
 
@@ -323,10 +338,77 @@ def model_value(parent: ET.Element, name: str, default: str) -> str:
     (<volume id="12" value="0.8"/>), which LMMS reads first. `default`
     when the model is not saved at all.
     """
-    child = parent.find(name)
-    if child is not None and child.get("value") is not None:
+    child = model_element(parent, name)
+    if child is not None:
         return child.get("value")
     return parent.get(name, default)
+
+
+def model_element(parent: ET.Element, name: str) -> ET.Element | None:
+    """The child element that carries the value of the model `name` on
+    `parent` (LMMS writes one for a model that is automated or
+    controlled), or None when the model is a plain attribute."""
+    child = parent.find(name)
+    if child is not None and child.get("value") is not None:
+        return child
+    return None
+
+
+def set_model_value(parent: ET.Element, name: str, value: str) -> bool:
+    """Set the LMMS model `name` saved on `parent` to `value` (file text).
+
+    A model that is automated or controlled is stored as a child element
+    (<vol id="12" value="100"/>) and LMMS reads that one, not an attribute
+    of the same name (verified with LMMS 1.2.2: with <vol value="0"/> and
+    vol="100" the track is silent), so a plain attribute write would change
+    nothing. The child's value is set, keeping its id (the automation stays
+    connected); a stale attribute of the same name, which an older version
+    of this server wrote beside the child, is brought in line. Otherwise the
+    attribute is set.
+
+    Returns True when the model is stored as a child element.
+    """
+    child = model_element(parent, name)
+    if child is None:
+        parent.set(name, value)
+        return False
+    child.set("value", value)
+    if name in parent.attrib:
+        parent.set(name, value)
+    return True
+
+
+def model_automation(
+    root: ET.Element, parent: ET.Element, name: str,
+) -> list[dict]:
+    """The automation patterns that play the model `name` of `parent`.
+
+    A model that is a child element with an id is linked to every
+    <automationpattern> of the song's automation tracks that has an
+    <object id> of it. One dict per pattern: {"track_index" (of the
+    automation track), "track" (its name), "start" (the tick the pattern
+    starts at), "last_point" (the tick of its last point)}. Empty when the
+    model is not automated.
+    """
+    child = model_element(parent, name)
+    model_id = None if child is None else child.get("id")
+    if not model_id:
+        return []
+    found = []
+    for index, track in enumerate(find_tracks(root)):
+        for pattern in track.findall("automationpattern"):
+            if not any(obj.get("id") == model_id
+                       for obj in pattern.findall("object")):
+                continue
+            start = _to_int(pattern.get("pos"))
+            points = [_to_int(t.get("pos")) for t in pattern.findall("time")]
+            found.append({
+                "track_index": index,
+                "track": get_track_name(track),
+                "start": start,
+                "last_point": start + max(points, default=0),
+            })
+    return found
 
 
 def load_project(path: str | Path) -> ET.Element:
@@ -669,6 +751,90 @@ def add_instrument_track(
     )
 
 
+def _check_sample_track_routing(names: MixerNames, mixer_channel: int) -> None:
+    """Raise ValueError for a sample track on a channel other than Master
+    when the project's LMMS cannot route sample tracks (1.2.x)."""
+    if mixer_channel and names.sample_track_attr is None:
+        raise ValueError(
+            f"Sample tracks cannot be routed to mixer channel "
+            f"{mixer_channel}: this project uses the LMMS 1.2 mixer format, "
+            f"in which sample tracks always play on Master (channel 0). "
+            f"Use mixer_channel=0, or an instrument track for sound that "
+            f"needs its own channel."
+        )
+
+
+def set_track_mixer_channel(
+    root: ET.Element, track_index: int, mixer_channel: int,
+) -> dict:
+    """Route an existing track to a mixer channel of the project.
+
+    The channel is written under the project's own spelling (fxch or
+    mixch; a leftover of the other spelling is dropped, so the two never
+    mix) and, where the track's channel is an automated model, into its
+    child element (see set_model_value). The tracks routed are an
+    instrument track, a sample track, or every instrument inside a pattern
+    track.
+
+    Raises ValueError (nothing changes) for a track index out of range, a
+    track type that has no audio output (automation ...), a channel the
+    project does not have (see check_mixer_channel) and a sample track
+    on a channel other than Master when the project's LMMS cannot route
+    sample tracks (see _check_sample_track_routing).
+
+    Returns {"track": name, "type": type name, "channel": n, "routed":
+    [{"name", "previous"}] for each track routed}; "routed" is empty for a
+    sample track on LMMS 1.2.x asked for Master (it always plays there).
+    """
+    track = find_track_element(root, track_index)
+    kind = get_track_type(track)
+    name = get_track_name(track)
+    names = mixer_names(root)
+
+    if kind == 0:
+        targets = [(name, s) for s in track.findall("instrumenttrack")]
+    elif kind == 1:
+        targets = [
+            (get_track_name(inner), s)
+            for inner in track.iter("track")
+            for s in inner.findall("instrumenttrack")
+        ]
+    elif kind == 2:
+        _check_sample_track_routing(names, mixer_channel)
+        targets = [(name, s) for s in track.findall("sampletrack")]
+    else:
+        raise ValueError(
+            f"Track {track_index} is a {track_type_name(kind).lower()} "
+            f"track, which has no audio output and so no mixer channel. "
+            f"Only instrument, sample and pattern tracks can be routed "
+            f"(list_tracks shows the types)."
+        )
+    if not targets:
+        raise ValueError(
+            f"Track {track_index} ('{name}') holds no instrument or sample "
+            f"track to route.")
+    check_mixer_channel(root, mixer_channel, track_index)
+
+    routed = []
+    for target_name, settings in targets:
+        attr = (names.track_attr if settings.tag == "instrumenttrack"
+                else names.sample_track_attr)
+        if attr is None:
+            continue  # a 1.2.x sample track always plays on Master
+        previous = get_track_mixer_channel(settings)
+        for other in ALL_MIXER_NAMES:
+            if other.track_attr != attr:
+                settings.attrib.pop(other.track_attr, None)
+        set_model_value(settings, attr, str(mixer_channel))
+        routed.append({"name": target_name, "previous": previous})
+    return {
+        "track": name,
+        "type": track_type_name(kind),
+        "channel": mixer_channel,
+        "routed": routed,
+    }
+
+
 def add_sample_track(
     root: ET.Element,
     name: str,
@@ -685,14 +851,7 @@ def add_sample_track(
     track on another channel).
     """
     names = mixer_names(root)
-    if mixer_channel and names.sample_track_attr is None:
-        raise ValueError(
-            f"Sample tracks cannot be routed to mixer channel "
-            f"{mixer_channel}: this project uses the LMMS 1.2 mixer format, "
-            f"in which sample tracks always play on Master (channel 0). "
-            f"Use mixer_channel=0, or an instrument track for sound that "
-            f"needs its own channel."
-        )
+    _check_sample_track_routing(names, mixer_channel)
     check_mixer_channel(root, mixer_channel)
     song = root.find("song")
     container = song.find("trackcontainer[@type='song']")
@@ -920,13 +1079,20 @@ def add_mixer_channel(
     return channel
 
 
-def set_head_attribute(root: ET.Element, attr: str, value: str) -> None:
-    """Set an attribute on the <head> element."""
+def find_head(root: ET.Element) -> ET.Element | None:
+    """The project's <head> element (song settings: tempo, master ...)."""
     head = root.find("song/head")
     if head is None:
         head = root.find("head")
+    return head
+
+
+def set_head_attribute(root: ET.Element, attr: str, value: str) -> None:
+    """Set a song setting on the <head> element (the child element that
+    carries its value when it is automated, see set_model_value)."""
+    head = find_head(root)
     if head is not None:
-        head.set(attr, value)
+        set_model_value(head, attr, value)
 
 
 # ──────────────────────────────────────────────────────────────────
