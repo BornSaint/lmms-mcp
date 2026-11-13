@@ -54,7 +54,12 @@ BURIED_TARGET_DB = 12.0
 # not more than CONTRIBUTOR_DB below it (the MAX_CONTRIBUTORS loudest). The
 # suggested fix lowers one of them so the mix peak lands at PEAK_TARGET_DBFS
 # (a track is lowered by at most 1 / MIN_FACTOR, 20 dB).
-PEAK_NEAR_DBFS = -1.0
+# PEAK_NEAR_DBFS is above the -1 dBFS peak render_project's auto_fix_clipping
+# leaves (server._RENDER_TARGET_PEAK_DB, +-0.1 dB of measuring): a mix that was
+# just fixed is correct and must not be flagged, so the flag is for a mix that
+# clips or is within 0.5 dB of full scale. PEAK_TARGET_DBFS is below that fix
+# target, so a mix lowered as suggested is not flagged either.
+PEAK_NEAR_DBFS = -0.5
 PEAK_TARGET_DBFS = -2.0
 PEAK_WINDOW_S = 0.025
 CONTRIBUTOR_DB = 12.0

@@ -667,7 +667,7 @@ class TestFlagsEndToEnd:
         assert snare["gain_db"] is None
         assert flag["master_suggestion"].startswith(
             "to bring the peak to -2 dBFS: set_mixer_channel_volume(0, 0.")
-        # Lowering the Kick as suggested brings the peak under -1 dBFS.
+        # Lowering the Kick as suggested brings the peak to -2 dBFS.
         srv.set_track_volume(0, round(100 * factor))
         assert flags(analyze(srv), "peak_contributors") == []
 
@@ -680,6 +680,53 @@ class TestFlagsEndToEnd:
                                         {"name": "loud", "bars": [4, 8]}])
         assert [f["section"] for f in flags(result, "peak_contributors")] == [
             "loud"]
+
+    @pytest.mark.parametrize("peak_db", [-1.1, -1.0, -0.9, -0.6])
+    def test_a_mix_at_the_auto_fix_target_has_no_peak_flag(
+            self, monkeypatch, tmp_path, peak_db):
+        # render_project's auto_fix_clipping leaves the peak at -1 dBFS (+-0.1):
+        # that mix is correct and analyze_mix must not send the agent to fix it
+        amp = 10 ** (peak_db / 20)
+        signals = {"Kick": tone(250, amp * 0.6, 8),
+                   "Snare": tone(250, amp * 0.4, 8)}
+        srv, _, _ = setup(monkeypatch, tmp_path, signals)
+        result = analyze(srv)
+        assert result["mix"]["peak_dbfs"] == pytest.approx(peak_db, abs=0.05)
+        assert flags(result, "peak_contributors") == []
+        assert result["flags"] == []
+
+    @pytest.mark.parametrize("peak_db", [-0.4, 0.0, 2.0])
+    def test_a_mix_at_or_over_full_scale_has_the_peak_flag(
+            self, monkeypatch, tmp_path, peak_db):
+        amp = 10 ** (peak_db / 20)
+        signals = {"Kick": tone(250, amp * 0.6, 8),
+                   "Snare": tone(250, amp * 0.4, 8)}
+        srv, _, _ = setup(monkeypatch, tmp_path, signals)
+        result = analyze(srv, sections=[{"name": "all", "bars": [0, 8]}])
+        [flag] = flags(result, "peak_contributors")
+        assert flag["mix_peak_dbfs"] == pytest.approx(peak_db, abs=0.05)
+
+    def test_a_mix_that_render_project_fixed_is_not_flagged(
+            self, monkeypatch, tmp_path):
+        # clipping mix: peak 1.25 (+1.9 dBFS)
+        signals = {"Kick": tone(250, 0.8, 8), "Snare": tone(250, 0.45, 8)}
+        srv, proj, _ = setup(monkeypatch, tmp_path, signals)
+        assert flags(analyze(srv), "peak_contributors")
+        # what render_project's auto_fix_clipping does: Master volume down to
+        # a -1 dBFS peak
+        gain = audio_analysis.from_db(srv._RENDER_TARGET_PEAK_DB - db(1.25))
+        xml_parser.scale_master_volume(proj.root, gain)
+        result = analyze(srv)
+        assert result["mix"]["peak_dbfs"] == pytest.approx(-1.0, abs=0.1)
+        assert result["flags"] == []
+
+    def test_the_peak_flag_thresholds_agree_with_render_project(self):
+        from lmms_mcp import server as srv
+        # the flag starts above the fix target (its measuring error, 0.1 dB,
+        # included) and a suggested peak is below that target
+        assert mix_analysis.PEAK_NEAR_DBFS >= srv._RENDER_TARGET_PEAK_DB + 0.4
+        assert mix_analysis.PEAK_NEAR_DBFS < 0.0
+        assert mix_analysis.PEAK_TARGET_DBFS < srv._RENDER_TARGET_PEAK_DB
 
     def test_a_balanced_mix_has_no_flags(self, monkeypatch, tmp_path):
         signals = {"A": tone(250, 0.1, 8), "B": tone(500, 0.1, 8),

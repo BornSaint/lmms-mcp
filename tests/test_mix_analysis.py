@@ -580,6 +580,17 @@ class TestPeakContributors:
         assert probes[0].seconds == 1.5
         assert probes[0].peak == pytest.approx(near, rel=0.01)
 
+    def test_find_probes_ignores_a_mix_fixed_to_minus_one(self):
+        # render_project's auto_fix_clipping leaves a peak of -1 dBFS (+-0.1)
+        for peak_db, probes in ((-1.1, 0), (-1.0, 0), (-0.9, 0), (-0.45, 1),
+                                (0.5, 1)):
+            audio = aa.Audio(1000, 1, __import__("array").array(
+                "f", [0.1] * 1000))
+            audio.samples[500] = 10 ** (peak_db / 20)
+            mix_bars = aa.bar_stats(audio, 1.0)
+            found = ma.find_probes(audio, 1.0, [Section("a", 0, 1)], mix_bars)
+            assert len(found) == probes, peak_db
+
     def test_no_probe_no_flag(self):
         tracks = [stem("Kick", -20, 4, index=0)]
         result = ma.analyze_balance(

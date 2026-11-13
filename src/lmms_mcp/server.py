@@ -602,14 +602,19 @@ is compensated for you."""
     )
 
     blocks.append(
-        "Loudness: instruments differ by 30 dB or more, so set track "
-        "volumes before the first render. Adding an instrument track and "
-        "every tool that gives it a sound (a preset, a sample, a "
-        "soundfont) return level_at_vol_100, how loud that sound is at "
-        "track volume 100 in dBFS (volume V changes it by 20*log10(V/100) "
-        "dB), and get_project_info estimates the mix peak "
-        "(estimated_mix_peak_dbfs) from them, so a peak above 0 can be "
-        "fixed with set_track_volume before rendering."
+        "Mixing: instruments differ by 30 dB or more, so a track added "
+        "without `volume` gets one chosen from how loud its sound is "
+        "(level_at_vol_100, in dBFS at volume 100; the response has "
+        "volume and volume_chosen); a volume you set is never changed. "
+        "Keep headroom: aim for a pre-master mix peak around -6 dBFS. N "
+        "tracks that sound together add about 10*log10(N) dB (power), up "
+        "to 20*log10(N) dB when they hit on the same beat; volume V "
+        "changes a level by 20*log10(V/100) dB. Workflow: 1) add tracks "
+        "and sounds, 2) add notes, 3) get_project_info: "
+        "estimated_mix_peak_dbfs, fixed with set_track_volume before "
+        "rendering, 4) render_project (it lowers a clipping Master volume "
+        "and returns levels), then analyze_mix to find buried or dominant "
+        "tracks."
     )
 
     blocks.append(
@@ -1230,14 +1235,15 @@ def _render_for_levels(project_path: Path, output: Path) -> None:
 
 def _add_level(
     result: dict, proj, inst_track: ET.Element | None, measure: bool = True,
-) -> None:
+) -> levels.Level | None:
     """Add "level_at_vol_100" to a tool response: how loud the track's sound
     is at track volume 100, from the seed, the cache or (when `measure`, the
     first time, about 1 s) a render of the sound. When it cannot be measured
     (no LMMS, a timeout, a silent sound) the field is left out and a short
-    "note" says why: a level never makes the tool fail."""
+    "note" says why: a level never makes the tool fail. Returns the level
+    (None when unknown)."""
     if inst_track is None:
-        return
+        return None
     try:
         found = levels.resolve_level(
             inst_track, _availability.version, proj.level_table,
@@ -1247,10 +1253,51 @@ def _add_level(
                 f"render_project shows how loud it is.")
         result["note"] = f"{result['note']} {note}" if result.get("note") \
             else note
+        return None
+    if found is None:
+        return None
+    level, source = found
+    result["level_at_vol_100"] = level.to_dict(source)
+    return level
+
+
+def _choose_volume(
+    result: dict, proj, track_index: int, inst_track: ET.Element,
+    level: levels.Level | None, fallback: int = levels.DEFAULT_VOLUME,
+    new_track: bool = False,
+) -> None:
+    """Set the volume of a track whose volume the agent did not give, from
+    the level of its sound (levels.auto_volume), and say so in the response:
+    "volume" and "volume_chosen". `fallback` is the volume when the level is
+    not known yet (a sampler without its file, no LMMS to measure with). A
+    track whose volume the agent set (or whose volume is automated) is left
+    alone and the response says nothing about its volume. A track that
+    already had a volume gets "(was N)" in the text when it changes."""
+    if inst_track is None or not proj.volume_is_default(track_index):
         return
-    if found is not None:
-        level, source = found
-        result["level_at_vol_100"] = level.to_dict(source)
+    if xml_parser.model_automation(proj.root, inst_track, "vol"):
+        proj.mark_default_volume(track_index, False)
+        return
+    before = int(inst_presets.number(
+        xml_parser.model_value(inst_track, "vol", "100"), 100))
+    if level is None:
+        volume = fallback
+        if volume == before and not new_track:
+            return     # nothing changed, and the level's own note says why
+        text = (
+            f"default {fallback}: the level of this sound is not known "
+            f"yet; the volume is chosen when a tool gives the track a "
+            f"sound (a sample, a file, a preset)")
+    else:
+        auto = levels.auto_volume(level)
+        volume, text = auto.volume, auto.text
+    if volume != before:
+        xml_parser.set_model_value(inst_track, "vol", str(volume))
+        proj._modified = True
+        if not new_track:
+            text += f" (was {before})"
+    result["volume"] = volume
+    result["volume_chosen"] = text
 
 
 def _project_levels(proj, inst_track: ET.Element) -> levels.Level | None:
@@ -1261,8 +1308,8 @@ def _project_levels(proj, inst_track: ET.Element) -> levels.Level | None:
 
 
 def _add_instrument(
-    proj, name: str, instrument: str, av, mixer_channel: int, volume: int,
-    panning: int, custom: bool = False,
+    proj, name: str, instrument: str, av, mixer_channel: int,
+    volume: int | None, panning: int, custom: bool = False,
 ) -> dict:
     """Add an instrument track using the plugin name LMMS actually loads.
 
@@ -1271,6 +1318,10 @@ def _add_instrument(
     server offers: opulenz is OPL2 and freeboy is papu in LMMS 1.2. The
     result reports the offered name as "instrument" and, when it differs,
     the name written into the project as "lmms_plugin".
+
+    volume None means the agent gave none: the volume is chosen from the
+    level of the sound (_choose_volume) and again whenever a later tool
+    gives the track another sound, until set_track_volume sets it.
     """
     plugin = av.plugin_name(instrument)
     try:
@@ -1278,7 +1329,7 @@ def _add_instrument(
             "instrument", name,
             instrument=plugin,
             mixer_channel=mixer_channel,
-            volume=volume,
+            volume=levels.DEFAULT_VOLUME if volume is None else volume,
             panning=panning,
         )
     except ValueError as exc:  # a mixer channel the project lacks
@@ -1302,8 +1353,15 @@ def _add_instrument(
     # The seed (or the cache) answers; a plugin without a seed (another LMMS
     # version) is rendered once. A custom plugin is never rendered here: an
     # unknown plugin could take the whole timeout.
-    _add_level(result, proj, proj._instrument_track_element(
-        result["track_index"]), measure=not custom)
+    index = result["track_index"]
+    inst_track = proj._instrument_track_element(index)
+    level = _add_level(result, proj, inst_track, measure=not custom)
+    if volume is None:
+        proj.mark_default_volume(index)
+        _choose_volume(result, proj, index, inst_track, level, new_track=True)
+    else:
+        result["volume"] = volume
+        result["volume_chosen"] = "explicit"
     return result
 
 
@@ -1357,7 +1415,7 @@ def add_instrument_track(
     name: str,
     instrument: str = "tripleoscillator",
     mixer_channel: int = 0,
-    volume: int = 100,
+    volume: int | None = None,
     panning: int = 0,
 ) -> str:
     """Add an instrument track to the project.
@@ -1371,8 +1429,24 @@ def add_instrument_track(
             The channel must exist (create it with add_mixer_channel
             first): LMMS would play a track routed to a missing channel on
             another one, so such a call is refused.
-        volume: Track volume (0-200, 100=normal)
+        volume: Track volume (0-200, 100=normal). Omit it and the server
+            chooses the volume from how loud the instrument is (see
+            Volume below); a volume you give is never changed by the server.
         panning: Track panning (-100 to +100, 0=center)
+
+    Volume: without `volume` the server chooses it from how loud the sound
+    is, and the response has "volume" and "volume_chosen" (e.g. "auto: RMS
+    target -30 dBFS (level_at_vol_100 rms -15 dB -> 18)"): the volume that
+    puts the sound's RMS at -30 dBFS and one note's peak at -5 dBFS at the
+    most, within 10-200 (the instruments differ by 30 dB or more and the
+    peaks of 6 tracks add up to about 12 dB over one, so 6-8 tracks at
+    volume 100 clip by 7-12 dB; at the chosen volumes they land near
+    0 dBFS). When 200 is not enough (quiet ZynAddSubFX basses, soundfont
+    pianos) "volume_chosen" says by how much. A track whose sound is not
+    known yet (a sampler without its file) has 100 until a tool gives it a
+    sound (a sample, a file, a preset); the volume is then chosen again and
+    the response says so. A volume you pass here, or set with
+    set_track_volume, is never changed.
 
     The response reports "instrument" (the name you gave). When the
     installed LMMS knows that plugin under another name, it also reports
@@ -1538,7 +1612,10 @@ def set_audiofile_sample(
     Loudness: the response has "level_at_vol_100", how loud the sample is
     at track volume 100 in dBFS (see add_instrument_track). The first time
     a sample is set it is measured with a short render (about 1 s) and
-    cached, so choose the track volume by it, not by trial renders.
+    cached, so choose the track volume by it, not by trial renders. When the
+    track's volume was never given (add_instrument_track without `volume`,
+    no set_track_volume since) it is chosen from this level now and the
+    response has "volume" and "volume_chosen"; a volume you set is kept.
 
     Args:
         track_index: Zero-based index of the audiofileprocessor track
@@ -1597,7 +1674,9 @@ def set_audiofile_sample(
                 f"pitch_cents=0)."
             )
     # a sample that was not found plays nothing: nothing to measure
-    _add_level(result, proj, inst_track, measure="warning" not in result)
+    level = _add_level(
+        result, proj, inst_track, measure="warning" not in result)
+    _choose_volume(result, proj, track_index, inst_track, level)
     return json.dumps(result)
 
 
@@ -1626,7 +1705,8 @@ def set_instrument_file(
     The response has "level_at_vol_100", how loud this sound is at track
     volume 100 in dBFS (see add_instrument_track); the first time a
     file/bank/patch is used it is measured with a short render (about 1 s)
-    and cached.
+    and cached. A track whose volume was never given gets its volume chosen
+    from it ("volume", "volume_chosen"; see add_instrument_track).
 
     Args:
         track_index: Zero-based index of the instrument track
@@ -1661,7 +1741,9 @@ def set_instrument_file(
         "message": f"Set {Path(info['file']).name}{sound} on "
                    f"{info['instrument']} track {track_index}",
     }
-    _add_level(result, proj, proj._instrument_track_element(track_index))
+    inst_track = proj._instrument_track_element(track_index)
+    level = _add_level(result, proj, inst_track)
+    _choose_volume(result, proj, track_index, inst_track, level)
     return json.dumps(result)
 
 
@@ -1956,6 +2038,8 @@ def _set_track_model(
     result: dict = {}
     if settings is not None:
         xml_parser.set_model_value(settings, attr, str(value))
+        if attr == "vol":
+            proj.mark_default_volume(track_index, False)
         result = _automation_note(
             proj, settings, attr, f"Track {track_index}'s {label}",
             str(value))
@@ -1968,6 +2052,10 @@ def _set_track_model(
 @_tool
 def set_track_volume(track_index: int, volume: int) -> str:
     """Set the volume of a track.
+
+    From now on the server keeps this volume: it no longer chooses the
+    track's volume when a preset or sample is loaded into it (see
+    add_instrument_track).
 
     If the track's volume is automated (add_automation), the value is its
     static one: it applies until the automation curve starts, and the curve
@@ -2745,7 +2833,9 @@ def load_zyn_preset(track_index: int, preset: str) -> str:
     Loudness: the response has "level_at_vol_100", the peak of a note and
     of a chord and the RMS of this sound at track volume 100 in dBFS (see
     add_instrument_track); the first time a preset is used it is measured
-    with a short render (about 1 s) and cached.
+    with a short render (about 1 s) and cached. A track whose volume was
+    never given gets its volume chosen from it ("volume", "volume_chosen";
+    see add_instrument_track).
 
     Args:
         track_index: Index of the target track
@@ -2809,7 +2899,9 @@ def load_zyn_preset(track_index: int, preset: str) -> str:
         )
     if notes:
         response["note"] = " ".join(notes)
-    _add_level(response, proj, proj._instrument_track_element(track_index))
+    inst_track = proj._instrument_track_element(track_index)
+    level = _add_level(response, proj, inst_track)
+    _choose_volume(response, proj, track_index, inst_track, level)
     return json.dumps(response)
 
 
@@ -2980,9 +3072,12 @@ def _install_preset(inst_track, preset, plugin: str, instrument: str):
     return new, replaced, kept, note
 
 
-def _preset_mix_note(index: int, preset, inst_track) -> str | None:
+def _preset_mix_note(
+    index: int, preset, inst_track, volume: bool = True,
+) -> str | None:
     """Sentence saying the preset was saved with another volume / panning
-    than the track that keeps its own."""
+    than the track that keeps its own (`volume` False: the volume is not
+    compared, the server chooses it)."""
     parts = []
     for label, stored, current, tool in (
         ("volume", preset.volume,
@@ -2994,6 +3089,8 @@ def _preset_mix_note(index: int, preset, inst_track) -> str | None:
              xml_parser.model_value(inst_track, "pan", "0"), 0)),
          "set_track_panning"),
     ):
+        if label == "volume" and not volume:
+            continue
         if stored != current:
             parts.append(
                 f"{label} {stored} (the track keeps {current}; "
@@ -3033,7 +3130,12 @@ def load_instrument_preset(
     (rename=True, or `name`, sets it; a preset with another volume or
     panning than the track is reported, the track keeps its own), mute and
     solo, mixer channel and MIDI port. A new track takes the preset's
-    volume and panning.
+    panning; its volume is chosen from the level of the sound like that of
+    add_instrument_track without `volume` ("volume", "volume_chosen"; the
+    preset's own volume is used only when the level is unknown). An existing
+    track whose volume was never given (add_instrument_track without
+    `volume`, no set_track_volume since) has its volume chosen again for the
+    new sound, and the response says so; a volume you set is kept.
 
     The preset's tuning is stored as the author heard it in LMMS and
     returned as "tuning" with a "hint" saying which key sounds at the
@@ -3152,6 +3254,7 @@ def load_instrument_preset(
             warnings.append(f"The track keeps its mixer channel {channel}. {exc}")
 
     created = track is None
+    volume_chosen = not created and proj.volume_is_default(track_index)
     if created:
         track_name = name or loaded.name
         volume = max(0, min(200, loaded.volume))
@@ -3184,11 +3287,13 @@ def load_instrument_preset(
 
     notes = [note] if note else []
     if not created:
-        mix = _preset_mix_note(track_index, loaded, inst_track)
+        mix = _preset_mix_note(
+            track_index, loaded, inst_track, volume=not volume_chosen)
         if mix:
             notes.append(mix)
         kept = ["notes", "name" if not renamed else None,
-                "volume", "panning", "mixer channel", *kept]
+                "volume" if not volume_chosen else None,
+                "panning", "mixer channel", *kept]
         kept = [k for k in kept if k]
     else:
         kept = []
@@ -3236,7 +3341,14 @@ def load_instrument_preset(
         + (f"into a new track {track_index}" if created
            else f"into track {track_index}")
     )
-    _add_level(result, proj, new)
+    if created:
+        proj.mark_default_volume(track_index)
+    level = _add_level(result, proj, new)
+    _choose_volume(
+        result, proj, track_index, new, level,
+        fallback=max(0, min(200, loaded.volume)), new_track=created)
+    if volume_chosen and "volume_chosen" not in result and "kept" in result:
+        result["kept"].insert(result["kept"].index("panning"), "volume")
     return json.dumps(result)
 
 
@@ -3966,7 +4078,8 @@ def analyze_mix(
       "gain_db" is sized for; a volume change applies to the whole song (to
       change one section only, use add_automation with target_type "track"
       and param "volume"). "peak_contributors": a section whose mix peak is
-      at or above -1 dBFS, with the "contributors" (up to 4 tracks whose own
+      at or above -0.5 dBFS (not the -1 dBFS render_project fixes a clip
+      to: that mix is fine), with the "contributors" (up to 4 tracks whose own
       peak within 25 ms of the mix's peak is within 12 dB of it), the "gain_db"
       that lowers each one so the peak is at -2 dBFS, and a
       "master_suggestion" that does it with the Master volume instead.

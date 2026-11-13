@@ -39,6 +39,11 @@ used).
 
 Nothing here is written into the project file: LMMS must not see
 attributes it does not know.
+
+The track volume of a new track follows from its level (auto_volume): a
+track the agent gives no volume gets the volume that puts its sound at a
+fixed loudness, so a mix of 6 to 8 tracks lands near 0 dBFS before any
+volume is touched.
 """
 
 from __future__ import annotations
@@ -133,6 +138,124 @@ class Level:
 
 def _round(db: float) -> float:
     return round(db, 1) + 0.0
+
+
+# ──────────────────────────────────────────────────────────────────
+# THE AUTOMATIC TRACK VOLUME
+# ──────────────────────────────────────────────────────────────────
+
+# A track whose volume the agent did not give gets the volume that puts its
+# sound at AUTO_RMS_TARGET_DBFS (the rms_dbfs of its level: the RMS while one
+# note is held, the quantity an ear and analyze_mix compare), but not so loud
+# that one note peaks above AUTO_PEAK_LIMIT_DBFS (a drum sample is -23 to
+# -29 dB RMS at a 0 dBFS peak, so the RMS alone would put its peak at or
+# above 0 dBFS). The two numbers were measured, not guessed: 7 test songs of
+# 3 to 10 tracks (13 drum samples and 16 synth, soundfont and ZynAddSubFX
+# sounds: kick, snare, hat, clap, bass, keys, lead, pad; 16 bars at 120 bpm)
+# were rendered one track at a time at volume 100 and mixed again with each
+# rule (the mix is a plain sum of the tracks times their volumes, so this is
+# exact), and the mix peak and the analyze_mix flags (dominant, buried) were
+# read each time:
+#
+#   RMS target, peak limit   mix peak, 3-8 tracks      10 tracks   flags (7
+#   (dBFS)                   (6 songs, dBFS)           (dBFS)      songs)
+#   -20, none                -2.1 .. +12.4             +15.2       4
+#   -24, none                -6.1 .. +9.6              +14.6       9
+#   -28, -5                  -10.1 .. +3.5             +5.9        2
+#   -30, -5  (chosen)        -11.9 .. +3.2             +4.8        1
+#   -32, -5                  -12.6 .. +2.1             +3.9        4
+#   -30, none                -11.9 .. +3.9             +8.6        6
+#   -30, -6                  -11.9 .. +2.5             +4.3        1
+#   -30, -8                  -11.9 .. +1.0             +3.3        4
+#
+# Why -30 and not the -20 dBFS a track has in a finished mix: the RMS of a
+# note is far from the RMS of a track that plays it (eighth notes and 3-note
+# chords are 3 to 8 dB louder than the one note), and the peaks of N tracks
+# that play together add up (+11.7 dB for 6 equal ones, the midpoint of the
+# power and amplitude sums), so -20 puts 6 tracks 10 dB over full scale.
+# -30 puts 6 to 8 tracks at -1 .. +3.2 dBFS and -16 to -18 dBFS RMS, a normal
+# level before mastering; render_project lowers what is left. The peak limit
+# keeps the drum samples from setting the mix peak (a hat is -29 dB RMS at a
+# 0 dBFS peak, so the RMS target alone leaves it at -1.3 dBFS and the kick,
+# snare, hat and clap that play together add up), but -8 buries snares and
+# claps (more than 15 dB below the mix). -6 and -5 have the same flags
+# offline and -6 peaks 0.2 to 0.7 dB lower; -5 is used because in the real
+# end-to-end song with the quietest snare sample (-31 dB RMS) -6 left the
+# snare 15.0 dB below the mix (flagged), and -5 puts it 1 dB louder.
+AUTO_RMS_TARGET_DBFS = -30.0
+AUTO_PEAK_LIMIT_DBFS = -5.0
+# The automatic volume stays in this range (set_track_volume still takes
+# 0-200): above 200 the mixer has no more gain, and below 10 a sound is
+# 20 dB under what it sounds at 100, which is a track the agent should
+# decide about (the response says so).
+AUTO_VOLUME_MIN = 10
+AUTO_VOLUME_MAX = 200
+# What a track has when its level is not known (the plain default).
+DEFAULT_VOLUME = 100
+
+
+def _volume_db(volume: int) -> float:
+    return 20.0 * math.log10(volume / 100.0)
+
+
+@dataclass(frozen=True)
+class AutoVolume:
+    """The volume chosen for a sound, and why (`text` is for the response).
+    `limit` is "rms" or "peak" (what set the volume), `clamped` is "min" or
+    "max" when the range of AUTO_VOLUME_* cut it, and `off_db` is how far the
+    sound lands from what the rule wanted then (positive: below it, at the
+    maximum; negative: above it, at the minimum; 0 when not clamped)."""
+
+    volume: int
+    limit: str
+    clamped: str | None
+    off_db: float
+    text: str
+
+
+def auto_volume(level: Level) -> AutoVolume:
+    """The track volume (0-200) for a sound of this level: the sound at
+    AUTO_RMS_TARGET_DBFS RMS, one note peaking at most at
+    AUTO_PEAK_LIMIT_DBFS, within AUTO_VOLUME_MIN..AUTO_VOLUME_MAX. See the
+    comment above for how the numbers were chosen."""
+    by_rms = AUTO_RMS_TARGET_DBFS - level.rms_dbfs
+    by_peak = AUTO_PEAK_LIMIT_DBFS - level.note_peak_dbfs
+    limit = "rms" if by_rms <= by_peak else "peak"
+    wanted = 100.0 * 10 ** (min(by_rms, by_peak) / 20.0)
+    volume = int(round(wanted))
+    clamped = None
+    off_db = 0.0
+    if volume > AUTO_VOLUME_MAX:
+        volume, clamped = AUTO_VOLUME_MAX, "max"
+    elif volume < AUTO_VOLUME_MIN:
+        volume, clamped = AUTO_VOLUME_MIN, "min"
+    gain = _volume_db(volume)
+    rms_at = level.rms_dbfs + gain
+    peak_at = level.note_peak_dbfs + gain
+    if clamped:
+        # distance from the limit that wanted more (max) or less (min)
+        off_db = _round((AUTO_RMS_TARGET_DBFS - rms_at) if limit == "rms"
+                        else (AUTO_PEAK_LIMIT_DBFS - peak_at))
+    if limit == "rms":
+        rule = (f"RMS target {AUTO_RMS_TARGET_DBFS:g} dBFS (level_at_vol_100 "
+                f"rms {level.rms_dbfs:g} dB")
+    else:
+        rule = (f"note peak limit {AUTO_PEAK_LIMIT_DBFS:g} dBFS "
+                f"(level_at_vol_100 note_peak {level.note_peak_dbfs:g} dB")
+    text = f"auto: {rule} -> {volume})"
+    if clamped == "max":
+        text += (
+            f". Volume {AUTO_VOLUME_MAX} (+6 dB) is the most the mixer "
+            f"gives and this sound stays {abs(off_db):.0f} dB below that "
+            f"target (rms {_round(rms_at):g} dBFS), so it will sit low in "
+            f"the mix; raise the note velocities (up to 200) or lower the "
+            f"other tracks.")
+    elif clamped == "min":
+        text += (
+            f". Volume {AUTO_VOLUME_MIN} is the lowest the automatic "
+            f"choice sets and this sound is still {abs(off_db):.0f} dB "
+            f"above that target; set_track_volume goes lower.")
+    return AutoVolume(volume, limit, clamped, off_db, text)
 
 
 # ──────────────────────────────────────────────────────────────────

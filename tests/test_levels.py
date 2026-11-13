@@ -1105,7 +1105,7 @@ class TestEstimate:
 
     def test_the_tool_uses_measured_levels_and_lists_unknown_ones(self, lab):
         lab.fake.amplitudes = {"tripleoscillator": (0.1, 0.2)}
-        lab.add()
+        lab.add(volume=100)
         lab.add("watsyn")
         for index in (0, 1):
             lab.srv.add_note(index, 57, 0, 48, 100)
@@ -1121,6 +1121,351 @@ class TestEstimate:
         assert not any(k in info for k in (
             "estimated_mix_peak_dbfs", "estimate_range_dbfs",
             "estimate_basis", "unknown_level_tracks"))
+
+
+# ──────────────────────────────────────────────────────────────────
+# the automatic track volume
+# ──────────────────────────────────────────────────────────────────
+
+
+def vol_of(lab, index=0):
+    return int(float(xml_parser.model_value(lab.inst(index), "vol", "100")))
+
+
+def chosen(result):
+    """What levels.auto_volume says about the level a response reports."""
+    return levels.auto_volume(Level.from_dict(result["level_at_vol_100"]))
+
+
+class TestAutoVolumeRule:
+    def test_the_rms_target(self):
+        level = Level(-10.0, -4.0, -20.0)
+        auto = levels.auto_volume(level)
+        assert (auto.volume, auto.limit, auto.clamped) == (32, "rms", None)
+        assert auto.text == ("auto: RMS target -30 dBFS (level_at_vol_100 "
+                             "rms -20 dB -> 32)")
+        assert level.rms_dbfs + db(auto.volume / 100) \
+            == pytest.approx(levels.AUTO_RMS_TARGET_DBFS, abs=0.2)
+
+    def test_a_sample_is_limited_by_its_peak(self):
+        # a hat: peak 0 dBFS at -29 dB RMS; the RMS alone would say 89
+        auto = levels.auto_volume(Level(0.0, 6.0, -29.0))
+        assert (auto.volume, auto.limit, auto.clamped) == (56, "peak", None)
+        assert auto.text == ("auto: note peak limit -5 dBFS (level_at_vol_100 "
+                             "note_peak 0 dB -> 56)")
+        assert 0.0 + db(auto.volume / 100) == pytest.approx(-5.0, abs=0.1)
+
+    def test_a_loud_sound_stops_at_the_minimum(self):
+        auto = levels.auto_volume(Level(-2.7, 8.8, -7.9))   # tripleoscillator
+        assert (auto.volume, auto.limit, auto.clamped) == (10, "rms", "min")
+        assert auto.off_db == -2.1
+        assert auto.text.startswith(
+            "auto: RMS target -30 dBFS (level_at_vol_100 rms -7.9 dB -> 10). ")
+        assert "lowest" in auto.text and "2 dB above that target" in auto.text
+        assert "set_track_volume goes lower" in auto.text
+
+    def test_a_quiet_sound_stops_at_the_maximum(self):
+        auto = levels.auto_volume(Level(*levels.SEED_SOUNDFONT["level"]))
+        assert (auto.volume, auto.clamped) == (200, "max")
+        assert auto.off_db == 3.9
+        assert "Volume 200 (+6 dB) is the most the mixer gives" in auto.text
+        assert "4 dB below that target" in auto.text
+        assert "rms -33.9 dBFS" in auto.text
+        assert "velocities" in auto.text
+
+    def test_the_range_and_the_targets(self):
+        assert levels.AUTO_RMS_TARGET_DBFS == -30.0
+        assert levels.AUTO_PEAK_LIMIT_DBFS == -5.0
+        assert (levels.AUTO_VOLUME_MIN, levels.AUTO_VOLUME_MAX) == (10, 200)
+        for rms in (-60.0, -45.0, -30.0, -20.0, -10.0, 0.0, 10.0):
+            auto = levels.auto_volume(Level(rms + 3, rms + 9, rms))
+            assert 10 <= auto.volume <= 200
+            if auto.clamped is None:
+                assert rms + db(auto.volume / 100) \
+                    == pytest.approx(-30.0, abs=0.5)
+
+    def test_the_volumes_of_the_seeded_instruments(self):
+        got = {name: levels.auto_volume(Level(*seed)).volume
+               for name, seed in levels.SEED_LEVELS.items()}
+        assert got["lb302"] == 18
+        assert got["opulenz"] == 93
+        assert got["zynaddsubfx"] == 126
+        assert got["tripleoscillator"] == got["monstro"] == 10
+        assert all(10 <= v <= 200 for v in got.values())
+
+
+class TestAutoVolumeTools:
+    def test_a_new_track_gets_the_volume_of_its_level(self, lab12):
+        result = lab12.add("lb302")
+        assert result["volume"] == 18
+        assert result["volume_chosen"] == (
+            "auto: RMS target -30 dBFS (level_at_vol_100 rms -15 dB -> 18)")
+        assert vol_of(lab12) == 18
+        assert json.loads(lab12.srv.get_track(0))["volume"] == 18
+        assert lab12.renders == 0
+
+    def test_the_estimate_uses_the_chosen_volume(self, lab12):
+        lab12.add("lb302")
+        lab12.srv.add_note(0, 57, 0, 48, 100)
+        info = json.loads(lab12.srv.get_project_info())
+        assert info["estimated_mix_peak_dbfs"] == pytest.approx(
+            levels.SEED_LEVELS["lb302"][0] + db(0.18), abs=0.1)
+
+    def test_six_default_tracks_do_not_clip(self, lab12):
+        for name in ("kicker", "lb302", "tripleoscillator", "organic",
+                     "sid", "nes"):
+            lab12.add(name)
+            lab12.srv.add_note(lab12.proj.get_info().tracks[-1].index,
+                               57, 0, 48, 100)
+        peak = json.loads(lab12.srv.get_project_info())[
+            "estimated_mix_peak_dbfs"]
+        assert peak < 3.0
+        # with volume 100 everywhere it is far over
+        for index in range(6):
+            lab12.srv.set_track_volume(index, 100)
+        assert json.loads(lab12.srv.get_project_info())[
+            "estimated_mix_peak_dbfs"] > 6.0
+
+    def test_a_loud_instrument_says_the_minimum_is_not_enough(self, lab12):
+        result = lab12.add("tripleoscillator")
+        assert result["volume"] == 10
+        assert "lowest the automatic choice sets" in result["volume_chosen"]
+
+    def test_a_quiet_sound_says_200_is_not_enough(self, lab):
+        lab.fake.amplitudes = {"zynaddsubfx": (0.01, 0.02)}
+        result = lab.add("zynaddsubfx")
+        assert result["volume"] == 200
+        assert "Volume 200 (+6 dB) is the most" in result["volume_chosen"]
+        assert vol_of(lab) == 200
+
+    def test_an_explicit_volume_is_never_chosen(self, lab12):
+        result = lab12.add("lb302", volume=100)
+        assert result["volume"] == 100
+        assert result["volume_chosen"] == "explicit"
+        assert vol_of(lab12) == 100
+        assert not lab12.proj.volume_is_default(0)
+
+    def test_an_explicit_volume_survives_a_sound_change(self, lab, zyn_dir):
+        lab.add("zynaddsubfx", volume=60)
+        result = json.loads(lab.srv.load_zyn_preset(0, "Bass/Deep"))
+        assert "volume" not in result and "volume_chosen" not in result
+        assert vol_of(lab) == 60
+
+    def test_set_track_volume_ends_the_choosing(self, lab, zyn_dir):
+        lab.add("zynaddsubfx")
+        auto = vol_of(lab)
+        # the same number as the chosen one, but now it is the agent's
+        lab.srv.set_track_volume(0, auto)
+        assert not lab.proj.volume_is_default(0)
+        lab.fake.amplitudes = {"zynaddsubfx": (0.9, 0.9)}
+        result = json.loads(lab.srv.load_zyn_preset(0, "Bass/Deep"))
+        assert "volume" not in result
+        assert vol_of(lab) == auto
+
+    def test_a_preset_chooses_again_for_a_chosen_volume(self, lab, zyn_dir):
+        lab.fake.amplitudes = lambda inst: (
+            (0.5, 1.0) if inst.find("instrument/zynaddsubfx/ZynAddSubFX-data")
+            is not None else (0.05, 0.1))
+        first = lab.add("zynaddsubfx")
+        before = first["volume"]
+        result = json.loads(lab.srv.load_zyn_preset(0, "Bass/Deep"))
+        auto = chosen(result)
+        assert result["volume"] == auto.volume != before
+        assert result["volume_chosen"] == f"{auto.text} (was {before})"
+        assert vol_of(lab) == auto.volume
+        assert lab.proj.volume_is_default(0)       # and again the next time
+        lab.fake.amplitudes = {"zynaddsubfx": (0.001, 0.002)}
+        result = json.loads(lab.srv.load_zyn_preset(0, "Bass/Wide"))
+        assert result["volume"] == chosen(result).volume == 200
+
+    def test_the_same_volume_is_not_announced_as_a_change(self, lab, zyn_dir):
+        first = lab.add("zynaddsubfx")
+        result = json.loads(lab.srv.load_zyn_preset(0, "Bass/Deep"))
+        assert result["volume"] == first["volume"]
+        assert "(was" not in result["volume_chosen"]
+
+    def test_a_sampler_has_100_until_it_has_a_sound(self, lab, tmp_path):
+        sample = tmp_path / "kick.wav"
+        sample.write_bytes(b"RIFF....")
+        result = lab.add("audiofileprocessor")
+        assert result["volume"] == 100
+        assert "not known" in result["volume_chosen"]
+        assert "level_at_vol_100" not in result
+        result = json.loads(lab.srv.set_audiofile_sample(0, str(sample)))
+        auto = chosen(result)
+        assert auto.volume != 100
+        assert result["volume"] == auto.volume
+        assert result["volume_chosen"] == f"{auto.text} (was 100)"
+        assert vol_of(lab) == auto.volume
+
+    def test_a_missing_sample_changes_nothing(self, lab, tmp_path):
+        lab.add("audiofileprocessor")
+        result = json.loads(lab.srv.set_audiofile_sample(
+            0, str(tmp_path / "nope.wav")))
+        assert "volume" not in result and "volume_chosen" not in result
+        assert vol_of(lab) == 100
+
+    def test_a_soundfont_patch_chooses_again(self, lab):
+        lab.fake.amplitudes = {"sf2player": (0.05, 0.1)}
+        lab.add("sf2player")
+        path = lab.srv._availability.files.default_soundfont
+        result = json.loads(lab.srv.set_instrument_file(0, path, 0, 1))
+        assert result["volume"] == chosen(result).volume
+        assert vol_of(lab) == result["volume"]
+
+    def test_an_unknown_level_keeps_the_volume(self, monkeypatch, tmp_path,
+                                               zyn_dir):
+        lab = Lab(monkeypatch, tmp_path, fail=True)
+        added = lab.add("zynaddsubfx")
+        assert added["volume"] == 100 and "not known" in added["volume_chosen"]
+        assert "could not be measured" in added["note"]
+        result = json.loads(lab.srv.load_zyn_preset(0, "Bass/Deep"))
+        assert "volume" not in result          # still 100, nothing to say
+        assert vol_of(lab) == 100
+        assert lab.proj.volume_is_default(0)
+
+    def test_a_custom_plugin_is_not_rendered_and_keeps_100(
+            self, lab, monkeypatch):
+        srv = lab.srv
+        monkeypatch.setattr(srv, "_availability", lmms_app.build_availability(
+            srv.KNOWN_INSTRUMENTS, srv.effects_mod.KNOWN_EFFECTS,
+            set(srv.KNOWN_INSTRUMENTS) | {"mynewsynth"}, "1.3.0",
+            windows=False))
+        result = json.loads(srv.add_instrument_track(
+            "X", instrument="mynewsynth"))
+        assert result["volume"] == 100 and "not known" in result["volume_chosen"]
+        assert lab.renders == 0
+
+    def test_an_instrument_preset_chooses_again(self, lab, xpf_dir):
+        lab.fake.amplitudes = lambda inst: (
+            (0.1, 0.2) if inst.find("instrument")[0].get("coarse0")
+            else (0.5, 1.0))
+        lab.add()
+        before = vol_of(lab)
+        result = json.loads(lab.srv.load_instrument_preset(
+            0, "TripleOscillator/Test Sound"))
+        auto = chosen(result)
+        assert auto.volume != before
+        assert result["volume"] == auto.volume == vol_of(lab)
+        assert result["volume_chosen"] == f"{auto.text} (was {before})"
+        assert "volume" not in result["kept"]
+        assert "panning" in result["kept"]
+        # the preset was saved with volume 100: no "keeps ... volume" note
+        assert "volume" not in result.get("note", "")
+
+    def test_an_instrument_preset_keeps_an_explicit_volume(self, lab, xpf_dir):
+        lab.add(volume=80)
+        result = json.loads(lab.srv.load_instrument_preset(
+            0, "TripleOscillator/Test Sound"))
+        assert "volume" not in result and "volume_chosen" not in result
+        assert "volume" in result["kept"]
+        assert "volume 100 (the track keeps 80" in result["note"]
+        assert vol_of(lab) == 80
+
+    def test_a_track_created_from_a_preset_gets_a_chosen_volume(
+            self, lab, xpf_dir):
+        xpf = (xpf_dir / "TripleOscillator" / "Loud.xpf")
+        xpf.write_text(XPF.replace('vol="100"', 'vol="59"').replace(
+            'name="Test Sound"', 'name="Loud"'))
+        result = json.loads(lab.srv.load_instrument_preset(
+            None, "TripleOscillator/Loud"))
+        assert result["created"] is True
+        auto = chosen(result)
+        assert result["volume"] == auto.volume != 59
+        assert result["volume_chosen"] == auto.text      # a new track: no "was"
+        assert vol_of(lab) == auto.volume
+        assert lab.proj.volume_is_default(0)
+
+    def test_a_preset_track_without_a_level_keeps_the_presets_volume(
+            self, monkeypatch, tmp_path, xpf_dir):
+        lab = Lab(monkeypatch, tmp_path, fail=True)
+        (xpf_dir / "TripleOscillator" / "Loud.xpf").write_text(
+            XPF.replace('vol="100"', 'vol="59"').replace(
+                'name="Test Sound"', 'name="Loud"'))
+        result = json.loads(lab.srv.load_instrument_preset(
+            None, "TripleOscillator/Loud"))
+        assert result["volume"] == 59 == vol_of(lab)
+        assert result["volume_chosen"].startswith("default 59:")
+
+    def test_automated_volume_is_not_chosen(self, lab, zyn_dir):
+        lab.add("zynaddsubfx")
+        lab.srv.add_automation("track", "volume", [
+            {"bar": 0, "value": 50}, {"bar": 2, "value": 80}],
+            target_index=0, name="Swell")
+        before = vol_of(lab)
+        result = json.loads(lab.srv.load_zyn_preset(0, "Bass/Deep"))
+        assert "volume" not in result and "volume_chosen" not in result
+        assert vol_of(lab) == before
+        assert not lab.proj.volume_is_default(0)
+
+    def test_the_state_follows_the_track_when_tracks_are_removed(
+            self, lab, zyn_dir):
+        lab.add("zynaddsubfx", volume=70)         # track 0, explicit
+        lab.add("zynaddsubfx")                    # track 1, chosen
+        lab.proj.remove_track(0)
+        assert lab.proj.volume_is_default(0)      # the chosen one is 0 now
+        lab.fake.amplitudes = {"zynaddsubfx": (0.9, 0.9)}
+        result = json.loads(lab.srv.load_zyn_preset(0, "Bass/Deep"))
+        assert result["volume"] == chosen(result).volume
+
+    def test_the_xml_has_no_trace_of_it(self, lab, zyn_dir):
+        lab.add("zynaddsubfx")
+        json.loads(lab.srv.load_zyn_preset(0, "Bass/Deep"))
+        text = lab.proj.get_xml_string()
+        assert "volume_chosen" not in text and "default_volume" not in text
+
+    def test_a_loaded_project_keeps_every_volume(self, lab, tmp_path):
+        lab.add("zynaddsubfx")
+        path = tmp_path / "song.mmp"
+        lab.proj.save(str(path))
+        loaded = LMMSProject()
+        loaded.load(path)
+        assert not loaded.volume_is_default(0)
+        assert lab.proj.volume_is_default(0)
+
+    def test_a_restored_tree_keeps_the_state(self, lab):
+        import copy
+        lab.add("zynaddsubfx")
+        lab.add("zynaddsubfx", volume=50)
+        lab.proj.restore(copy.deepcopy(lab.proj.root), False)
+        assert lab.proj.volume_is_default(0)
+        assert not lab.proj.volume_is_default(1)
+
+    def test_sample_tracks_keep_their_100(self, lab12):
+        result = json.loads(lab12.srv.add_sample_track("Loops"))
+        assert "volume" not in result and "volume_chosen" not in result
+        info = json.loads(lab12.srv.get_track(0))
+        assert info["volume"] == 100
+
+
+class TestMixingInstructions:
+    def test_the_mixing_paragraph(self, lab12):
+        text = " ".join(lab12.srv.build_instructions(
+            lab12.srv._availability, "/tmp/p").split())
+        start = text.index("Mixing:")
+        block = text[start:text.index("Default projects directory")]
+        for word in ("level_at_vol_100", "volume_chosen", "never changed",
+                     "-6 dBFS", "10*log10(N)", "20*log10(N)",
+                     "20*log10(V/100)", "estimated_mix_peak_dbfs",
+                     "set_track_volume", "render_project", "analyze_mix",
+                     "1)", "2)", "3)", "4)"):
+            assert word in block, word
+        assert len(block) < 1100            # sent with every session
+
+    def test_the_tool_descriptions(self):
+        from lmms_mcp import server as srv
+        for tool in (srv.add_instrument_track, srv.set_audiofile_sample,
+                     srv.set_instrument_file, srv.load_zyn_preset,
+                     srv.load_instrument_preset):
+            assert "volume_chosen" in " ".join(tool.__doc__.split())
+        assert "keeps this volume" in " ".join(
+            srv.set_track_volume.__doc__.split())
+
+    def test_the_readme(self):
+        readme = (Path(__file__).resolve().parents[1] / "README.md").read_text()
+        for word in ("Track volumes you do not set", "volume_chosen",
+                     "levels.auto_volume", "-30 dBFS", "-5 dBFS"):
+            assert word in readme, word
 
 
 # ──────────────────────────────────────────────────────────────────

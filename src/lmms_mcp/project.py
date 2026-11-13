@@ -56,6 +56,13 @@ class LMMSProject:
         # made from the track's content, so the table stays right when
         # tracks are removed, reordered or the project is loaded.
         self.level_table: dict = {}
+        # The instrument tracks (their <track> elements) whose volume the
+        # server chose itself (add_instrument_track without a volume, see
+        # levels.auto_volume) and the agent has not set since: loading a
+        # sound into one of them chooses the volume again. Kept here, never
+        # in the XML, like the level table; a loaded or new project starts
+        # with none (every volume in a file counts as the agent's).
+        self._default_volume: set[ET.Element] = set()
 
     @property
     def root(self) -> ET.Element:
@@ -96,12 +103,14 @@ class LMMSProject:
         )
         self._path = ""
         self._modified = True
+        self._default_volume = set()
 
     def load(self, path: str | Path) -> None:
         """Load a project from a .mmpz or .mmp file."""
         self._root = load_project(path)
         self._path = str(path)
         self._modified = False
+        self._default_volume = set()
 
     def convert_mixer(self, names: MixerNames) -> dict | None:
         """Rename the loaded project's mixer to `names` (the ones the
@@ -141,9 +150,46 @@ class LMMSProject:
 
     def restore(self, root: ET.Element, modified: bool) -> None:
         """Put back a project tree copied earlier (copy.deepcopy of
-        `root`), e.g. when an edit could not be saved."""
+        `root`), e.g. when an edit could not be saved. The tracks whose
+        volume was the server's choice stay so (the copy has the same
+        tracks at the same positions)."""
+        positions = self._default_volume_positions()
         self._root = root
         self._modified = modified
+        tracks = find_tracks(root)
+        self._default_volume = {
+            tracks[i] for i in positions if i < len(tracks)}
+
+    def _default_volume_positions(self) -> list[int]:
+        if not self._default_volume or self._root is None:
+            return []
+        return [i for i, track in enumerate(find_tracks(self._root))
+                if track in self._default_volume]
+
+    def volume_is_default(self, track_index: int) -> bool:
+        """Whether the server chose the volume of this track (and the
+        agent has not set it since): see mark_default_volume."""
+        try:
+            return find_track_element(self.root, track_index) \
+                in self._default_volume
+        except ValueError:
+            return False
+
+    def mark_default_volume(self, track_index: int, default: bool = True) -> None:
+        """Remember (default=True) that the track's volume was chosen by the
+        server and not by the agent, so that loading another sound into the
+        track chooses it again; default=False forgets it (the agent set the
+        volume)."""
+        try:
+            track = find_track_element(self.root, track_index)
+        except ValueError:
+            if default:
+                raise
+            return
+        if default:
+            self._default_volume.add(track)
+        else:
+            self._default_volume.discard(track)
 
     def get_info(self) -> SongInfo:
         """Extract song information from the project."""
@@ -355,6 +401,7 @@ class LMMSProject:
         song = self.root.find("song")
         container = song.find("trackcontainer[@type='song']")
         container.remove(track)
+        self._default_volume.discard(track)
 
         self._modified = True
         return {

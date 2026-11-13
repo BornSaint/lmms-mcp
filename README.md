@@ -98,7 +98,7 @@ python -m lmms_mcp
 
 | Tool | Description |
 |------|-------------|
-| `add_instrument_track` | Add a synthesizer/sampler track; the response has `level_at_vol_100`, how loud the instrument is (see [Loudness before the first render](#loudness-before-the-first-render)) |
+| `add_instrument_track` | Add a synthesizer/sampler track; the response has `level_at_vol_100`, how loud the instrument is, and, when you pass no `volume`, the `volume` the server chose from it with `volume_chosen` saying why (see [Loudness before the first render](#loudness-before-the-first-render)) |
 | `add_sample_track` | Add an audio sample track |
 | `set_audiofile_sample` | Set the sample (and amp, reverse, loop, start/end) of an `audiofileprocessor` track; optional `base_note` / `pitch_cents` tune it in the same call |
 | `set_track_tuning` | Tune an instrument track: `base_note` (the note a sample was recorded at, e.g. `"C4"`) and a `pitch_cents` fine tune; without arguments it returns the current tuning |
@@ -107,7 +107,7 @@ python -m lmms_mcp
 | `remove_track` | Remove a track by index |
 | `get_track` | Get detailed track information (instrument tracks with a base note other than A4 or a fine tune also show `base_note`, `base_note_name`, `pitch_cents`) |
 | `list_tracks` | List all tracks with summary (same tuning fields) |
-| `set_track_volume` | Set track volume (0-200) |
+| `set_track_volume` | Set track volume (0-200); the server no longer chooses that track's volume afterwards |
 | `set_track_panning` | Set track panning (-100 to +100) |
 | `set_track_mixer_channel` | Route an existing track to another mixer channel (the channel must exist) |
 | `mute_track` | Mute/unmute a track |
@@ -190,7 +190,7 @@ Only offered when the installed LMMS has the `zynaddsubfx` plugin.
 |------|-------------|
 | `get_lmms_info` | Detect installed LMMS version + available plugins |
 | `render_project` | Export to WAV/FLAC/OGG/MP3 via headless LMMS render. `oversampling` (1/2/4/8, default 1 = what LMMS plays in its GUI; higher changes the sound of some instruments such as ZynAddSubFX) and `interpolation` (linear/sincfastest/sincmedium/sincbest, default sincfastest). A relative `output_path` is relative to the default projects folder (`LMMS_PROJECTS_DIR`). Missing folders of `output_path` are created (listed as `created_dirs`); a path LMMS cannot write gives an error naming the path. The response measures the render (`levels`: peak, clipped samples, RMS, loudness per 4 bars) and, with `auto_fix_clipping` (default true), lowers the Master mixer volume of a clipping mix to a -1 dBFS peak and saves the project (`auto_gain`, `levels_after`) |
-| `analyze_mix` | Per-track balance of the mix in one call, instead of scripting over a render: renders every unmuted instrument/sample track and the mix as float (one LMMS render per track plus one, about 9 s each for a 2-minute song; no tokens) and reports, per track, peak, RMS where it plays, active bar ranges and per-section RMS/peak/share of the energy, plus the mix per section. `sections` (`[{"name": "hook", "bars": [12, 20]}]`, bars 0-based, end exclusive; default blocks of 4 bars) and `oversampling` (default 1). `flags` with ready-to-use suggestions: `dominant` (more than 6 dB above the other tracks), `buried` (more than 15 dB below the mix while it plays), `peak_contributors` (the tracks that peak with a mix peak at or above -1 dBFS); e.g. `set_track_volume(3, 197): +5.9 dB`, with the limit of volume 200 said when it is not enough. Does not change the project |
+| `analyze_mix` | Per-track balance of the mix in one call, instead of scripting over a render: renders every unmuted instrument/sample track and the mix as float (one LMMS render per track plus one, about 9 s each for a 2-minute song; no tokens) and reports, per track, peak, RMS where it plays, active bar ranges and per-section RMS/peak/share of the energy, plus the mix per section. `sections` (`[{"name": "hook", "bars": [12, 20]}]`, bars 0-based, end exclusive; default blocks of 4 bars) and `oversampling` (default 1). `flags` with ready-to-use suggestions: `dominant` (more than 6 dB above the other tracks), `buried` (more than 15 dB below the mix while it plays), `peak_contributors` (the tracks that peak with a mix peak at or above -0.5 dBFS: a mix `render_project` just fixed to -1 dBFS is not flagged); e.g. `set_track_volume(3, 197): +5.9 dB`, with the limit of volume 200 said when it is not enough. Does not change the project |
 
 The server reads and writes project files directly - it never launches
 the LMMS GUI. The installed LMMS is only used for: preset discovery,
@@ -489,7 +489,7 @@ What loading into an existing track replaces and keeps:
 |------------------------|-------------------|
 | the instrument and its settings (the track changes instrument if the preset uses another one) | notes and patterns |
 | envelopes and filter, chords, arpeggio | track name (`rename=True` or `name` sets it; a new track gets the preset's) |
-| the effect chain, only when the preset has effects | volume, panning (the response notes it when the preset was saved with other values), mute, solo |
+| the effect chain, only when the preset has effects | volume (unless the server chose it: see [Loudness before the first render](#loudness-before-the-first-render)), panning (the response notes it when the preset was saved with other values), mute, solo |
 | the tuning: base note, fine tune and pitch range, stored as the preset's author heard them | mixer channel, MIDI port |
 
 A call is refused, and nothing changes, when the preset needs an instrument
@@ -569,6 +569,60 @@ of the rendered peak, while the power sum alone read up to 4.3 dB too low. The r
 `unknown_level_tracks` (sample tracks and sounds whose level is not known) that
 are left out. Effects and automation are not included: it is an estimate, and
 `render_project` measures the real level.
+
+### Track volumes you do not set
+
+A track added without `volume` (`add_instrument_track`, or created by
+`load_instrument_preset` with `track_index=null`) gets a volume chosen from
+its level, so that a mix of default volumes lands near 0 dBFS instead of 7 to
+12 dB over, which is what volume 100 on every track gives for 6 to 8 tracks
+(this replaces the plain 100 the tracks had before: a behaviour change). The rule
+(`levels.auto_volume`): the volume that puts the sound's `rms_dbfs` at
+-30 dBFS, but not louder than one note peaking at -5 dBFS, within 10 to 200.
+`tripleoscillator`, `monstro` and `kicker` come out at the minimum 10 (still
+2, 8 and 0.6 dB above the target); the drum samples tried at 13 (a kick) to
+104 (a quiet hat); `lb302` 18, `opulenz` 93, `zynaddsubfx` 126; the default
+soundfont piano needs more than the maximum 200 (4 dB short). The response
+says so:
+
+```json
+"volume": 18,
+"volume_chosen": "auto: RMS target -30 dBFS (level_at_vol_100 rms -15 dB -> 18)"
+```
+
+and, when 200 is not enough, by how much the sound stays under the target
+(raise the note velocities, up to 200, or lower the other tracks).
+
+- A track whose sound is not known yet (an `audiofileprocessor` without a
+  sample, a level that could not be measured) has volume 100; when
+  `set_audiofile_sample`, `set_instrument_file`, `load_zyn_preset` or
+  `load_instrument_preset` then gives it a sound, the volume is chosen
+  again and the response has the new `volume` and `volume_chosen` (with
+  "(was N)").
+- A volume you pass to `add_instrument_track`, or set with
+  `set_track_volume`, is never changed (`volume_chosen` is `"explicit"`
+  on the first); so is the volume of a track whose volume is automated.
+  Sample tracks, VST tracks and pattern tracks keep 100 (their level is not
+  known).
+- The state ("chosen by the server" or not) lives in the server's memory
+  only, never in the project file: a loaded project keeps every volume as it
+  is.
+
+Why -30 dBFS, and not the -20 dBFS a track has in a finished mix: the RMS of a
+held note is far below the RMS of a track that plays it (eighth notes and
+3-note chords are 3 to 8 dB louder than one note), and the peaks of N tracks
+that sound together add up (about +11.7 dB for 6 equal ones). The numbers come
+from rendering 7 test songs of 3 to 10 tracks (13 drum samples and 16 synth,
+soundfont and ZynAddSubFX sounds, 16 bars) one track at a time and mixing them
+again with each candidate rule; the mix peak and the `analyze_mix` flags were
+read each time (the table is in the comment of `levels.AUTO_RMS_TARGET_DBFS`).
+At -20 dBFS the mixes of 6 to 8 tracks peaked at +7 to +12 dBFS; at -30 dBFS
+with the -5 dBFS peak limit they peak at -1 to +3.2 dBFS (+4.8 for 10 tracks)
+with one borderline `buried` flag in 7 songs. The peak limit matters for
+samples: a hat sample is -29 dB RMS at a 0 dBFS peak, so the RMS target alone
+leaves its peak at -1.3 dBFS, and the kick, snare, hat and clap that play
+together then set the mix peak (without the limit the 7 songs peaked up to 4
+dB higher and had 6 flags).
 
 ## Available Instruments
 
