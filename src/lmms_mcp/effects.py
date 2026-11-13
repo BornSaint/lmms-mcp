@@ -179,7 +179,10 @@ def add_effect(
         "autoquit": str(level["decay_ms"]),
         "autoquit_denominator": "4",
         "autoquit_numerator": "4",
-        "syncmode": "0",
+        # the tempo sync mode of autoquit is read as autoquit_syncmode (a
+        # plain "syncmode" is ignored by LMMS 1.2.2 in a current project)
+        "autoquit_syncmode": "0",
+        "gate": "0",
         "name": normalized,
     })
     controls = ET.SubElement(effect, KNOWN_EFFECTS[normalized][1])

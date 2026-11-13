@@ -653,6 +653,62 @@ def track_type_name(type_id: int) -> str:
     return TRACK_TYPE_NAMES.get(type_id, f"Unknown({type_id})")
 
 
+# The settings of the parts of a fresh instrument track, under the attribute
+# names LMMS 1.2.2 reads (LMMS ignores a name it does not know, so a wrong
+# name silently does nothing) and with the values LMMS itself writes for a
+# new track. They are the ones of LMMS's own default template
+# (/usr/share/lmms/projects/templates/default.mpt) and agree with the value
+# most of the shipped demo projects have for each attribute. A track that
+# starts with them sounds as LMMS's defaults do: the envelope amounts are 0
+# and the arpeggio and chord are off.
+
+# <eldata>: the filter (cutoff in Hz, resonance, type, wet).
+ELDATA_DEFAULTS: dict[str, str] = {
+    "fcut": "14000", "fres": "0.5", "ftype": "0", "fwet": "0",
+}
+
+# <elvol>, <elcut> and <elres>: an envelope (pre-delay, attack, hold, decay,
+# sustain, release, amount) and an LFO (pre-delay, attack, speed with its
+# tempo sync, amount, shape, x100, user wave) for the volume, the filter
+# cutoff and the filter resonance. LMMS starts the three the same way.
+# "lspd_*" is the tempo sync of the LFO speed. LMMS 1.2.2 reads the sync mode
+# of a time as <name>_syncmode (next to <name>_numerator and _denominator);
+# the plain "syncmode" that older LMMS wrote is converted only in files an
+# older LMMS made (checked: creatorversion 1.0.2 yes, 1.2.0 no).
+ENVELOPE_DEFAULTS: dict[str, str] = {
+    "pdel": "0", "att": "0", "hold": "0.5", "dec": "0.5",
+    "sustain": "0.5", "rel": "0.1", "amt": "0",
+    "lpdel": "0", "latt": "0", "lspd": "0.1",
+    "lspd_numerator": "4", "lspd_denominator": "4", "lspd_syncmode": "0",
+    "lamt": "0", "lshp": "0", "x100": "0", "ctlenvamt": "0",
+    "userwavefile": "",
+}
+
+# <chordcreator>: the chord stack (off, chord 0, 1 octave).
+CHORDCREATOR_DEFAULTS: dict[str, str] = {
+    "chord-enabled": "0", "chord": "0", "chordrange": "1",
+}
+
+# <arpeggiator>: off, chord 0, 1 octave, cycle/skip/miss 0, 100 ms per note
+# (tempo sync "arptime_*"), gate 100 %, direction up, free mode.
+ARPEGGIATOR_DEFAULTS: dict[str, str] = {
+    "arp-enabled": "0", "arp": "0", "arprange": "1",
+    "arpcycle": "0", "arpskip": "0", "arpmiss": "0",
+    "arptime": "100", "arptime_numerator": "4",
+    "arptime_denominator": "4", "arptime_syncmode": "0",
+    "arpgate": "100", "arpdir": "0", "arpmode": "0",
+}
+
+# <midiport>: no MIDI input or output (channels 0 and 1, program 1, no
+# fixed velocity or note).
+MIDIPORT_DEFAULTS: dict[str, str] = {
+    "inputcontroller": "0", "outputcontroller": "0",
+    "inputchannel": "0", "outputchannel": "1", "outputprogram": "1",
+    "fixedinputvelocity": "-1", "fixedoutputvelocity": "-1",
+    "fixedoutputnote": "-1", "basevelocity": "63",
+    "readable": "0", "writable": "0",
+}
+
 # Attributes a fresh instrument's settings element needs for the track to be
 # audible. LMMS fills in its own default for every attribute that is missing,
 # but a few plugins have a default state that makes no sound at all. Keyed by
@@ -676,7 +732,10 @@ def _make_instrument_track(
 ) -> ET.Element:
     """Append an instrument <track> element to a trackcontainer parent.
 
-    The mixer channel is written under the attribute name of `names`.
+    The mixer channel is written under the attribute name of `names`. The
+    parts (eldata, chordcreator, arpeggiator, midiport) start with the
+    values LMMS writes for a new track, see ELDATA_DEFAULTS and the tables
+    after it.
     """
     track = ET.SubElement(parent, "track", {
         "muted": "0",
@@ -705,40 +764,13 @@ def _make_instrument_track(
         dict(INSTRUMENT_DEFAULTS.get(instrument, {})),
     )
 
-    eldata = ET.SubElement(inst_track, "eldata", {
-        "fres": "0.5", "ftype": "0", "fcut": "14000", "fwet": "0",
-    })
-    ET.SubElement(eldata, "elvol", {
-        "lspd_denominator": "4", "sustain": "0.5",
-        "lspd_numerator": "4", "attack": "0", "decay": "0.5",
-        "hold": "0", "amount": "0",
-    })
-    ET.SubElement(eldata, "elcut", {
-        "lspd_denominator": "4", "sustain": "0.5",
-        "lspd_numerator": "4", "attack": "0", "decay": "0.5",
-        "hold": "0", "amount": "0",
-    })
-    ET.SubElement(eldata, "elres", {
-        "lspd_denominator": "4", "sustain": "0.5",
-        "lspd_numerator": "4", "attack": "0", "decay": "0.5",
-        "hold": "0", "amount": "0",
-    })
+    eldata = ET.SubElement(inst_track, "eldata", dict(ELDATA_DEFAULTS))
+    for tag in ("elvol", "elcut", "elres"):
+        ET.SubElement(eldata, tag, dict(ENVELOPE_DEFAULTS))
 
-    ET.SubElement(inst_track, "chordcreator", {
-        "chord": "0", "chordrange": "1", "chord-enabled": "0",
-    })
-    ET.SubElement(inst_track, "arpeggiator", {
-        "arp": "0", "arp-enabled": "0",
-        "arpcenter": "0", "arpdir": "0", "arprange": "1",
-        "arpspeed": "4", "arpType": "0",
-    })
-    ET.SubElement(inst_track, "midiport", {
-        "inputcontroller": "0", "fixedoutputvelocity": "-1",
-        "inputchannel": "0", "outputcontroller": "0", "writable": "0",
-        "outputchannel": "1", "fixedinputvelocity": "-1",
-        "fixedoutputnote": "-1", "outputprogram": "1",
-        "basevelocity": "63", "readable": "0",
-    })
+    ET.SubElement(inst_track, "chordcreator", dict(CHORDCREATOR_DEFAULTS))
+    ET.SubElement(inst_track, "arpeggiator", dict(ARPEGGIATOR_DEFAULTS))
+    ET.SubElement(inst_track, "midiport", dict(MIDIPORT_DEFAULTS))
     ET.SubElement(inst_track, "fxchain", {
         "numofeffects": "0", "enabled": "0",
     })
