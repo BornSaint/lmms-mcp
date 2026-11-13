@@ -598,6 +598,9 @@ is compensated for you."""
         f"""Default projects directory: {projects_dir}
 When saving a project, use this directory if no specific path is given.
 Example: save to {projects_dir}/my_song.mmpz
+A relative path in save_project, load_project and the output_path of
+render_project is relative to this directory: after save_project("song.mmpz")
+load_project("song.mmpz") loads that same file.
 
 Workflow: Create a project -> Add tracks -> Load instruments/presets ->
 Add notes -> Add effects -> Configure mixer -> Save"""
@@ -750,9 +753,7 @@ def _project_files_in(folder: Path, limit: int = 20) -> list[Path]:
 def _missing_project_hint(path: Path) -> str:
     """What to try when a project file does not exist: the project files
     with a similar name (the other extension, other case, a close
-    spelling) in the same folder, or the same relative path in the
-    default projects folder (where save_project puts it), or that the
-    folder itself is missing."""
+    spelling) in the same folder, or that the folder itself is missing."""
     folder = path.parent
     own = [f for f in _project_files_in(folder) if f != path]
     same_stem = [f for f in own if f.stem.lower() == path.stem.lower()]
@@ -761,10 +762,6 @@ def _missing_project_hint(path: Path) -> str:
     similar = same_stem + [
         f for f in own
         if f.name.lower() in close_names and f not in same_stem]
-    if not path.is_absolute():
-        in_default = Path(DEFAULT_PROJECTS_DIR) / path
-        if in_default.is_file():
-            similar.append(in_default)
     if similar:
         listed = ", ".join(str(f) for f in similar[:3])
         return (f" A similar file exists: {listed}. Pass that path if it "
@@ -775,12 +772,20 @@ def _missing_project_hint(path: Path) -> str:
             f"starting with ~/).")
 
 
-def _load_error(path: str, exc: Exception) -> dict:
+def _load_error(path: str, exc: Exception, relative: bool = False) -> dict:
     """The {"error", "path"} response of a project file that could not be
-    loaded, with the reason and what to try."""
+    loaded, with the reason and what to try. `path` is the absolute path
+    that was tried; `relative` is True when the caller passed a relative
+    path (which is looked up in more than one place)."""
     where = Path(path)
     if isinstance(exc, FileNotFoundError):
-        reason = f"no such file.{_missing_project_hint(where)}"
+        searched = ""
+        if relative:
+            searched = (
+                f" A relative path is looked up in the default projects "
+                f"folder ({DEFAULT_PROJECTS_DIR}), then in the server's "
+                f"working folder ({_working_folder()}).")
+        reason = f"no such file.{searched}{_missing_project_hint(where)}"
     elif isinstance(exc, IsADirectoryError):
         files = _project_files_in(where, limit=5)
         reason = "it is a folder, not a project file."
@@ -810,16 +815,90 @@ def _load_error(path: str, exc: Exception) -> dict:
     return {"error": f"Could not load {path}: {reason}", "path": path}
 
 
+def _in_projects_folder(path: str) -> Path:
+    """A project file path as save_project places it: a relative path is
+    under the default projects folder (the result is absolute even when
+    LMMS_PROJECTS_DIR is relative); an absolute path stays as it is."""
+    full = Path(DEFAULT_PROJECTS_DIR) / path
+    return full if full.is_absolute() else Path.cwd() / full
+
+
+def _working_folder() -> str:
+    """The server process's working folder ("" if it was deleted)."""
+    try:
+        return str(Path.cwd())
+    except OSError:
+        return ""
+
+
+def _resolve_project_file(path: str) -> tuple[str, str | None]:
+    """Where load_project reads a project file from, and a note for the
+    response when that needs saying.
+
+    An absolute path is used as it is. A relative path is looked up the way
+    save_project places it, in the default projects folder, and only if
+    nothing is there in the server's working folder. The returned path is
+    always absolute. The note names the other file when a relative path
+    exists in both places (the default folder wins), or says that the
+    working-folder file was loaded because the default folder has none.
+    """
+    if Path(path).is_absolute():
+        return path, None
+    in_default = _in_projects_folder(path)
+    cwd = _working_folder()
+    if not cwd:
+        return str(in_default), None
+    in_cwd = Path(cwd) / path
+    try:
+        if in_default.is_file():
+            if in_cwd.is_file() and not _same_file(in_default, in_cwd):
+                return str(in_default), (
+                    f"A file of that name also exists in the server's "
+                    f"working folder ({in_cwd}); relative paths mean the "
+                    f"default projects folder, so {in_default} was loaded. "
+                    f"Pass the full path to load the other one.")
+            return str(in_default), None
+        if in_cwd.is_file():
+            return str(in_cwd), (
+                f"{path} is not in the default projects folder "
+                f"({DEFAULT_PROJECTS_DIR}); loaded the file of that name "
+                f"in the server's working folder instead: {in_cwd}.")
+        # Neither is a file: let the load report what is at the default
+        # place (no such file, or a folder), unless only the working
+        # folder has something there (a folder).
+        if not in_default.exists() and in_cwd.exists():
+            return str(in_cwd), None
+    except OSError:
+        # Unreadable folder: loading in_default reports the real reason.
+        pass
+    return str(in_default), None
+
+
+def _same_file(a: Path, b: Path) -> bool:
+    try:
+        return os.path.samefile(a, b)
+    except OSError:
+        return False
+
+
 @_tool
 def load_project(path: str) -> str:
     """Load an existing LMMS project file (.mmpz or .mmp).
+
+    Relative paths are relative to the default projects folder
+    (LMMS_PROJECTS_DIR), the same as in save_project, so the name that
+    save_project was given loads that file again. If a relative path is
+    not there but exists in the server's working folder, that file is
+    loaded and the response has a "note" saying so; if it exists in both
+    places the default folder's file is loaded and the note names the
+    other. The response always has the absolute "path" that was loaded.
 
     If the file cannot be loaded the response is {"error": ..., "path":
     ...} with the reason (no such file, a folder instead of a file, no
     permission, not an LMMS project file), and the project that was open
     stays as it was. When the file does not exist the error lists project
     files with a similar name (e.g. the same name with the other extension
-    .mmp / .mmpz, or the file in the default projects folder).
+    .mmp / .mmpz).
 
     A project that uses the mixer names of another LMMS than the installed
     one is converted: LMMS 1.2 ignores the names of LMMS 1.3 (a project an
@@ -832,26 +911,32 @@ def load_project(path: str) -> str:
     channel); set_track_mixer_channel routes them to a channel that exists.
 
     Args:
-        path: Full path to the LMMS project file (a path starting with ~
-            is expanded to the home folder)
+        path: Path of the LMMS project file: absolute, starting with ~ (the
+            home folder), or relative to the default projects folder
+            (LMMS_PROJECTS_DIR), e.g. "song.mmpz" or "songs/take1.mmp"
     """
     path = _expand_user(path)
+    relative = not Path(path).is_absolute()
+    path, note = _resolve_project_file(path)
     proj = LMMSProject()
     try:
         proj.load(path)
     except (OSError, ValueError) as exc:
         # The open project is untouched: set_project only runs below.
-        return json.dumps(_load_error(path, exc))
+        return json.dumps(_load_error(path, exc, relative))
     converted = _convert_mixer(proj, _availability)
     set_project(proj)
     info = proj.get_info()
     response = {
         "message": f"Loaded project from {path}",
+        "path": path,
         "bpm": info.bpm,
         "time_signature": info.time_signature,
         "track_count": info.track_count,
         "tracks": [{"index": t.index, "name": t.name, "type": t.type_name} for t in info.tracks],
     }
+    if note:
+        response["note"] = note
     if converted:
         response["converted_mixer"] = converted
     warning = _unroutable_warning(proj)
@@ -996,10 +1081,12 @@ def save_project(
 
     Args:
         path: File path to save to. If empty, saves to the default projects directory.
-            If only a filename is given (e.g. "song.mmpz"), it's saved in the default directory.
-            A relative path with folders (e.g. "songs/jazz/take1.mmp") is
-            created under the default directory. A path starting with ~
-            (e.g. "~/songs/take1.mmp") is in the home folder.
+            Relative paths are relative to the default projects folder
+            (LMMS_PROJECTS_DIR), the same as in load_project: a filename
+            (e.g. "song.mmpz") is saved in that folder, and a relative path
+            with folders (e.g. "songs/jazz/take1.mmp") is created under it.
+            A path starting with ~ (e.g. "~/songs/take1.mmp") is in the
+            home folder.
         compressed: If True, saves as .mmpz (compressed). If False, saves as .mmp
             (plain XML). By default (None) the format follows the file extension:
             ".mmp" is always plain XML, everything else compressed. Writing
@@ -1011,7 +1098,7 @@ def save_project(
     if not path and not proj.path:
         save_path = str(Path(DEFAULT_PROJECTS_DIR) / "untitled.mmpz")
     elif path and not Path(path).is_absolute():
-        save_path = str(Path(DEFAULT_PROJECTS_DIR) / path)
+        save_path = str(_in_projects_folder(path))
     else:
         # An absolute path, or no path: save again where the project is.
         save_path = path or proj.path
@@ -3175,7 +3262,10 @@ def render_project(
 
     Args:
         output_path: Output file path (default: <project>.wav in the
-            same directory); a path starting with ~ is in the home folder
+            same directory). A relative path is relative to the default
+            projects folder (LMMS_PROJECTS_DIR), the same as in
+            save_project and load_project; a path starting with ~ is in
+            the home folder
         file_format: "wav", "flac", "ogg" or "mp3"
         samplerate: Sample rate in Hz (44100, 48000, ...)
         bitrate: Bitrate in kbit/s for lossy formats (ogg/mp3)
@@ -3222,6 +3312,8 @@ def render_project(
     if output_path is None:
         output_path = str(proj_path.with_suffix(f".{fmt}"))
     output_path = _expand_user(output_path)
+    if not Path(output_path).is_absolute():
+        output_path = str(_in_projects_folder(output_path))
 
     # Save current state before rendering. Keep the compression format
     # consistent with the file extension - compressed bytes inside a

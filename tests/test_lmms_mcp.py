@@ -8478,21 +8478,39 @@ class TestLoadProjectErrors:
         assert str(tmp_path / "my_song_v2.mmpz") in error
         assert "totally-different" not in error and "notes.txt" not in error
 
-    def test_relative_name_found_in_the_default_folder(
+    def test_relative_name_with_the_other_extension_in_the_default_folder(
             self, monkeypatch, tmp_path):
         from lmms_mcp import server as srv_mod
         srv, _ = self._open_project()
         default = tmp_path / "default"
         default.mkdir()
-        self._saved(default, "song.mmp")
+        self._saved(default, "song.mmpz")
         elsewhere = tmp_path / "elsewhere"
         elsewhere.mkdir()
         monkeypatch.chdir(elsewhere)
         monkeypatch.setattr(srv_mod, "DEFAULT_PROJECTS_DIR", str(default))
         result = json.loads(srv.load_project("song.mmp"))
-        assert result["path"] == "song.mmp"
-        assert f"A similar file exists: {default / 'song.mmp'}" in \
-            result["error"]
+        # The error names the absolute path that was looked at first, says
+        # where a relative path is looked up, and suggests the similar file.
+        assert result["path"] == str(default / "song.mmp")
+        error = result["error"]
+        assert error.startswith(f"Could not load {default / 'song.mmp'}: ")
+        assert "no such file" in error
+        assert f"default projects folder ({default})" in error
+        assert f"working folder ({elsewhere})" in error
+        assert f"A similar file exists: {default / 'song.mmpz'}" in error
+
+    def test_relative_name_missing_everywhere(self, monkeypatch, tmp_path):
+        from lmms_mcp import server as srv_mod
+        srv, proj = self._open_project()
+        monkeypatch.chdir(tmp_path)
+        monkeypatch.setattr(
+            srv_mod, "DEFAULT_PROJECTS_DIR", str(tmp_path / "default"))
+        result = json.loads(srv.load_project("sub/none.mmp"))
+        target = tmp_path / "default" / "sub" / "none.mmp"
+        assert result["path"] == str(target)
+        assert f"The folder {target.parent} does not exist" in result["error"]
+        assert srv.get_project() is proj
 
     def test_folder(self, tmp_path):
         srv, _ = self._open_project()
@@ -8616,6 +8634,270 @@ class TestLoadProjectErrors:
             load_project(tmp_path / "short.mmp")
         with pytest.raises(FileNotFoundError):
             load_project(tmp_path / "missing.mmp")
+
+
+class TestRelativeProjectPaths:
+    """A relative project path means the default projects folder in
+    save_project, load_project and render_project (output_path), so the
+    name given to one works in the others."""
+
+    @pytest.fixture
+    def folders(self, monkeypatch, tmp_path):
+        from lmms_mcp import server as srv
+        default = tmp_path / "default"
+        default.mkdir()
+        cwd = tmp_path / "cwd"
+        cwd.mkdir()
+        monkeypatch.chdir(cwd)
+        monkeypatch.setattr(srv, "DEFAULT_PROJECTS_DIR", str(default))
+        return default, cwd
+
+    @staticmethod
+    def _project(*track_names):
+        from lmms_mcp import server as srv
+        proj = LMMSProject()
+        proj.new()
+        srv.set_project(proj)
+        for name in track_names:
+            srv.add_instrument_track(name)
+        return srv, proj
+
+    @staticmethod
+    def _tracks(srv):
+        return [t["name"] for t in json.loads(srv.get_project_info())["tracks"]]
+
+    def test_save_relative_then_load_relative_is_the_same_file(
+            self, folders):
+        default, cwd = folders
+        srv, _ = self._project("Saved")
+        saved = json.loads(srv.save_project("sub/song.mmp"))
+        assert saved["path"] == str(default / "sub" / "song.mmp")
+        self._project("Other")
+        result = json.loads(srv.load_project("sub/song.mmp"))
+        assert "error" not in result and "note" not in result
+        assert result["path"] == saved["path"]
+        assert result["message"] == f"Loaded project from {saved['path']}"
+        assert self._tracks(srv) == ["Saved"]
+        assert srv.get_project().path == saved["path"]
+        assert not any(cwd.iterdir())
+
+    def test_a_plain_file_name_round_trips(self, folders):
+        default, _ = folders
+        srv, _ = self._project("Saved")
+        srv.save_project("song.mmpz")
+        self._project()
+        result = json.loads(srv.load_project("song.mmpz"))
+        assert result["path"] == str(default / "song.mmpz")
+        assert self._tracks(srv) == ["Saved"]
+
+    def test_a_file_only_in_the_working_folder_is_loaded_with_a_note(
+            self, folders):
+        default, cwd = folders
+        srv, proj = self._project("Local")
+        proj.save(str(cwd / "local.mmp"))
+        self._project("Other")
+        result = json.loads(srv.load_project("local.mmp"))
+        assert "error" not in result
+        assert result["path"] == str(cwd / "local.mmp")
+        assert result["message"] == f"Loaded project from {cwd / 'local.mmp'}"
+        assert "not in the default projects folder" in result["note"]
+        assert str(default) in result["note"]
+        assert f"working folder instead: {cwd / 'local.mmp'}" in result["note"]
+        assert self._tracks(srv) == ["Local"]
+        assert srv.get_project().path == str(cwd / "local.mmp")
+
+    def test_a_relative_path_with_folders_falls_back_to_the_working_folder(
+            self, folders):
+        _, cwd = folders
+        (cwd / "a").mkdir()
+        srv, proj = self._project("Local")
+        proj.save(str(cwd / "a" / "x.mmp"))
+        result = json.loads(srv.load_project("a/x.mmp"))
+        assert result["path"] == str(cwd / "a" / "x.mmp")
+        assert "working folder" in result["note"]
+
+    def test_a_file_in_both_places_loads_the_default_folder_one(
+            self, folders):
+        default, cwd = folders
+        srv, proj = self._project("InDefault")
+        proj.save(str(default / "song.mmp"))
+        _, proj = self._project("InWorkingFolder")
+        proj.save(str(cwd / "song.mmp"))
+        self._project()
+        result = json.loads(srv.load_project("song.mmp"))
+        assert "error" not in result
+        assert result["path"] == str(default / "song.mmp")
+        assert self._tracks(srv) == ["InDefault"]
+        assert str(cwd / "song.mmp") in result["note"]
+        assert "working folder" in result["note"]
+        assert "full path" in result["note"]
+        # The full path of the other file loads that one, without a note.
+        result = json.loads(srv.load_project(str(cwd / "song.mmp")))
+        assert result["path"] == str(cwd / "song.mmp")
+        assert "note" not in result
+        assert self._tracks(srv) == ["InWorkingFolder"]
+
+    def test_the_working_folder_is_the_default_folder_has_no_note(
+            self, monkeypatch, tmp_path):
+        from lmms_mcp import server as srv_mod
+        monkeypatch.chdir(tmp_path)
+        monkeypatch.setattr(srv_mod, "DEFAULT_PROJECTS_DIR", str(tmp_path))
+        srv, proj = self._project("Here")
+        proj.save(str(tmp_path / "song.mmp"))
+        result = json.loads(srv.load_project("song.mmp"))
+        assert result["path"] == str(tmp_path / "song.mmp")
+        assert "note" not in result
+
+    def test_a_relative_default_folder_gives_an_absolute_path(
+            self, monkeypatch, tmp_path):
+        from lmms_mcp import server as srv_mod
+        monkeypatch.chdir(tmp_path)
+        monkeypatch.setattr(srv_mod, "DEFAULT_PROJECTS_DIR", "rel/projects")
+        srv, _ = self._project("Saved")
+        saved = json.loads(srv.save_project("song.mmp"))
+        assert saved["path"] == str(tmp_path / "rel" / "projects" / "song.mmp")
+        result = json.loads(srv.load_project("song.mmp"))
+        assert result["path"] == saved["path"]
+
+    def test_absolute_and_tilde_paths_are_not_looked_up_elsewhere(
+            self, folders, monkeypatch, tmp_path):
+        default, cwd = folders
+        home = tmp_path / "home"
+        home.mkdir()
+        monkeypatch.setenv("HOME", str(home))
+        monkeypatch.setenv("USERPROFILE", str(home))
+        srv, proj = self._project("Abs")
+        proj.save(str(tmp_path / "abs.mmp"))
+        proj.save(str(home / "home.mmp"))
+        # Same names in the other places must not be picked up instead.
+        proj.save(str(default / "home.mmp"))
+        self._project("Default")
+        srv.save_project(str(default / "abs.mmp"))
+        self._project()
+        result = json.loads(srv.load_project(str(tmp_path / "abs.mmp")))
+        assert result["path"] == str(tmp_path / "abs.mmp")
+        assert "note" not in result
+        assert self._tracks(srv) == ["Abs"]
+        result = json.loads(srv.load_project("~/home.mmp"))
+        assert result["path"] == str(home / "home.mmp")
+        assert "note" not in result
+        # A missing absolute path is not retried under the default folder
+        # and its error does not describe a relative lookup.
+        (default / "gone.mmp").write_bytes(b"x")
+        result = json.loads(srv.load_project(str(tmp_path / "gone.mmp")))
+        assert result["path"] == str(tmp_path / "gone.mmp")
+        assert "relative path" not in result["error"]
+
+    def test_a_folder_name_gives_the_folder_error(self, folders):
+        default, _ = folders
+        (default / "songs").mkdir()
+        srv, _ = self._project()
+        result = json.loads(srv.load_project("songs"))
+        assert result["path"] == str(default / "songs")
+        assert "it is a folder, not a project file" in result["error"]
+
+    def test_a_folder_only_in_the_working_folder_gives_the_folder_error(
+            self, folders):
+        _, cwd = folders
+        (cwd / "songs").mkdir()
+        srv, _ = self._project()
+        result = json.loads(srv.load_project("songs"))
+        assert result["path"] == str(cwd / "songs")
+        assert "it is a folder, not a project file" in result["error"]
+
+    def test_a_file_beats_a_folder_of_the_same_name(self, folders):
+        default, cwd = folders
+        (default / "song.mmp").mkdir()
+        srv, proj = self._project("Local")
+        proj.save(str(cwd / "song.mmp"))
+        result = json.loads(srv.load_project("song.mmp"))
+        assert result["path"] == str(cwd / "song.mmp")
+        assert "note" in result
+
+    def test_a_failed_load_keeps_the_open_project(self, folders):
+        default, _ = folders
+        (default / "junk.mmp").write_text("junk")
+        srv, proj = self._project("Keep")
+        result = json.loads(srv.load_project("junk.mmp"))
+        assert result["path"] == str(default / "junk.mmp")
+        assert "not a valid LMMS project file" in result["error"]
+        assert "relative path" not in result["error"]
+        assert srv.get_project() is proj
+        assert self._tracks(srv) == ["Keep"]
+
+    def test_render_relative_output_goes_under_the_default_folder(
+            self, folders, monkeypatch, tmp_path):
+        default, cwd = folders
+        srv, calls = TestRenderProjectQuality._setup(monkeypatch, tmp_path)
+        result = json.loads(srv.render_project(output_path="out/take1.wav"))
+        target = default / "out" / "take1.wav"
+        assert result["success"] is True
+        assert result["output_file"] == str(target)
+        assert result["created_dirs"] == [str(default / "out")]
+        cmd = calls[0]
+        assert cmd[cmd.index("-o") + 1] == str(target)
+        assert target.is_file()
+        assert not (cwd / "out").exists()
+
+    def test_render_plain_file_name_goes_to_the_default_folder(
+            self, folders, monkeypatch, tmp_path):
+        default, cwd = folders
+        srv, calls = TestRenderProjectQuality._setup(monkeypatch, tmp_path)
+        result = json.loads(srv.render_project(output_path="mix.wav"))
+        assert result["output_file"] == str(default / "mix.wav")
+        assert (default / "mix.wav").is_file()
+        assert "created_dirs" not in result
+        assert list(cwd.iterdir()) == []
+
+    def test_render_absolute_output_is_unchanged(
+            self, folders, monkeypatch, tmp_path):
+        default, _ = folders
+        srv, calls = TestRenderProjectQuality._setup(monkeypatch, tmp_path)
+        out = tmp_path / "elsewhere" / "x.wav"
+        result = json.loads(srv.render_project(output_path=str(out)))
+        assert result["output_file"] == str(out)
+        assert list(default.iterdir()) == []
+
+    def test_render_default_output_stays_next_to_the_project(
+            self, folders, monkeypatch, tmp_path):
+        default, _ = folders
+        srv, calls = TestRenderProjectQuality._setup(monkeypatch, tmp_path)
+        result = json.loads(srv.render_project())
+        assert result["output_file"] == str(tmp_path / "song.wav")
+        assert list(default.iterdir()) == []
+
+    def test_render_after_loading_by_a_relative_name(
+            self, folders, monkeypatch, tmp_path):
+        import subprocess
+        from lmms_mcp import lmms_app
+        default, _ = folders
+        srv, _ = self._project("Saved")
+        srv.save_project("song.mmp")
+        self._project()
+        srv.load_project("song.mmp")
+        monkeypatch.setattr(
+            lmms_app, "find_lmms_exe", lambda: Path("/fake/lmms"))
+        calls = []
+
+        def fake_run(cmd, **kwargs):
+            calls.append(cmd)
+            Path(cmd[cmd.index("-o") + 1]).write_bytes(b"RIFF")
+            return subprocess.CompletedProcess(cmd, 0, "", "")
+
+        monkeypatch.setattr("subprocess.run", fake_run)
+        result = json.loads(srv.render_project())
+        assert result["output_file"] == str(default / "song.wav")
+        cmd = calls[0]
+        assert cmd[cmd.index("render") + 1] == str(default / "song.mmp")
+
+    def test_docstrings_and_instructions_state_the_rule(self):
+        from lmms_mcp import server as srv
+        for tool in (srv.load_project, srv.save_project, srv.render_project):
+            doc = " ".join(tool.__doc__.split())
+            assert "relative to the default projects folder" in doc, tool
+            assert "LMMS_PROJECTS_DIR" in doc, tool
+        text = srv.build_instructions(srv._availability, "/some/dir")
+        assert "A relative path in save_project, load_project" in text
 
 
 class TestTildeExpansion:
