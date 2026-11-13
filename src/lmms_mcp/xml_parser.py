@@ -37,6 +37,11 @@ class MixerNames:
     track_attr: str
     sample_track_attr: str | None
 
+    @property
+    def label(self) -> str:
+        """The three names, e.g. 'fxmixer/fxchannel/fxch'."""
+        return f"{self.mixer}/{self.channel}/{self.track_attr}"
+
 
 # LMMS 1.2.x (verified with 1.2.2: its binary and all its demo projects).
 FX_MIXER = MixerNames("fxmixer", "fxchannel", "fxch", None)
@@ -51,15 +56,38 @@ ALL_MIXER_NAMES = (FX_MIXER, MIXER)
 DEFAULT_MIXER_NAMES = FX_MIXER
 
 
+def _lmms_series(version: str | None) -> tuple[int, int] | None:
+    """(major, minor) of an LMMS version text like '1.2.2', else None."""
+    match = re.match(r"\s*(\d+)\.(\d+)", version or "")
+    return None if match is None else (int(match[1]), int(match[2]))
+
+
 def mixer_names_for_version(version: str | None) -> MixerNames:
     """The mixer names the given LMMS version (e.g. '1.2.2') reads.
 
     An unknown or unparsable version gives DEFAULT_MIXER_NAMES.
     """
-    match = re.match(r"\s*(\d+)\.(\d+)", version or "")
-    if match is None:
+    series = _lmms_series(version)
+    if series is None:
         return DEFAULT_MIXER_NAMES
-    return MIXER if (int(match[1]), int(match[2])) >= (1, 3) else FX_MIXER
+    return MIXER if series >= (1, 3) else FX_MIXER
+
+
+def mixer_names_to_convert_to(version: str | None) -> MixerNames | None:
+    """The names a loaded project must be converted to for the installed
+    LMMS `version`, or None when it needs no conversion.
+
+    Only LMMS 1.2 and older needs one: it ignores the 1.3 names (see
+    MixerNames), so a project written with them (an older version of this
+    server wrote them whatever the LMMS) loads with its mixer and routing
+    lost. LMMS 1.3+ upgrades a project created by LMMS 1.2, so one with the
+    1.2 names loads there as is. Without a detected version (None or
+    unparsable) nothing says what the LMMS reads: no conversion.
+    """
+    series = _lmms_series(version)
+    if series is None or series >= (1, 3):
+        return None
+    return FX_MIXER
 
 
 def mixer_names(root: ET.Element) -> MixerNames:
@@ -92,6 +120,173 @@ def get_track_mixer_channel(track_settings: ET.Element) -> int:
     return 0
 
 
+def mixer_channel_numbers(root: ET.Element) -> list[int]:
+    """The numbers of the mixer channels a project has, ascending.
+
+    Channel 0 (Master) is always there: LMMS creates it even when the file
+    has no mixer. A number between two channels that the file lacks is not
+    a channel (LMMS allocates it empty and without a send to Master, so it
+    is silent).
+    """
+    numbers = {0}
+    for channel in find_mixer_channels(root):
+        number = _to_int(channel.get("num"), -1)
+        if number >= 0:
+            numbers.add(number)
+    return sorted(numbers)
+
+
+def _channel_label(root: ET.Element, number: int) -> str:
+    """A channel as text: '1 (drums)', or '2' when it has no name."""
+    name = "Master" if number == 0 else ""
+    for channel in find_mixer_channels(root):
+        if _to_int(channel.get("num"), -1) == number and channel.get("name"):
+            name = channel.get("name")
+            break
+    return f"{number} ({name})" if name else str(number)
+
+
+def describe_mixer_channels(root: ET.Element) -> str:
+    """The channels as text, e.g. '0 (Master), 1 (drums), 2'."""
+    return ", ".join(
+        _channel_label(root, n) for n in mixer_channel_numbers(root))
+
+
+def _misrouting(root: ET.Element, channel: int) -> str:
+    """What LMMS does with a track routed to a channel the project lacks."""
+    last = mixer_channel_numbers(root)[-1]
+    if channel > last:
+        # verified with LMMS 1.2.2: the track takes the last channel's
+        # volume (silent when that is 0), not a silence of its own
+        return (
+            f"LMMS 1.2.2 plays such a track on the last channel, "
+            f"{_channel_label(root, last)}, so it would take the volume and "
+            f"effects of that channel instead of the one you meant (and be "
+            f"silent if that channel is).")
+    if channel > 0:
+        return (
+            "A number between two channels is not a channel: LMMS "
+            "allocates it empty and without a send to Master, so the track "
+            "would be silent.")
+    return ""
+
+
+def check_mixer_channel(root: ET.Element, channel: int) -> None:
+    """Raise ValueError unless the project has the mixer channel.
+
+    LMMS does not route a track to a channel that is not in the project: it
+    plays it on another one (see _misrouting), so nothing may be routed to
+    one. The message names the channels there are and how to create another.
+    """
+    numbers = mixer_channel_numbers(root)
+    if channel in numbers:
+        return
+    next_number = numbers[-1] + 1
+    raise ValueError(" ".join(filter(None, (
+        f"Mixer channel {channel} does not exist: the project has the "
+        f"channels {describe_mixer_channels(root)}.",
+        _misrouting(root, channel),
+        f"Use one of those, or create a channel first with "
+        f"add_mixer_channel(name) (the next one it creates is channel "
+        f"{next_number}).",
+    ))))
+
+
+def unroutable_tracks(root: ET.Element) -> list[tuple[int, str, int]]:
+    """Tracks routed to a mixer channel that does not exist.
+
+    (index in the song, name, channel) for every song track holding an
+    instrument or sample track (a pattern track's inner tracks count for
+    the pattern track) whose channel the project lacks: LMMS plays them on
+    another channel (see _misrouting).
+    """
+    numbers = set(mixer_channel_numbers(root))
+    found = []
+    for index, track in enumerate(find_tracks(root)):
+        channels = {
+            get_track_mixer_channel(settings)
+            for settings in track.iter()
+            if settings.tag in ("instrumenttrack", "sampletrack")
+        }
+        for channel in sorted(channels - numbers):
+            found.append((index, get_track_name(track), channel))
+    return found
+
+
+def convert_mixer_names(root: ET.Element, target: MixerNames) -> dict | None:
+    """Rewrite a project's mixer in place to the names of `target`.
+
+    The mixer element, its channels and the track attribute are renamed;
+    every channel keeps all it holds (volume, mute, solo, name, effect
+    chain, sends) and every track keeps its channel. Returns None when the
+    project does not use the other spelling, else what was converted:
+    {"from": names, "to": names, "channels": n, "tracks": n,
+    "sample_tracks_on_master": [{"track": name, "channel": n}]}.
+    The last list is for a conversion to LMMS 1.2 names, where sample
+    tracks cannot be routed: one that was routed to a channel other than 0
+    now plays on Master.
+    """
+    def uses(names: MixerNames) -> bool:
+        return song.find(names.mixer) is not None or any(
+            names.track_attr in t.attrib for t in root.iter("instrumenttrack"))
+
+    song = root.find("song")
+    if song is None or uses(target):
+        return None
+    source = next((n for n in ALL_MIXER_NAMES if uses(n)), None)
+    if source is None:
+        return None
+
+    channels = 0
+    mixer = song.find(source.mixer)
+    if mixer is not None:
+        mixer.tag = target.mixer
+        for channel in mixer:
+            if channel.tag == source.channel:
+                channel.tag = target.channel
+                channels += 1
+
+    tracks = 0
+    on_master = []
+    for track in root.iter("track"):
+        for settings in track:
+            if settings.tag == "instrumenttrack":
+                attr, new_attr = source.track_attr, target.track_attr
+            elif settings.tag == "sampletrack" and source.sample_track_attr:
+                attr, new_attr = (
+                    source.sample_track_attr, target.sample_track_attr)
+            else:
+                continue
+            number = _to_int(settings.get(attr))
+            if not _rename_attribute(settings, attr, new_attr):
+                continue
+            tracks += 1
+            if new_attr is None and number:
+                on_master.append(
+                    {"track": track.get("name", ""), "channel": number})
+    return {
+        "from": source, "to": target, "channels": channels,
+        "tracks": tracks, "sample_tracks_on_master": on_master,
+    }
+
+
+def _rename_attribute(elem: ET.Element, old: str, new: str | None) -> bool:
+    """Rename an attribute keeping its value and place (drop it when `new`
+    is None); whether `elem` had it."""
+    if old not in elem.attrib:
+        return False
+    items = list(elem.attrib.items())
+    new_exists = new in elem.attrib
+    elem.attrib.clear()
+    for key, value in items:
+        if key == old:
+            if new is None or new_exists:
+                continue
+            key = new
+        elem.attrib[key] = value
+    return True
+
+
 def _q_compress(data: bytes) -> bytes:
     """Replicate Qt's qCompress: 4-byte big-endian size header + zlib data."""
     compressed = zlib.compress(data, 9)
@@ -118,6 +313,20 @@ def _to_int(value, default: int = 0) -> int:
         return int(float(value))
     except (TypeError, ValueError):
         return default
+
+
+def model_value(parent: ET.Element, name: str, default: str) -> str:
+    """The value of an LMMS model saved on `parent`, as the file's text.
+
+    LMMS saves a plain model as an attribute (volume="0.8") but one that
+    is automated or controlled as a child element carrying the value
+    (<volume id="12" value="0.8"/>), which LMMS reads first. `default`
+    when the model is not saved at all.
+    """
+    child = parent.find(name)
+    if child is not None and child.get("value") is not None:
+        return child.get("value")
+    return parent.get(name, default)
 
 
 def load_project(path: str | Path) -> ET.Element:
@@ -174,6 +383,27 @@ def save_project(path: str | Path, root: ET.Element, compressed: bool = True) ->
     path.write_bytes(data)
 
 
+def _make_mixer(song: ET.Element, names: MixerNames) -> ET.Element:
+    """Append a mixer with only the Master channel to a <song>."""
+    mixer = ET.SubElement(song, names.mixer, {
+        "visible": "1",
+        "width": "561",
+        "height": "332",
+        "x": "5",
+        "y": "310",
+        "maximized": "0",
+        "minimized": "0",
+    })
+    ET.SubElement(mixer, names.channel, {
+        "num": "0",
+        "muted": "0",
+        "volume": "1",
+        "name": "Master",
+        "soloed": "0",
+    }).append(ET.Element("fxchain", {"numofeffects": "0", "enabled": "0"}))
+    return mixer
+
+
 def create_empty_project(
     bpm: int = 140,
     time_sig_numerator: int = 4,
@@ -217,22 +447,7 @@ def create_empty_project(
         "minimized": "0",
     })
 
-    mixer = ET.SubElement(song, names.mixer, {
-        "visible": "1",
-        "width": "561",
-        "height": "332",
-        "x": "5",
-        "y": "310",
-        "maximized": "0",
-        "minimized": "0",
-    })
-    ET.SubElement(mixer, names.channel, {
-        "num": "0",
-        "muted": "0",
-        "volume": "1",
-        "name": "Master",
-        "soloed": "0",
-    }).append(ET.Element("fxchain", {"numofeffects": "0", "enabled": "0"}))
+    _make_mixer(song, names)
 
     ET.SubElement(song, "ControllerRackView", {
         "visible": "1", "width": "258", "height": "142",
@@ -440,7 +655,12 @@ def add_instrument_track(
     volume: int = 100,
     panning: int = 0,
 ) -> ET.Element:
-    """Add an instrument track to the project and return the track element."""
+    """Add an instrument track to the project and return the track element.
+
+    Raises ValueError (nothing is added) for a mixer channel the project
+    does not have: LMMS would play the track on another channel.
+    """
+    check_mixer_channel(root, mixer_channel)
     song = root.find("song")
     container = song.find("trackcontainer[@type='song']")
     return _make_instrument_track(
@@ -459,8 +679,10 @@ def add_sample_track(
     """Add a sample track to the project.
 
     Raises ValueError (nothing is added) for a mixer channel other than
-    Master when the project's LMMS cannot route sample tracks: LMMS 1.2.x
-    ignores a channel on a sample track, it always plays on Master.
+    Master when the project's LMMS cannot route sample tracks (LMMS 1.2.x
+    ignores a channel on a sample track, it always plays on Master), and
+    for a mixer channel the project does not have (LMMS would play such a
+    track on another channel).
     """
     names = mixer_names(root)
     if mixer_channel and names.sample_track_attr is None:
@@ -471,6 +693,7 @@ def add_sample_track(
             f"Use mixer_channel=0, or an instrument track for sound that "
             f"needs its own channel."
         )
+    check_mixer_channel(root, mixer_channel)
     song = root.find("song")
     container = song.find("trackcontainer[@type='song']")
 
@@ -665,15 +888,20 @@ def add_mixer_channel(
     name: str,
     volume: float = 1.0,
 ) -> ET.Element:
-    """Add a new mixer channel to the project."""
-    mixer = find_mixer(root)
-    if mixer is None:
-        raise ValueError("No mixer element found")
+    """Add a new mixer channel to the project.
 
+    A project that has no mixer element (LMMS then only has Master) gets
+    one first, in the spelling of its tracks.
+    """
     # A new channel is named like the others (never mixes spellings).
     names = mixer_names(root)
-    existing = find_mixer_channels(root)
-    num = max(int(ch.get("num", "0")) for ch in existing) + 1
+    mixer = find_mixer(root)
+    if mixer is None:
+        song = root.find("song")
+        if song is None:
+            raise ValueError("No song element found")
+        mixer = _make_mixer(song, names)
+    num = mixer_channel_numbers(root)[-1] + 1
 
     channel = ET.SubElement(mixer, names.channel, {
         "num": str(num),
@@ -1298,7 +1526,7 @@ def resolve_automation_target(
                 f"{sorted(attr_map.keys())}"
             )
         attr, default = attr_map[param]
-        value = head.get(attr, default)
+        value = model_value(head, attr, default)
         model_id = automate_attribute(head, attr, value)
         return model_id, float(value)
 
@@ -1316,10 +1544,10 @@ def resolve_automation_target(
             parent, vol_attr, pan_attr = inst_track, "vol", "pan"
 
         if param == "volume":
-            value = parent.get(vol_attr, "100")
+            value = model_value(parent, vol_attr, "100")
             return automate_attribute(parent, vol_attr, value), float(value)
         if param == "panning":
-            value = parent.get(pan_attr, "0")
+            value = model_value(parent, pan_attr, "0")
             return automate_attribute(parent, pan_attr, value), float(value)
         raise ValueError(
             f"Unknown track parameter '{param}'. Valid: volume, panning"
@@ -1337,7 +1565,7 @@ def resolve_automation_target(
             raise ValueError(
                 f"Unknown mixer parameter '{param}'. Valid: volume"
             )
-        value = channel.get("volume", "1")
+        value = model_value(channel, "volume", "1")
         return automate_attribute(channel, "volume", value), float(value)
 
     raise ValueError("target_type must be 'track', 'mixer' or 'song'")

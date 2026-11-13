@@ -26,6 +26,7 @@ from .xml_parser import (
     get_track_name,
     get_track_type,
     load_project,
+    model_value,
     save_project,
     set_head_attribute,
     add_instrument_track,
@@ -36,6 +37,9 @@ from .xml_parser import (
     add_bb_clip,
     add_mixer_channel,
     TRACK_TYPE_NAMES,
+    MixerNames,
+    convert_mixer_names,
+    unroutable_tracks,
 )
 
 
@@ -93,6 +97,24 @@ class LMMSProject:
         self._path = str(path)
         self._modified = False
 
+    def convert_mixer(self, names: MixerNames) -> dict | None:
+        """Rename the loaded project's mixer to `names` (the ones the
+        installed LMMS reads), see xml_parser.convert_mixer_names.
+
+        None when the project already uses them; else the conversion
+        report, and the project counts as modified (the file is unchanged
+        until it is saved).
+        """
+        report = convert_mixer_names(self.root, names)
+        if report is not None:
+            self._modified = True
+        return report
+
+    def unroutable_tracks(self) -> list[tuple[int, str, int]]:
+        """(index, name, channel) of the tracks routed to a mixer channel
+        the project lacks, which LMMS plays on another channel."""
+        return unroutable_tracks(self.root)
+
     def save(self, path: str | Path | None = None, compressed: bool | None = None) -> str:
         """Save the project. Returns the path it was saved to.
 
@@ -142,8 +164,8 @@ class LMMSProject:
             track = Track(
                 track_type=TrackType(get_track_type(track_elem)),
                 name=get_track_name(track_elem),
-                muted=track_elem.get("muted", "0") == "1",
-                solo=track_elem.get("solo", "0") == "1",
+                muted=model_value(track_elem, "muted", "0") == "1",
+                solo=model_value(track_elem, "solo", "0") == "1",
                 index=idx,
             )
 
@@ -164,8 +186,8 @@ class LMMSProject:
         if inst_elem is None:
             return
 
-        track.volume = int(inst_elem.get("vol", "100"))
-        track.panning = int(inst_elem.get("pan", "0"))
+        track.volume = int(float(model_value(inst_elem, "vol", "100")))
+        track.panning = int(float(model_value(inst_elem, "pan", "0")))
         track.mixer_channel = get_track_mixer_channel(inst_elem)
         track.base_note = pitch.get_base_note(inst_elem)
         track.pitch_cents = pitch.json_cents(pitch.get_pitch_cents(inst_elem))
@@ -226,8 +248,8 @@ class LMMSProject:
         """Parse sample or automation track."""
         sample_elem = elem.find("sampletrack")
         if sample_elem is not None:
-            track.volume = int(sample_elem.get("vol", "100"))
-            track.panning = int(sample_elem.get("pan", "0"))
+            track.volume = int(float(model_value(sample_elem, "vol", "100")))
+            track.panning = int(float(model_value(sample_elem, "pan", "0")))
             track.mixer_channel = get_track_mixer_channel(sample_elem)
 
     def _parse_mixer_channels(self) -> list[MixerChannel]:
@@ -252,9 +274,9 @@ class LMMSProject:
             channel = MixerChannel(
                 num=int(ch_elem.get("num", "0")),
                 name=ch_elem.get("name", ""),
-                volume=float(ch_elem.get("volume", "1")),
-                muted=ch_elem.get("muted", "0") == "1",
-                soloed=ch_elem.get("soloed", "0") == "1",
+                volume=float(model_value(ch_elem, "volume", "1")),
+                muted=model_value(ch_elem, "muted", "0") == "1",
+                soloed=model_value(ch_elem, "soloed", "0") == "1",
                 effects=effects,
                 sends=sends,
             )

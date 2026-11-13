@@ -474,7 +474,8 @@ Key concepts:
 - LMMS projects contain tracks (Instrument, Sample, Pattern, Automation)
 - Instrument tracks hold synthesizer/sampler plugins and patterns with notes
 - Pattern tracks (Beat/Bassline) hold drum patterns in the song editor
-- The Mixer has channels (0=Master) where tracks route their audio
+- The Mixer has channels (0=Master) where tracks route their audio; a
+  channel must exist (add_mixer_channel) before a track is routed to it
 - Time is measured in ticks: 192 ticks = 1 bar (4/4 time)
 - {KEY_NUMBERING_TEXT} Valid keys are {KEY_RANGE_TEXT}.
   Tools take either the key number or a note name ("C4", "Bb2").
@@ -649,20 +650,100 @@ def create_project(
 def load_project(path: str) -> str:
     """Load an existing LMMS project file (.mmpz or .mmp).
 
+    A project that uses the mixer names of another LMMS than the installed
+    one is converted: LMMS 1.2 ignores the names of LMMS 1.3 (a project an
+    older version of this server wrote for LMMS 1.2 has them), so its mixer
+    channels (volume, mute, effects) and track routing would have no
+    effect. The response then has "converted_mixer" (from, to, channels,
+    tracks, message); the file stays as it is until save_project. Nothing
+    is converted when no LMMS is installed. "warnings" lists tracks routed
+    to a mixer channel the project lacks (LMMS plays those on another
+    channel).
+
     Args:
         path: Full path to the LMMS project file
     """
     proj = LMMSProject()
     proj.load(path)
+    converted = _convert_mixer(proj, _availability)
     set_project(proj)
     info = proj.get_info()
-    return json.dumps({
+    response = {
         "message": f"Loaded project from {path}",
         "bpm": info.bpm,
         "time_signature": info.time_signature,
         "track_count": info.track_count,
         "tracks": [{"index": t.index, "name": t.name, "type": t.type_name} for t in info.tracks],
-    })
+    }
+    if converted:
+        response["converted_mixer"] = converted
+    warning = _unroutable_warning(proj)
+    if warning:
+        response["warnings"] = [warning]
+    return json.dumps(response)
+
+
+def _convert_mixer(proj, av) -> dict | None:
+    """Rename a loaded project's mixer to the names the installed LMMS reads.
+
+    None when nothing needed converting (no LMMS found, LMMS 1.3+ which
+    upgrades a project with the 1.2 names itself, or names that already
+    match); else the report load_project returns as "converted_mixer".
+    """
+    names = xml_parser.mixer_names_to_convert_to(av.version)
+    if names is None:
+        return None
+    report = proj.convert_mixer(names)
+    if report is None:
+        return None
+    source = report["from"]
+    message = (
+        f"The project used the mixer names of LMMS 1.3 "
+        f"({source.label}), which {_lmms_label(av)} ignores: its tracks "
+        f"would play on Master and its mixer channels (volume, mute, "
+        f"effects, sends) would have no effect. They were renamed to the "
+        f"names {_lmms_label(av)} reads ({names.label}); the channels and "
+        f"tracks keep everything else. The file on disk is unchanged until "
+        f"save_project."
+    )
+    result = {
+        "from": source.label,
+        "to": names.label,
+        "channels": report["channels"],
+        "tracks": report["tracks"],
+    }
+    if report["sample_tracks_on_master"]:
+        listed = ", ".join(
+            f"'{s['track']}' (channel {s['channel']})"
+            for s in report["sample_tracks_on_master"])
+        message += (
+            f" {_lmms_label(av)} cannot route sample tracks, so these "
+            f"now play on Master: {listed}."
+        )
+        result["sample_tracks_on_master"] = report["sample_tracks_on_master"]
+    result["message"] = message
+    return result
+
+
+def _unroutable_warning(proj) -> str | None:
+    """Sentence naming the tracks routed to a mixer channel that does not
+    exist (LMMS plays those on another channel), or None."""
+    found = proj.unroutable_tracks()
+    if not found:
+        return None
+    listed = ", ".join(
+        f"track {index} '{name}' (channel {channel})"
+        for index, name, channel in found)
+    return (
+        f"Misrouted in LMMS: {listed} {'is' if len(found) == 1 else 'are'} "
+        f"routed to a mixer channel the project does not have (it has "
+        f"{xml_parser.describe_mixer_channels(proj.root)}), so LMMS plays "
+        f"{'it' if len(found) == 1 else 'them'} on another channel, with "
+        f"that channel's volume and effects. add_mixer_channel creates the "
+        f"next channel, so call it until the channel exists, or "
+        f"remove_track and add the track again with an existing "
+        f"mixer_channel."
+    )
 
 
 @mcp.tool()
@@ -749,13 +830,16 @@ def _add_instrument(
     the name written into the project as "lmms_plugin".
     """
     plugin = av.plugin_name(instrument)
-    result = proj.add_track(
-        "instrument", name,
-        instrument=plugin,
-        mixer_channel=mixer_channel,
-        volume=volume,
-        panning=panning,
-    )
+    try:
+        result = proj.add_track(
+            "instrument", name,
+            instrument=plugin,
+            mixer_channel=mixer_channel,
+            volume=volume,
+            panning=panning,
+        )
+    except ValueError as exc:  # a mixer channel the project lacks
+        return {"error": str(exc)}
     result["instrument"] = instrument
     if plugin != instrument:
         result["lmms_plugin"] = plugin
@@ -835,7 +919,10 @@ def add_instrument_track(
         instrument: Plugin name (lowercase). Valid options in the installed
             LMMS:
             $INSTRUMENTS
-        mixer_channel: Mixer channel number (0=Master, 1+=custom channels)
+        mixer_channel: Mixer channel number (0=Master, 1+=custom channels).
+            The channel must exist (create it with add_mixer_channel
+            first): LMMS would play a track routed to a missing channel on
+            another one, so such a call is refused.
         volume: Track volume (0-200, 100=normal)
         panning: Track panning (-100 to +100, 0=center)
 
@@ -1206,7 +1293,8 @@ def add_sample_track(
         name: Track name
         mixer_channel: Mixer channel number (0=Master). LMMS 1.2.x cannot
             route sample tracks (they always play on Master), so a channel
-            other than 0 is refused there; LMMS 1.3+ routes them.
+            other than 0 is refused there; LMMS 1.3+ routes them. The
+            channel must exist (add_mixer_channel creates one).
         volume: Track volume (0-200)
         panning: Track panning (-100 to +100)
     """
@@ -2420,6 +2508,15 @@ def load_instrument_preset(
             f"not be checked; if LMMS cannot find it the track is silent."
         )
 
+    if track is not None:
+        # the track keeps its mixer channel; a missing one is misrouted
+        channel = xml_parser.get_track_mixer_channel(
+            track.find("instrumenttrack"))
+        try:
+            xml_parser.check_mixer_channel(proj.root, channel)
+        except ValueError as exc:
+            warnings.append(f"The track keeps its mixer channel {channel}. {exc}")
+
     created = track is None
     if created:
         track_name = name or loaded.name
@@ -2847,7 +2944,8 @@ def add_vst_track(
     Args:
         name: Track name (e.g. "Spire Lead")
         dll_path: Absolute path to the VST .dll file
-        mixer_channel: Mixer channel number (0=Master)
+        mixer_channel: Mixer channel number (0=Master). The channel must
+            exist (add_mixer_channel creates one).
         volume: Track volume (0-200)
         panning: Track panning (-100 to +100)
     """
@@ -2871,13 +2969,16 @@ def add_vst_track(
             "error": f"'{path.name}' is not a .dll file."
         })
 
-    result = proj.add_track(
-        "instrument", name,
-        instrument="vestige",
-        mixer_channel=mixer_channel,
-        volume=volume,
-        panning=panning,
-    )
+    try:
+        result = proj.add_track(
+            "instrument", name,
+            instrument="vestige",
+            mixer_channel=mixer_channel,
+            volume=volume,
+            panning=panning,
+        )
+    except ValueError as exc:  # a mixer channel the project lacks
+        return json.dumps({"error": str(exc)})
 
     # Set the plugin path on the vestige element
     try:
@@ -3703,12 +3804,14 @@ Steps:
 2. For each track, consider:
    - Set appropriate volume levels (drums ~80-100, bass ~70-90, melody ~60-80)
    - Add panning for stereo width (bass center, hi-hats slightly left/right)
-   - Route tracks to dedicated mixer channels
 3. Create mixer channels if needed for:
    - Drum bus
    - Bass bus
    - Lead/Melody bus
    - FX returns (reverb, delay)
+   A track can only be routed to a channel that exists, so create the
+   channel first (add_mixer_channel), then add the track with that
+   mixer_channel.
 4. Adjust mixer channel volumes
 5. Save the project"""
 

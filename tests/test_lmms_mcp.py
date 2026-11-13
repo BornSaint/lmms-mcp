@@ -5770,6 +5770,8 @@ class _PresetLab:
         self.proj = LMMSProject()
         self.proj.new()
         srv.set_project(self.proj)
+        srv.add_mixer_channel("Bus 1")
+        srv.add_mixer_channel("Bus 2")
         srv.add_instrument_track(
             "Lead", instrument="tripleoscillator", mixer_channel=2,
             volume=80, panning=20)
@@ -6478,6 +6480,25 @@ def find_mixer_channel_element(root, num):
     raise AssertionError(f"no mixer channel {num}")
 
 
+@pytest.fixture
+def installed(monkeypatch):
+    """installed(version): the server runs against that LMMS version
+    (None: no LMMS detected) and no project exists yet. Returns the server
+    module."""
+    import dataclasses
+    from lmms_mcp import project as project_mod
+    from lmms_mcp import server as srv
+
+    def use(version):
+        monkeypatch.setattr(
+            srv, "_availability",
+            dataclasses.replace(srv._availability, version=version))
+        monkeypatch.setattr(project_mod, "_current_project", None)
+        return srv
+
+    return use
+
+
 class TestMixerNames:
     """Projects are written with the mixer names the installed LMMS reads.
 
@@ -6489,23 +6510,6 @@ class TestMixerNames:
     VERSIONS = [("1.2.2", "FX_MIXER"), ("1.2.0", "FX_MIXER"),
                 ("1.3.0", "MIXER"), ("1.3.0-alpha.1", "MIXER"),
                 (None, "FX_MIXER")]
-
-    @pytest.fixture
-    def installed(self, monkeypatch):
-        """installed(version): the server runs against that LMMS version
-        and no project exists yet. Returns the server module."""
-        import dataclasses
-        from lmms_mcp import project as project_mod
-        from lmms_mcp import server as srv
-
-        def use(version):
-            monkeypatch.setattr(
-                srv, "_availability",
-                dataclasses.replace(srv._availability, version=version))
-            monkeypatch.setattr(project_mod, "_current_project", None)
-            return srv
-
-        return use
 
     @staticmethod
     def _names(attr):
@@ -6685,14 +6689,20 @@ class TestMixerNames:
     # --- existing projects -----------------------------------------
 
     @staticmethod
-    def _load(srv, tmp_path, names, suffix=".mmp"):
+    def _write(tmp_path, names, suffix=".mmp", text=None):
+        """Write a project spelled with `names` (or the given text)."""
         path = tmp_path / f"existing{suffix}"
-        text = _mixer_project_xml(names)
+        text = _mixer_project_xml(names) if text is None else text
         if suffix == ".mmp":
             path.write_text(text)
         else:
             from lmms_mcp.xml_parser import _q_compress
             path.write_bytes(_q_compress(text.encode()))
+        return path
+
+    @classmethod
+    def _load(cls, srv, tmp_path, names, suffix=".mmp"):
+        path = cls._write(tmp_path, names, suffix)
         result = json.loads(srv.load_project(str(path)))
         assert "error" not in result, result
         return path
@@ -6726,8 +6736,11 @@ class TestMixerNames:
     def test_edits_keep_the_spelling_of_the_loaded_project(
             self, installed, tmp_path, attr, version):
         srv = installed(version)
-        names = self._names(attr)
-        path = self._load(srv, tmp_path, names)
+        path = self._load(srv, tmp_path, self._names(attr))
+        # the project's own spelling, except 1.3 names under LMMS 1.2.2
+        # (converted on load, see TestMixerConversion)
+        names = self._names(
+            "FX_MIXER" if (attr, version) == ("MIXER", "1.2.2") else attr)
 
         assert json.loads(srv.add_mixer_channel("Pads"))["channel_num"] == 2
         assert "error" not in json.loads(srv.add_instrument_track(
@@ -6768,8 +6781,12 @@ class TestMixerNames:
         sample = find_tracks(srv.get_project().root)[-1].find("sampletrack")
         assert "mixch" not in sample.attrib and "fxch" not in sample.attrib
 
-    def test_sample_track_in_a_loaded_lmms13_project(self, installed, tmp_path):
-        srv = installed("1.2.2")
+    @pytest.mark.parametrize("version", ["1.3.0", None])
+    def test_sample_track_in_a_loaded_lmms13_project(
+            self, installed, tmp_path, version):
+        # no conversion here (1.3 installed, or no LMMS detected), so the
+        # project's mixch sample routing stays
+        srv = installed(version)
         self._load(srv, tmp_path, self._names("MIXER"))
         assert "error" not in json.loads(srv.add_sample_track("L", mixer_channel=1))
         sample = find_tracks(srv.get_project().root)[-1].find("sampletrack")
@@ -6811,8 +6828,584 @@ class TestMixerNames:
             assert xml_parser.find_mixer(root) is None
             assert xml_parser.find_mixer_channels(root) == []
             assert xml_parser.mixer_names(root) == names
-            with pytest.raises(ValueError, match="No mixer"):
-                xml_parser.add_mixer_channel(root, "X")
+            # a mixer is created, in the project's spelling
+            channel = xml_parser.add_mixer_channel(root, "X")
+            assert channel.tag == names.channel and channel.get("num") == "1"
+            assert xml_parser.find_mixer(root).tag == names.mixer
+            assert [c.get("num") for c in xml_parser.find_mixer_channels(root)
+                    ] == ["0", "1"]
         assert xml_parser.mixer_names(ET.Element("lmms-project")) == (
             xml_parser.DEFAULT_MIXER_NAMES)
 
+
+
+# ──────────────────────────────────────────────────────────────────
+# MIXER ROUTING: a track must be routed to a channel that exists
+# ──────────────────────────────────────────────────────────────────
+
+class TestMixerChannelMustExist:
+    """LMMS does not route a track to a mixer channel that is not in the
+    project: 1.2.2 plays it on the last channel instead (with that
+    channel's volume; real renders), so nothing may be routed to one: every
+    tool that routes a track refuses it and says which channels exist."""
+
+    VERSIONS = ["1.2.2", "1.3.0", None]
+
+    @staticmethod
+    def _project(installed, version):
+        """Server with a project that has the channels 0 Master, 1 Drums."""
+        srv = installed(version)
+        srv.create_project()
+        srv.add_mixer_channel("Drums")
+        return srv
+
+    @staticmethod
+    def _assert_refused(result, channel=5):
+        assert f"Mixer channel {channel} does not exist" in result["error"], result
+        # the channels there are, with their names, and how to get another
+        assert "0 (Master), 1 (Drums)" in result["error"]
+        assert "add_mixer_channel" in result["error"]
+        assert "channel 2" in result["error"]  # the one it would create next
+        # what LMMS would do instead (verified with LMMS 1.2.2: the track
+        # plays on the last channel, with that channel's volume)
+        assert "plays such a track on the last channel, 1 (Drums)" in (
+            result["error"])
+
+    @pytest.mark.parametrize("version", VERSIONS)
+    @pytest.mark.parametrize("instrument", ["tripleoscillator", "papu"])
+    def test_instrument_track(self, installed, version, instrument):
+        # papu is not a known instrument: the custom-plugin path
+        srv = self._project(installed, version)
+        before = srv.get_project().get_xml_string()
+        self._assert_refused(json.loads(srv.add_instrument_track(
+            "Lead", instrument, mixer_channel=5)))
+        assert srv.get_project().get_xml_string() == before
+        assert not find_tracks(srv.get_project().root)
+
+        # ... and works once the channel exists
+        for _ in range(4):
+            srv.add_mixer_channel("More")
+        assert "error" not in json.loads(srv.add_instrument_track(
+            "Lead", instrument, mixer_channel=5))
+        track = find_tracks(srv.get_project().root)[0]
+        assert get_track_mixer_channel(track.find("instrumenttrack")) == 5
+
+    @pytest.mark.parametrize("version", VERSIONS)
+    def test_master_and_existing_channels_are_accepted(
+            self, installed, version):
+        srv = self._project(installed, version)
+        for channel in (0, 1):
+            assert "error" not in json.loads(srv.add_instrument_track(
+                "T", mixer_channel=channel))
+
+    @pytest.mark.parametrize("channel", [-1, 2, 99])
+    def test_other_numbers_are_refused(self, installed, channel):
+        srv = self._project(installed, "1.2.2")
+        result = json.loads(srv.add_instrument_track(
+            "T", mixer_channel=channel))
+        assert f"Mixer channel {channel} does not exist" in result["error"]
+
+    def test_master_always_exists_even_without_a_mixer(self):
+        # LMMS creates Master when the file has no mixer at all
+        from lmms_mcp import xml_parser
+        root = create_empty_project()
+        song = root.find("song")
+        song.remove(song.find("fxmixer"))
+        add_instrument_track(root, "T")  # Master: no error
+        with pytest.raises(ValueError) as err:
+            add_instrument_track(root, "T", mixer_channel=1)
+        assert "channels 0 (Master)" in str(err.value)
+        assert "next one it creates is channel 1)" in str(err.value)
+        # ... and add_mixer_channel, which the error points to, works: it
+        # adds the missing mixer (with Master) in the project's spelling
+        channel = xml_parser.add_mixer_channel(root, "Drums")
+        assert channel.get("num") == "1" and channel.tag == "fxchannel"
+        assert [c.get("num") for c in xml_parser.find_mixer_channels(root)] == [
+            "0", "1"]
+        add_instrument_track(root, "T", mixer_channel=1)
+
+    def test_the_error_says_what_lmms_does_instead(self):
+        # verified with LMMS 1.2.2 (real renders): a number past the last
+        # channel plays on the last channel; a number inside a gap is an
+        # empty channel without a send to Master (silent)
+        from lmms_mcp import xml_parser
+        root = create_empty_project()
+        xml_parser.add_mixer_channel(root, "One")
+        xml_parser.add_mixer_channel(root, "Two").set("num", "3")
+
+        def refusal(channel):
+            with pytest.raises(ValueError) as err:
+                xml_parser.check_mixer_channel(root, channel)
+            return str(err.value)
+
+        past = refusal(9)
+        assert "last channel, 3 (Two)" in past and "silent if" in past
+        assert "next one it creates is channel 4" in past
+        gap = refusal(2)
+        assert "without a send to Master" in gap and "silent" in gap
+        assert "last channel" not in gap
+        negative = refusal(-1)
+        assert "Mixer channel -1 does not exist" in negative
+        assert "last channel" not in negative and "silent" not in negative
+
+    def test_a_gap_in_the_numbers_is_not_a_channel(self):
+        # LMMS allocates the numbers between channels empty and without a
+        # send to Master: silent
+        from lmms_mcp import xml_parser
+        root = create_empty_project()
+        xml_parser.add_mixer_channel(root, "One")
+        two = xml_parser.add_mixer_channel(root, "Two")
+        two.set("num", "3")
+        assert xml_parser.mixer_channel_numbers(root) == [0, 1, 3]
+        add_instrument_track(root, "T", mixer_channel=3)
+        with pytest.raises(ValueError, match="0 \\(Master\\), 1 \\(One\\), 3 \\(Two\\)"):
+            add_instrument_track(root, "T", mixer_channel=2)
+
+    @pytest.mark.parametrize("version,reason", [
+        ("1.3.0", "does not exist"), ("1.2.2", "LMMS 1.2 mixer format")])
+    def test_sample_track(self, installed, version, reason):
+        # LMMS 1.3 routes sample tracks, so the channel must exist; 1.2.x
+        # cannot route them at all (its own refusal, unchanged)
+        srv = self._project(installed, version)
+        before = srv.get_project().get_xml_string()
+        result = json.loads(srv.add_sample_track("Loop", mixer_channel=5))
+        assert reason in result["error"]
+        assert srv.get_project().get_xml_string() == before
+        assert "error" not in json.loads(
+            srv.add_sample_track("Loop", mixer_channel=0))
+        if version == "1.3.0":
+            assert "error" not in json.loads(
+                srv.add_sample_track("Loop", mixer_channel=1))
+            self._assert_refused(json.loads(
+                srv.add_sample_track("Loop", mixer_channel=5)))
+
+    @pytest.mark.parametrize("version", VERSIONS)
+    def test_vst_track(self, installed, tmp_path, version):
+        srv = self._project(installed, version)
+        dll = tmp_path / "synth.dll"
+        dll.write_bytes(b"MZ")
+        before = srv.get_project().get_xml_string()
+        self._assert_refused(json.loads(srv.add_vst_track(
+            "VST", str(dll), mixer_channel=5)))
+        assert srv.get_project().get_xml_string() == before
+        assert "error" not in json.loads(srv.add_vst_track(
+            "VST", str(dll), mixer_channel=1))
+
+    def test_pattern_track_is_routed_to_master(self, installed):
+        # add_pattern_track has no mixer_channel: its kicker is on Master,
+        # which always exists
+        srv = installed("1.2.2")
+        srv.create_project()
+        assert "error" not in json.loads(srv.add_pattern_track("Beat"))
+        assert srv.get_project().unroutable_tracks() == []
+
+    def test_project_add_track_validates_too(self):
+        proj = LMMSProject()
+        proj.new(lmms_version="1.3.0")  # (1.2 refuses sample routing anyway)
+        for kind in ("instrument", "sample"):
+            with pytest.raises(ValueError, match="does not exist"):
+                proj.add_track(kind, "T", mixer_channel=3)
+        assert not find_tracks(proj.root)
+
+    # --- existing routing (a loaded project, a preset) ---------------
+
+    @staticmethod
+    def _stale_project(tmp_path, channel=5):
+        from lmms_mcp import xml_parser
+        text = _mixer_project_xml(xml_parser.FX_MIXER).replace(
+            'fxch="1"', f'fxch="{channel}"')
+        return TestMixerNames._write(tmp_path, None, text=text)
+
+    def test_load_project_warns_about_a_track_on_a_missing_channel(
+            self, installed, tmp_path):
+        srv = installed("1.2.2")
+        path = self._stale_project(tmp_path)
+        result = json.loads(srv.load_project(str(path)))
+        (warning,) = result["warnings"]
+        assert "track 0 'Bass' (channel 5)" in warning
+        assert "0 (Master), 1 (drums)" in warning
+        assert "add_mixer_channel" in warning and "remove_track" in warning
+        assert "another channel" in warning
+        assert srv.get_project().unroutable_tracks() == [(0, "Bass", 5)]
+
+    def test_load_project_is_quiet_when_the_routing_is_valid(
+            self, installed, tmp_path):
+        from lmms_mcp import xml_parser
+        srv = installed("1.2.2")
+        path = TestMixerNames._write(tmp_path, xml_parser.FX_MIXER)
+        assert "warnings" not in json.loads(srv.load_project(str(path)))
+
+    def test_creating_the_missing_channels_fixes_the_warning(
+            self, installed, tmp_path):
+        srv = installed("1.2.2")
+        srv.load_project(str(self._stale_project(tmp_path, channel=3)))
+        assert srv.get_project().unroutable_tracks()
+        srv.add_mixer_channel("Two")
+        srv.add_mixer_channel("Three")
+        assert srv.get_project().unroutable_tracks() == []
+
+    def test_unroutable_tracks_looks_inside_pattern_tracks(self):
+        from lmms_mcp import xml_parser
+        root = create_empty_project()
+        add_pattern_track(root, "Beat")
+        inner = root.find(".//bbtrack//instrumenttrack")
+        inner.set("fxch", "4")
+        assert xml_parser.unroutable_tracks(root) == [(0, "Beat", 4)]
+
+    def test_preset_into_a_track_on_a_missing_channel_warns(self, lab):
+        # the track keeps its channel (the preset's own is not used), so a
+        # stale one stays misrouted: say so
+        lab.put("TripleOscillator/Bubbles.xpf", _xpf("Bubbles"))
+        clean = lab.load(0, "TripleOscillator/Bubbles")
+        assert "warnings" not in clean
+        lab.inst_track().set("fxch", "9")
+        result = lab.load(0, "TripleOscillator/Bubbles")
+        (warning,) = result["warnings"]
+        assert "keeps its mixer channel 9" in warning
+        assert "does not exist" in warning and "add_mixer_channel" in warning
+        assert "last channel" in warning
+        # a new track takes channel 0
+        assert "warnings" not in lab.load(None, "TripleOscillator/Bubbles")
+
+
+# ──────────────────────────────────────────────────────────────────
+# MIXER CONVERSION: LMMS 1.3 names in a project, LMMS 1.2 installed
+# ──────────────────────────────────────────────────────────────────
+
+class TestMixerConversion:
+    """A project an older version of this server wrote for LMMS 1.2.2 has
+    the LMMS 1.3 mixer names, which 1.2.2 ignores (verified: routing,
+    channel volume and effects had no effect). load_project renames them to
+    the installed LMMS's, keeping everything else."""
+
+    @staticmethod
+    def _names(attr):
+        return TestMixerNames._names(attr)
+
+    @staticmethod
+    def _load(srv, tmp_path, names, suffix=".mmp", text=None):
+        path = TestMixerNames._write(tmp_path, names, suffix, text)
+        return path, json.loads(srv.load_project(str(path)))
+
+    @staticmethod
+    def _data(srv):
+        """Everything a project holds about its mixer and routing."""
+        info = json.loads(srv.get_project_info())
+        return info["mixer_channels"], [
+            (t["name"], t["mixer_channel"], t["volume"]) for t in info["tracks"]]
+
+    @pytest.mark.parametrize("suffix", [".mmp", ".mmpz"])
+    def test_a_13_project_is_converted_under_lmms_12(
+            self, installed, tmp_path, suffix):
+        srv = installed("1.2.2")
+        path, result = self._load(
+            srv, tmp_path, self._names("MIXER"), suffix)
+
+        report = result["converted_mixer"]
+        assert report["from"] == "mixer/mixerchannel/mixch"
+        assert report["to"] == "fxmixer/fxchannel/fxch"
+        assert (report["channels"], report["tracks"]) == (2, 1)
+        assert "LMMS 1.2.2" in report["message"]
+        assert "save_project" in report["message"]
+        assert "sample_tracks_on_master" not in report
+
+        proj = srv.get_project()
+        _assert_only_spelling(proj.root, self._names("FX_MIXER"))
+        assert proj.modified  # differs from the file until it is saved
+        # all the channel data and the routing survived
+        channels, tracks = self._data(srv)
+        assert [(m["num"], m["name"], m["volume"], m["muted"], m["soloed"],
+                 m["effects"], m["sends"]) for m in channels] == [
+            (0, "Master", 1.2, False, False, [], []),
+            (1, "drums", 0.65, False, False, ["delay"],
+             [{"channel": 0, "amount": 1.0}])]
+        assert tracks == [("Bass", 1, 80), ("Loop", 0, 100)]
+        assert proj.unroutable_tracks() == []
+        # the file on disk is unchanged until it is saved: loading it
+        # again converts it again
+        assert "converted_mixer" in json.loads(srv.load_project(str(path)))
+
+    def test_save_and_load_again_round_trips(self, installed, tmp_path):
+        srv = installed("1.2.2")
+        path, _ = self._load(srv, tmp_path, self._names("MIXER"))
+        converted = self._data(srv)
+        for suffix in (".mmpz", ".mmp"):
+            out = tmp_path / f"saved{suffix}"
+            srv.save_project(str(out))
+            srv.create_project()
+            result = json.loads(srv.load_project(str(out)))
+            assert "converted_mixer" not in result  # nothing left to convert
+            _assert_only_spelling(srv.get_project().root,
+                                  self._names("FX_MIXER"))
+            assert self._data(srv) == converted
+            assert not srv.get_project().modified
+        # and later edits keep the names LMMS 1.2.2 reads
+        srv.add_mixer_channel("Pads")
+        srv.add_instrument_track("Pad", mixer_channel=2)
+        srv.add_pattern_track("Beat")
+        _assert_only_spelling(srv.get_project().root, self._names("FX_MIXER"))
+
+    def test_converting_in_place_keeps_each_element_and_attribute(self):
+        # the channels keep every attribute, child and their order
+        from lmms_mcp import xml_parser
+        text = _mixer_project_xml(xml_parser.MIXER)
+        root = ET.fromstring(text)
+        report = xml_parser.convert_mixer_names(root, xml_parser.FX_MIXER)
+        assert (report["channels"], report["tracks"]) == (2, 1)
+        expected = text.replace("mixerchannel", "fxchannel").replace(
+            "<mixer ", "<fxmixer ").replace("</mixer>", "</fxmixer>").replace(
+            "mixch=", "fxch=")
+        assert ET.tostring(root) == ET.tostring(ET.fromstring(expected))
+        # nothing left to convert; the other direction restores the original
+        assert xml_parser.convert_mixer_names(
+            root, xml_parser.FX_MIXER) is None
+        back = xml_parser.convert_mixer_names(root, xml_parser.MIXER)
+        assert (back["channels"], back["tracks"]) == (2, 1)
+        assert ET.tostring(root) == ET.tostring(ET.fromstring(text))
+
+    def test_pattern_track_and_mixer_state_are_converted(self):
+        from lmms_mcp import xml_parser
+        root = create_empty_project(lmms_version="1.3.0")
+        xml_parser.add_mixer_channel(root, "Drums", volume=0.4)
+        add_instrument_track(root, "Lead", mixer_channel=1)
+        add_pattern_track(root, "Beat")
+        channel = find_mixer_channel_element(root, 1)
+        channel.set("muted", "1")
+        channel.set("soloed", "1")
+        channel.find("send").set("amount", "0.5")
+        extra = ET.SubElement(channel, "send", {"channel": "2", "amount": "0.25"})
+        assert extra is not None
+
+        report = xml_parser.convert_mixer_names(root, xml_parser.FX_MIXER)
+        assert (report["channels"], report["tracks"]) == (2, 2)  # + inner kicker
+        _assert_only_spelling(root, xml_parser.FX_MIXER)
+        channel = find_mixer_channel_element(root, 1)
+        assert channel.tag == "fxchannel"
+        assert (channel.get("name"), channel.get("volume"),
+                channel.get("muted"), channel.get("soloed")) == (
+            "Drums", "0.4", "1", "1")
+        assert [s.attrib for s in channel.findall("send")] == [
+            {"channel": "0", "amount": "0.5"},
+            {"channel": "2", "amount": "0.25"}]
+        inner = root.find(".//bbtrack//instrumenttrack")
+        assert inner.get("fxch") == "0" and "mixch" not in inner.attrib
+
+    def test_sample_track_routing_is_reported_not_silently_lost(
+            self, installed, tmp_path):
+        # LMMS 1.2 cannot route sample tracks: one that was on a channel
+        # now plays on Master, and the response says which
+        from lmms_mcp import xml_parser
+        text = _mixer_project_xml(xml_parser.MIXER).replace(
+            '<sampletrack vol="100" pan="0">',
+            '<sampletrack vol="100" pan="0" mixch="1">')
+        srv = installed("1.2.2")
+        _, result = self._load(srv, tmp_path, None, text=text)
+        report = result["converted_mixer"]
+        assert report["sample_tracks_on_master"] == [
+            {"track": "Loop", "channel": 1}]
+        assert "'Loop' (channel 1)" in report["message"]
+        assert "Master" in report["message"]
+        assert report["tracks"] == 2
+        sample = find_tracks(srv.get_project().root)[1].find("sampletrack")
+        assert set(sample.attrib) == {"vol", "pan"}
+        _assert_only_spelling(srv.get_project().root, self._names("FX_MIXER"))
+
+    def test_a_sample_track_on_master_is_not_reported(self, installed, tmp_path):
+        from lmms_mcp import xml_parser
+        text = _mixer_project_xml(xml_parser.MIXER).replace(
+            '<sampletrack vol="100" pan="0">',
+            '<sampletrack vol="100" pan="0" mixch="0">')
+        srv = installed("1.2.2")
+        _, result = self._load(srv, tmp_path, None, text=text)
+        assert "sample_tracks_on_master" not in result["converted_mixer"]
+
+    # --- when nothing is converted ----------------------------------
+
+    def test_no_conversion_without_a_detected_lmms(self, installed, tmp_path):
+        # nothing says which names the LMMS reads: the project stays as is
+        for version in (None, "", "garbage"):
+            srv = installed(version)
+            _, result = self._load(srv, tmp_path, self._names("MIXER"))
+            assert "converted_mixer" not in result
+            proj = srv.get_project()
+            _assert_only_spelling(proj.root, self._names("MIXER"))
+            assert not proj.modified
+
+    @pytest.mark.parametrize("version", ["1.3.0", "1.4.1", "2.0.0"])
+    def test_no_conversion_under_lmms_13(self, installed, tmp_path, version):
+        srv = installed(version)
+        _, result = self._load(srv, tmp_path, self._names("MIXER"))
+        assert "converted_mixer" not in result
+        _assert_only_spelling(srv.get_project().root, self._names("MIXER"))
+
+    @pytest.mark.parametrize("version", ["1.3.0", "1.2.2", None])
+    def test_a_project_in_the_installed_spelling_is_untouched(
+            self, installed, tmp_path, version):
+        # LMMS 1.3+ upgrades a 1.2 project itself on load (it renames
+        # fxmixer/fxchannel/fxch), so the 1.2 names are never converted
+        srv = installed(version)
+        _, result = self._load(srv, tmp_path, self._names("FX_MIXER"))
+        assert "converted_mixer" not in result
+        proj = srv.get_project()
+        _assert_only_spelling(proj.root, self._names("FX_MIXER"))
+        assert not proj.modified
+
+    def test_a_project_without_a_mixer_only_has_its_tracks_converted(self):
+        # (so that add_mixer_channel, which then adds a mixer in the
+        # tracks' spelling, writes names the installed LMMS reads)
+        from lmms_mcp import xml_parser
+        root = ET.fromstring(_mixer_project_xml(xml_parser.MIXER))
+        song = root.find("song")
+        song.remove(song.find("mixer"))
+        report = xml_parser.convert_mixer_names(root, xml_parser.FX_MIXER)
+        assert (report["channels"], report["tracks"]) == (0, 1)
+        assert root.find(".//instrumenttrack").get("fxch") == "1"
+        assert xml_parser.mixer_names(root) == xml_parser.FX_MIXER
+        xml_parser.add_mixer_channel(root, "X")
+        _assert_only_spelling(root, xml_parser.FX_MIXER)
+
+    def test_a_project_without_a_mixer_or_routing_needs_no_conversion(self):
+        from lmms_mcp import xml_parser
+        assert xml_parser.convert_mixer_names(
+            ET.Element("lmms-project"), xml_parser.FX_MIXER) is None
+        root = create_empty_project(lmms_version="1.3.0")
+        song = root.find("song")
+        song.remove(song.find("mixer"))
+        add_instrument_track(root, "T")
+        root.find(".//instrumenttrack").attrib.pop("fxch")  # no routing at all
+        assert xml_parser.convert_mixer_names(root, xml_parser.FX_MIXER) is None
+
+    def test_a_project_with_both_mixers_is_left_alone(self):
+        from lmms_mcp import xml_parser
+        root = ET.fromstring(_mixer_project_xml(xml_parser.MIXER))
+        ET.SubElement(root.find("song"), "fxmixer")
+        before = ET.tostring(root)
+        assert xml_parser.convert_mixer_names(root, xml_parser.FX_MIXER) is None
+        assert ET.tostring(root) == before
+
+    @pytest.mark.parametrize("version,names", [
+        ("1.2.2", "FX_MIXER"), ("1.2.0", "FX_MIXER"), ("1.1.3", "FX_MIXER"),
+        ("1.3.0", None), ("1.10.0", None), (None, None), ("", None),
+        ("garbage", None)])
+    def test_which_installed_lmms_needs_a_conversion(self, version, names):
+        from lmms_mcp import xml_parser
+        expected = None if names is None else self._names(names)
+        assert xml_parser.mixer_names_to_convert_to(version) == expected
+
+
+# ──────────────────────────────────────────────────────────────────
+# AUTOMATED MODEL VALUES: <volume id=".." value=".."/> instead of volume=".."
+# ──────────────────────────────────────────────────────────────────
+
+class TestAutomatedValues:
+    """LMMS saves a model that is automated as a child element carrying its
+    value; the readers must see it (get_mixer_channels reported 1.0)."""
+
+    def test_model_value(self):
+        from lmms_mcp.xml_parser import model_value
+        plain = ET.fromstring('<ch volume="0.7"/>')
+        child = ET.fromstring('<ch><volume id="3" value="0.4"/></ch>')
+        both = ET.fromstring('<ch volume="0.7"><volume id="3" value="0.4"/></ch>')
+        no_value = ET.fromstring('<ch volume="0.7"><volume id="3"/></ch>')
+        assert model_value(plain, "volume", "1") == "0.7"
+        assert model_value(child, "volume", "1") == "0.4"
+        assert model_value(both, "volume", "1") == "0.4"  # LMMS reads the child
+        assert model_value(no_value, "volume", "1") == "0.7"
+        assert model_value(ET.Element("ch"), "volume", "1") == "1"
+
+    @staticmethod
+    def _automated_xml():
+        from lmms_mcp import xml_parser
+        text = _mixer_project_xml(xml_parser.FX_MIXER)
+        return (
+            text.replace(
+                '<fxchannel num="1" muted="0" volume="0.65" name="drums" soloed="0">',
+                '<fxchannel num="1" name="drums">'
+                '<volume id="11" value="0.4" scale_type="linear"/>'
+                '<muted id="12" value="1"/><soloed id="13" value="1"/>')
+            .replace('pan="0" fxch="1" usemasterpitch="1" pitchrange="1" '
+                     'pitch="0" basenote="57" vol="80">',
+                     'fxch="1" usemasterpitch="1" pitchrange="1" pitch="0" '
+                     'basenote="57"><vol id="14" value="130"/>'
+                     '<pan id="15" value="-40"/>')
+            .replace('<track muted="0" type="0" name="Bass" solo="0">',
+                     '<track type="0" name="Bass"><muted id="16" value="1"/>'
+                     '<solo id="17" value="1"/>')
+        )
+
+    def test_get_mixer_channels_reports_the_automated_values(
+            self, installed, tmp_path):
+        srv = installed("1.2.2")
+        path = TestMixerNames._write(tmp_path, None, text=self._automated_xml())
+        assert "error" not in json.loads(srv.load_project(str(path)))
+        drums = json.loads(srv.get_mixer_channels())["channels"][1]
+        assert (drums["volume"], drums["muted"], drums["soloed"]) == (
+            0.4, True, True)
+        resource = json.loads(srv.resource_project_mixer())["mixer_channels"]
+        assert resource[1]["volume"] == 0.4
+        # the plain channel is read as before
+        assert json.loads(srv.get_mixer_channels())["channels"][0][
+            "volume"] == 1.2
+
+    def test_tracks_report_the_automated_values(self, installed, tmp_path):
+        srv = installed("1.2.2")
+        path = TestMixerNames._write(tmp_path, None, text=self._automated_xml())
+        srv.load_project(str(path))
+        bass = json.loads(srv.get_track(0))
+        assert (bass["volume"], bass["panning"], bass["muted"], bass["solo"],
+                bass["mixer_channel"]) == (130, -40, True, True, 1)
+
+    def test_a_volume_automated_through_the_tools_keeps_its_value(
+            self, installed):
+        srv = installed("1.2.2")
+        srv.create_project()
+        srv.add_mixer_channel("Drums")
+        srv.set_mixer_channel_volume(1, 0.65)
+        srv.add_instrument_track("Lead", mixer_channel=1, volume=120, panning=25)
+
+        first = json.loads(srv.add_automation(
+            "mixer", "volume",
+            [{"bar": 0, "value": 1.0}, {"bar": 2, "value": 0.5}],
+            target_index=1))
+        assert first["current_value"] == 0.65
+        track = json.loads(srv.add_automation(
+            "track", "volume",
+            [{"bar": 0, "value": 100}, {"bar": 2, "value": 50}],
+            target_index=0))
+        assert track["current_value"] == 120
+
+        # the attribute became a child element: the readers still see it
+        channel = find_mixer_channel_element(srv.get_project().root, 1)
+        assert "volume" not in channel.attrib and channel.find("volume") is not None
+        assert json.loads(srv.get_mixer_channels())["channels"][1][
+            "volume"] == 0.65
+        lead = json.loads(srv.get_track(0))
+        assert (lead["volume"], lead["panning"]) == (120, 25)
+        # automating the same parameter again reports the real value
+        again = json.loads(srv.add_automation(
+            "mixer", "volume",
+            [{"bar": 3, "value": 0.1}, {"bar": 4, "value": 0.2}],
+            target_index=1))
+        assert again["current_value"] == 0.65
+        assert again["model_id"] == first["model_id"]
+        again = json.loads(srv.add_automation(
+            "track", "volume",
+            [{"bar": 3, "value": 10}, {"bar": 4, "value": 20}],
+            target_index=0))
+        assert again["current_value"] == 120
+
+    def test_a_converted_project_keeps_the_automated_volume(
+            self, installed, tmp_path):
+        from lmms_mcp import xml_parser
+        text = self._automated_xml().replace("fxmixer", "mixer").replace(
+            "fxchannel", "mixerchannel").replace("fxch=", "mixch=")
+        srv = installed("1.2.2")
+        path = TestMixerNames._write(tmp_path, None, text=text)
+        result = json.loads(srv.load_project(str(path)))
+        assert result["converted_mixer"]["channels"] == 2
+        _assert_only_spelling(srv.get_project().root, xml_parser.FX_MIXER)
+        assert json.loads(srv.get_mixer_channels())["channels"][1][
+            "volume"] == 0.4
+        channel = find_mixer_channel_element(srv.get_project().root, 1)
+        assert channel.find("volume").attrib == {
+            "id": "11", "value": "0.4", "scale_type": "linear"}
